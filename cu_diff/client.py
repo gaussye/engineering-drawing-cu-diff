@@ -37,6 +37,10 @@ class CUError(RuntimeError):
         self.status = status
 
 
+class CacheMiss(CUError):
+    """No completed or resumable operation matches the requested provenance."""
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise CUError("Refusing HTTP redirect of authenticated Azure request")
@@ -126,7 +130,7 @@ class Client:
             time.sleep(min(float(headers.get("Retry-After", "3")), 30))
         raise CUError("Azure CU polling timed out; rerun to resume the saved operation, not rebill")
 
-    def ensure_analyzer(self) -> tuple[str, dict]:
+    def ensure_analyzer(self, *, allow_create: bool = True) -> tuple[str, dict]:
         base, _ = self.request("GET", self.url("analyzers/prebuilt-document"))
         supported = base.get("supportedModels", {}).get("completion", [])
         if self.config["completion_model"] not in supported:
@@ -145,6 +149,11 @@ class Client:
         except CUError as error:
             if error.status != 404:
                 raise
+            if not allow_create:
+                raise CUError(
+                    "The configured analyzer does not exist. Web mode never creates analyzers; "
+                    "use an approved CLI setup before running the web application."
+                ) from error
             actual, headers = self.request("PUT", url, spec, {"If-None-Match": "*"})
             operation = next((v for k, v in headers.items() if k.lower() == "operation-location"), None)
             if operation:
@@ -161,7 +170,7 @@ class Client:
         return analyzer_id, actual
 
     def analyze(self, path: Path, cache: Path, analyzer_id: str,
-                analyzer: dict) -> tuple[dict, dict]:
+                analyzer: dict, *, allow_submit: bool = True) -> tuple[dict, dict]:
         binary = path.read_bytes()
         deployments = dict(self.config["model_deployments"])
         deployments["prebuilt-analyzer-completion"] = deployments[self.config["completion_model"]]
@@ -190,6 +199,11 @@ class Client:
             location = pending["operation_location"]
             started_at = pending["started_at"]
         else:
+            if not allow_submit:
+                raise CacheMiss(
+                    "No matching CU cache. This local server is cache-only; restart with "
+                    "--allow-azure-upload only after approving the configured Azure processing boundary."
+                )
             started_at = datetime.now(timezone.utc).isoformat()
             body = {
                 "inputs": [{"data": base64.b64encode(binary).decode("ascii"),

@@ -47,6 +47,26 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(request.call_count, 1)
             self.assertEqual(request.call_args.args[0], "GET")
 
+    def test_web_setup_never_creates_missing_analyzer(self):
+        client = Client(config())
+        with patch.object(client, "request", side_effect=[
+            ({"supportedModels": {"completion": ["gpt-5.4"]}}, {}),
+            CUError("missing", 404),
+        ]) as request:
+            with self.assertRaisesRegex(CUError, "Web mode never creates"):
+                client.ensure_analyzer(allow_create=False)
+            self.assertEqual([call.args[0] for call in request.call_args_list], ["GET", "GET"])
+
+    def test_cache_only_miss_does_not_submit(self):
+        client = Client(config())
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "synthetic.pdf"
+            pdf.write_bytes(b"synthetic")
+            with patch.object(client, "request") as request:
+                with self.assertRaisesRegex(CUError, "cache-only"):
+                    client.analyze(pdf, Path(tmp) / "cache", "test", {}, allow_submit=False)
+                request.assert_not_called()
+
     def test_cache_avoids_post_and_invalidates_model_version(self):
         client = Client(config())
         response = {"status": "Succeeded", "result": {"contents": [{"markdown": "synthetic"}]},

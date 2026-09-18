@@ -7,10 +7,18 @@ name = "engineering-drawing-cu-diff"
 version = "0.1.0"
 description = "Evidence-grounded engineering drawing comparison with Azure Content Understanding"
 requires-python = ">=3.11"
-dependencies = ["PyMuPDF>=1.24,<2"]
+dependencies = ["PyMuPDF>=1.28,<2"]
+
+[project.optional-dependencies]
+web = ["Flask>=3.1,<4", "waitress>=3.0,<4"]
+test = ["playwright>=1.50,<2"]
 
 [project.scripts]
 cu-diff = "cu_diff.cli:main"
+cu-diff-web = "cu_diff.web:main"
 
 [tool.setuptools.packages.find]
 include = ["cu_diff*"]
+
+[tool.setuptools.package-data]
+cu_diff = ["static/*.html", "static/*.css", "static/*.js"]

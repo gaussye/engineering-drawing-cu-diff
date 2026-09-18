@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>图纸校核 · 工程 PDF 对比</title>
+  <script>
+    (() => {
+      const param = new URLSearchParams(window.location.search).get("scoutTheme");
+      const theme =
+        param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+  <style>
+    :root {
+      color-scheme: light;
+      --cp-bg: #f7f4ef;
+      --cp-bg-elevated: #fcfbf8;
+      --cp-surface: #ffffff;
+      --cp-surface-soft: #f5f5f5;
+      --cp-border: #dedede;
+      --cp-border-strong: #919191;
+      --cp-text: #242424;
+      --cp-text-muted: #5c5c5c;
+      --cp-text-soft: #6f6f6f;
+      --cp-accent: #b11f4b;
+      --cp-accent-hover: #9a1a41;
+      --cp-accent-soft: rgba(177, 31, 75, 0.08);
+      --cp-accent-fg: #ffffff;
+      --cp-success: #16a34a;
+      --cp-danger: #dc2626;
+      --cp-warning: #f59e0b;
+      --cp-link: #0078d4;
+      --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.12);
+      --cp-overlay: rgba(255, 255, 255, 0.8);
+      --cp-panel: rgba(255, 255, 255, 0.86);
+      --cp-panel-strong: rgba(255, 255, 255, 0.96);
+      --cp-sheen: rgba(255, 255, 255, 0.55);
+      --cp-highlight: rgba(177, 31, 75, 0.12);
+    }
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --cp-bg: #3d3b3a;
+      --cp-bg-elevated: #343231;
+      --cp-surface: #292929;
+      --cp-surface-soft: #2e2e2e;
+      --cp-border: #474747;
+      --cp-border-strong: #5f5f5f;
+      --cp-text: #dedede;
+      --cp-text-muted: #919191;
+      --cp-text-soft: #b0b0b0;
+      --cp-accent: #fd8ea1;
+      --cp-accent-hover: #fb7b91;
+      --cp-accent-soft: rgba(253, 142, 161, 0.14);
+      --cp-accent-fg: #1a1a1a;
+      --cp-success: #4ade80;
+      --cp-danger: #f87171;
+      --cp-warning: #fbbf24;
+      --cp-link: #4da6ff;
+      --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+      --cp-overlay: rgba(41, 41, 41, 0.88);
+      --cp-panel: rgba(41, 41, 41, 0.72);
+      --cp-panel-strong: rgba(41, 41, 41, 0.96);
+      --cp-sheen: rgba(255, 255, 255, 0.04);
+      --cp-highlight: rgba(253, 142, 161, 0.12);
+    }
+  </style>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">▥</span><div><h1>图纸校核</h1><span class="eyebrow">ENGINEERING / REVISION CHECK</span></div></div>
+    <div class="workflow"><span>01 上传图纸</span><span aria-hidden="true">→</span><span>02 逐项比对</span><span aria-hidden="true">→</span><span>03 证据复核</span></div>
+    <button id="compare-button" class="primary" disabled>开始对比 <span aria-hidden="true">↗</span></button>
+  </header>
+  <div class="statusbar"><span id="connection-status">正在连接本地会话</span><span id="job-status" role="status" aria-live="polite">正在初始化…</span><span class="model-tag" id="model-tag">PDF / 双源校核</span></div>
+  <div id="error-banner" class="error-banner" role="alert" hidden><span id="error-message"></span><button id="retry-bootstrap" hidden>重新连接</button><button id="retry-operation" hidden>重试操作</button><button id="dismiss-error" aria-label="关闭错误提示">×</button></div>
+  <main class="workspace">
+    <aside class="sidebar" aria-label="对比结果">
+      <div class="sidebar-heading"><div><span class="eyebrow">REVIEW INDEX</span><h2>差异索引</h2></div><span id="result-count" class="count">—</span></div>
+      <div class="filters">
+        <label for="channel-filter">证据通道</label>
+        <select id="channel-filter"><option value="all">全部通道</option><option value="schema" selected>结构化字段</option><option value="ocr">OCR 原文</option><option value="unchanged">一致项复核</option></select>
+        <label for="review-filter">复核范围</label>
+        <select id="review-filter"><option value="all">全部结果</option><option value="review">需要人工复核</option><option value="uncertain">低确定性匹配</option><option value="unpaired">未配对项目</option></select>
+        <label class="check-label"><input id="show-interpretation" type="checkbox">显示仅解释差异</label>
+        <p class="filter-note">生成的解释不同不等于图纸内容变更；默认隐藏仅解释差异。</p>
+      </div>
+      <div id="results-list" class="results-list" aria-label="差异条目"><div class="list-empty"><span aria-hidden="true">⌕</span><h3>等待两份图纸</h3><p>固定按旧版 → 新版比较。<br>上传后可先检查页面，再开始对比。</p></div></div>
+      <details class="coverage-panel"><summary>覆盖范围与限制</summary><div id="coverage-content">尚未运行对比。系统不会将缺失位置的证据推测成红框。</div></details>
+      <p class="storage-notice" id="storage-notice">文件仅用于当前会话。</p>
+    </aside>
+    <section class="review-area" aria-label="图纸对照工作区">
+      <div class="drawing-grid">
+        <section class="drawing-panel" aria-labelledby="old-heading">
+          <header class="document-header"><span class="side-badge">A</span><div class="document-title"><h2 id="old-heading">旧版图纸 <span>OLD / 基准</span></h2><p id="old-filename">未上传文件</p></div><button id="old-replace" class="quiet" disabled>替换</button><button id="old-remove" class="quiet" aria-label="移除旧版图纸" disabled>×</button></header>
+          <div class="page-toolbar"><label for="old-page">页码</label><select id="old-page" disabled><option>— / —</option></select><div class="toolbar-spacer"></div><label for="old-zoom">缩放</label><select id="old-zoom" disabled><option value="fit">适宽</option><option value="50">50%</option><option value="75">75%</option><option value="100">100%</option><option value="125">125%</option><option value="150">150%</option><option value="200">200%</option></select><button id="old-fit" disabled>适合宽度</button></div>
+          <div id="old-viewport" class="drawing-viewport" tabindex="0" aria-label="旧版图纸，可独立滚动">
+            <div id="old-empty" class="upload-zone"><span class="upload-cross" aria-hidden="true">＋</span><span class="eyebrow">01 / BASELINE</span><h3>上传旧版图纸</h3><p>将基准 PDF 拖放到此处<br>或从本机选择文件</p><button id="old-choose" disabled>选择旧版 PDF</button><span class="upload-limit">PDF · 单文件最大 20 MB · 最多 20 页</span></div>
+            <div id="old-stage" class="drawing-stage" hidden><img alt="旧版图纸预览" draggable="false"><svg viewBox="0 0 1000 1000" preserveAspectRatio="none" aria-label="旧版证据标记"></svg></div>
+          </div>
+          <div id="old-evidence-note" class="evidence-note">旧版为比较基准，不自动推断文件时间顺序。</div>
+          <input id="old-upload" class="file-input" type="file" accept=".pdf,application/pdf" aria-label="上传旧版 PDF" disabled>
+        </section>
+        <section class="drawing-panel" aria-labelledby="new-heading">
+          <header class="document-header"><span class="side-badge">B</span><div class="document-title"><h2 id="new-heading">新版图纸 <span>NEW / 修订</span></h2><p id="new-filename">未上传文件</p></div><button id="new-replace" class="quiet" disabled>替换</button><button id="new-remove" class="quiet" aria-label="移除新版图纸" disabled>×</button></header>
+          <div class="page-toolbar"><label for="new-page">页码</label><select id="new-page" disabled><option>— / —</option></select><div class="toolbar-spacer"></div><label for="new-zoom">缩放</label><select id="new-zoom" disabled><option value="fit">适宽</option><option value="50">50%</option><option value="75">75%</option><option value="100">100%</option><option value="125">125%</option><option value="150">150%</option><option value="200">200%</option></select><button id="new-fit" disabled>适合宽度</button></div>
+          <div id="new-viewport" class="drawing-viewport" tabindex="0" aria-label="新版图纸，可独立滚动">
+            <div id="new-empty" class="upload-zone"><span class="upload-cross" aria-hidden="true">＋</span><span class="eyebrow">02 / REVISION</span><h3>上传新版图纸</h3><p>将修订 PDF 拖放到此处<br>两侧文件可以分别上传</p><button id="new-choose" disabled>选择新版 PDF</button><span class="upload-limit">PDF · 单文件最大 20 MB · 最多 20 页</span></div>
+            <div id="new-stage" class="drawing-stage" hidden><img alt="新版图纸预览" draggable="false"><svg viewBox="0 0 1000 1000" preserveAspectRatio="none" aria-label="新版证据标记"></svg></div>
+          </div>
+          <div id="new-evidence-note" class="evidence-note">红框指向原始证据，最终结论请结合图纸人工复核。</div>
+          <input id="new-upload" class="file-input" type="file" accept=".pdf,application/pdf" aria-label="上传新版 PDF" disabled>
+        </section>
+      </div>
+      <section class="detail-panel" aria-labelledby="detail-heading"><header><h2 id="detail-heading">证据详情</h2><span id="detail-meta">选择索引或红框，联动定位两侧原文</span></header><div id="detail-content" class="detail-content"><p class="detail-placeholder">保留原文 · 分离解释 · 不推测缺失证据</p></div></section>
+    </section>
+  </main>
+</body>
+</html>
