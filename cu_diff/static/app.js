@@ -7,11 +7,13 @@
     modified: "提取原文不同", relocated: "行号重排", interpretation_only: "仅解释差异",
     formatting_only: "仅格式差异（不计变更）",
     unpaired_old: "旧侧未配对（非确认删除）", unpaired_new: "新侧未配对（非确认新增）",
-    unchanged: "提取原文相同", reconciled: "OCR 分段已合并（非原文变更）"
+    unchanged: "提取原文相同", reconciled: "OCR 分段已合并（非原文变更）",
+    visual_modified: "外观变化候选", visual_annotation: "文字/引线布局候选",
+    visual_moved: "位移候选（非内容变更）", visual_uncertain: "图形对应不确定（待复核）"
   };
-  const channels = { schema: "结构化字段", ocr: "OCR 原文", unchanged: "一致项复核" };
+  const channels = { schema: "结构化字段", graphics: "本地图形候选", ocr: "OCR 原文", unchanged: "一致项复核" };
   const state = {
-    ready: false, csrf: "", revision: 0, azure: false, generation: 0,
+    ready: false, csrf: "", revision: 0, azure: false, graphicsEnabled: false, generation: 0,
     limits: { max_bytes: 20971520, max_pages: 20 }, result: null, selected: null,
     comparing: false, jobController: null, mutationQueue: Promise.resolve(),
     old: { document: null, page: 1, zoom: "fit", epoch: 0, pending: false, loaded: false, imageEpoch: 0 },
@@ -55,6 +57,22 @@
     return Boolean(state.old.document?.sha256) &&
       state.old.document.sha256 === state.new.document?.sha256;
   }
+  const graphicsUnavailable = "图形检测未接入/未启用：当前仅支持字段与 OCR 证据。";
+  function updateGraphicsAvailability() {
+    const menu = $("channel-filter");
+    menu.querySelector('[value="primary"]').textContent = state.graphicsEnabled ? "字段 + 图形候选" : "结构化字段（默认）";
+    const option = menu.querySelector('[value="graphics"]');
+    option.disabled = !state.graphicsEnabled;
+    option.textContent = state.graphicsEnabled ? "本地图形候选" : "本地图形候选（未启用）";
+    if (!state.graphicsEnabled && menu.value === "graphics") menu.value = "primary";
+    $("graphics-status").textContent = state.graphicsEnabled
+      ? "本地图形检测已启用；仅展示服务返回的候选，不代表工程结论。"
+      : graphicsUnavailable;
+    $("filter-note").textContent = state.graphicsEnabled
+      ? "默认显示字段与图形候选，不重复展示 OCR。红色实框：原文或局部外观残差候选；黄色虚框：仅位移或待复核证据，非内容变更。图形候选不能推断真实材质或尺寸变化；不确定项请切换「需要人工复核」。"
+      : "默认显示结构化字段，不重复展示 OCR。红色实框为原文差异候选；黄色虚框仅供复核，不是确认变更。";
+    $("coverage-content").textContent = `尚未运行对比。${state.graphicsEnabled ? "图形覆盖以本轮服务返回的统计为准。" : graphicsUnavailable}系统不会将缺失位置的证据推测成红框。`;
+  }
   function updateControls() {
     const busy = sides.some((side) => state[side].pending);
     $("compare-button").disabled = !state.ready || busy || state.comparing ||
@@ -86,7 +104,7 @@
     sides.forEach((side) => $(`${side}-stage`).querySelector("svg").replaceChildren());
     renderResults();
     renderDetails(null);
-    $("coverage-content").textContent = "文件已更改，旧结果已清除。重新对比后显示覆盖范围。";
+    $("coverage-content").textContent = `文件已更改，旧结果已清除。重新对比后显示覆盖范围。${state.graphicsEnabled ? "" : graphicsUnavailable}`;
     for (const side of sides) $(`${side}-evidence-note`).textContent = "尚无本轮对比证据。";
     updateControls();
   }
@@ -99,6 +117,8 @@
       state.revision = data.revision;
       state.limits = data.limits;
       state.azure = Boolean(data.azure_enabled);
+      state.graphicsEnabled = data.graphics_enabled === true;
+      updateGraphicsAvailability();
       state.ready = true;
       $("connection-status").textContent = "会话已连接";
       $("model-tag").textContent = `${data.model || "模型"} / ${state.azure ? "缓存优先 · 可提交 CU" : "只读缓存模式"}`;
@@ -257,10 +277,19 @@
     const right = Math.min(1, x + width), bottom = Math.min(1, y + height);
     return right > left && bottom > top ? { x: left, y: top, width: right - left, height: bottom - top } : null;
   }
-  function locations(item, side) {
+  function validLocations(entries, side) {
     const pages = state[side].document?.pages || [];
-    return (item?.[side]?.locations || []).filter((loc) =>
-      pages.some((page) => page.number === loc.page) && bounds(loc));
+    return (Array.isArray(entries) ? entries : []).filter((loc) =>
+      loc && pages.some((page) => page.number === loc.page) && bounds(loc));
+  }
+  function locations(item, side) {
+    return validLocations(item?.[side]?.locations, side);
+  }
+  function navigationLocations(item, side) {
+    const evidence = locations(item, side);
+    // Context is only a navigation fallback for a paired graphical region, never a change box.
+    if (evidence.length || item?.channel !== "graphics" || !item.old || !item.new) return evidence;
+    return validLocations(item[side].context_locations, side);
   }
   function uncertain(item) {
     const certainty = item.match?.certainty;
@@ -268,15 +297,24 @@
       ["low", "uncertain", "ambiguous", "低", "低确定性"].includes(String(certainty).toLowerCase());
   }
   function pairedDifference(item) {
-    return Boolean(item.old && item.new) && ["modified", "relocated"].includes(item.change);
+    return Boolean(item.old && item.new) &&
+      ["modified", "relocated", "visual_modified", "visual_annotation", "visual_moved"].includes(item.change);
+  }
+  function evidenceStyle(item) {
+    if (item.change === "visual_moved") return " review-evidence movement-evidence";
+    return pairedDifference(item) ? "" : " review-evidence";
   }
   function unpaired(item) {
     return ["unpaired_old", "unpaired_new"].includes(item.change);
   }
   function visibleItems() {
     return (state.result?.items || []).filter((item) => {
+      if (!state.graphicsEnabled && item.channel === "graphics") return false;
       if (!$("show-interpretation").checked && item.change === "interpretation_only") return false;
-      if ($("channel-filter").value !== "all" && item.channel !== $("channel-filter").value) return false;
+      const channel = $("channel-filter").value;
+      if (channel === "primary") {
+        if (!["schema", "graphics"].includes(item.channel)) return false;
+      } else if (channel !== "all" && item.channel !== channel) return false;
       switch ($("review-filter").value) {
         case "paired": return pairedDifference(item);
         case "formatting": return item.change === "formatting_only";
@@ -307,6 +345,8 @@
       for (const item of grouped) {
         const row = el("div", "result-item");
         row.dataset.id = item.id;
+        row.dataset.channel = item.channel;
+        row.dataset.change = item.change;
         const button = el("button", "result-button");
         button.type = "button";
         button.dataset.id = item.id;
@@ -337,10 +377,11 @@
         const box = bounds(loc);
         const rect = svgNode("rect", {
           x: box.x * 1000, y: box.y * 1000, width: box.width * 1000, height: box.height * 1000,
-          class: `evidence-box${pairedDifference(item) ? "" : " review-evidence"}${item.id === state.selected ? " selected" : ""}`,
+          class: `evidence-box${evidenceStyle(item)}${item.id === state.selected ? " selected" : ""}`,
           "data-id": item.id, "vector-effect": "non-scaling-stroke", tabindex: 0, role: "button",
           "data-field": loc.field || "",
-          "aria-label": `${item.id} ${loc.label || item.key || item.region || ""}，${sideName[side]}第 ${s.page} 页`
+          "data-channel": item.channel, "data-change": item.change,
+          "aria-label": `${item.id} ${loc.label || item.key || item.region || ""}，${changes[item.change] || item.change}，${sideName[side]}第 ${s.page} 页`
         });
         rect.addEventListener("click", () => selectItem(item.id));
         rect.addEventListener("keydown", (event) => {
@@ -350,10 +391,10 @@
         if (!labelled && (!state.selected || item.id === state.selected)) {
           const label = svgNode("text", {
             x: Math.min(box.x * 1000 + 2, 940), y: Math.max(18, box.y * 1000 - 5),
-            class: `evidence-label${pairedDifference(item) ? "" : " review-evidence"}`, "font-size": Math.max(10, 11 * 1000 / (stage.clientHeight || 1000)),
+            class: `evidence-label${evidenceStyle(item)}`, "font-size": Math.max(10, 11 * 1000 / (stage.clientHeight || 1000)),
             "aria-hidden": "true"
           });
-          label.textContent = `${item.id}${pairedDifference(item) ? "" : " 待核"}`;
+          label.textContent = `${item.id}${item.change === "visual_moved" ? " 位移" : pairedDifference(item) ? "" : " 待核"}`;
           svg.append(label);
           labelled = true;
         }
@@ -363,12 +404,18 @@
   function evidenceNote(side) {
     const item = state.result?.items.find((i) => i.id === state.selected);
     const node = $(`${side}-evidence-note`);
-    if (!item) { node.textContent = state.result ? "点击证据框或索引查看原文；黄色虚框不是确认变更。" : "预览已就绪，等待开始对比。"; return; }
+    if (!item) { node.textContent = state.result ? "点击证据框或索引查看证据；黄色虚框不是确认内容变更。" : "预览已就绪，等待开始对比。"; return; }
     const source = item[side], located = locations(item, side);
     if (!source) node.textContent = `${item.id} · 未配对到证据，不代表本侧图纸没有该内容`;
+    else if (item.channel === "graphics" && !located.length) {
+      const context = navigationLocations(item, side);
+      node.textContent = context.length
+        ? `${item.id} · 无局部残差框；第 ${[...new Set(context.map((loc) => loc.page))].join("、")} 页为配对上下文（仅导航，不是变化证据，不绘框）`
+        : `${item.id} · 无法定位局部残差；不绘制推测框${source.location_error ? `：${source.location_error}` : ""}`;
+    }
     else if (!located.length) node.textContent = `${item.id} · 无法定位${source.location_error ? `：${source.location_error}` : "；保留原文，不绘制推测框"}`;
     else if (!located.some((loc) => loc.page === state[side].page)) node.textContent = `${item.id} · 本页无对应证据；证据位于第 ${[...new Set(located.map((loc) => loc.page))].join("、")} 页`;
-    else node.textContent = `${item.id} · 第 ${state[side].page} 页证据${located.length > 1 ? ` · 共 ${located.length} 处，可切换页码查看` : ""}`;
+    else node.textContent = `${item.id} · 第 ${state[side].page} 页${item.channel === "graphics" ? "局部像素残差（候选）" : "证据"}${item.change === "visual_moved" ? " · 仅位移，非内容变更" : ""}${located.length > 1 ? ` · 共 ${located.length} 处，可切换页码查看` : ""}`;
   }
   function selectItem(id) {
     const item = state.result?.items.find((i) => i.id === id);
@@ -377,7 +424,7 @@
     document.querySelectorAll(".result-button").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.id === id)));
     renderDetails(item);
     for (const side of sides) {
-      const first = locations(item, side)[0];
+      const first = navigationLocations(item, side)[0];
       if (first && first.page !== state[side].page) {
         state[side].page = first.page;
         showPage(side, true);
@@ -390,7 +437,7 @@
   }
   function scrollToEvidence(side) {
     const item = state.result?.items.find((i) => i.id === state.selected);
-    const loc = locations(item, side).find((l) => l.page === state[side].page);
+    const loc = navigationLocations(item, side).find((l) => l.page === state[side].page);
     if (!loc || !state[side].loaded) return;
     const box = bounds(loc), viewport = $(`${side}-viewport`), stage = $(`${side}-stage`);
     const stageRect = stage.getBoundingClientRect(), paneRect = viewport.getBoundingClientRect();
@@ -400,11 +447,52 @@
       behavior: "auto"
     });
   }
+  function renderGraphicsDetails(item) {
+    const graphics = item.graphics || {}, alignment = graphics.alignment || {};
+    const section = el("section", "graphics-detail");
+    section.append(el("h3", "", "本地图形证据 · 候选，非工程结论"));
+    section.append(el("p", "graphics-disclaimer", item.change === "visual_moved"
+      ? "仅刚性位移候选，不计为内容修改；不能由像素差异推断真实材质或尺寸变化。"
+      : item.change === "visual_uncertain"
+        ? "无法可靠建立图形对应关系，必须人工复核；不能认定内容变化或无变化。"
+        : "外观、文字或引线布局残差仅为复核候选，不能推断真实材质、尺寸或工程内容变化。"));
+    const metric = (value, suffix = "") => Number.isFinite(value) ? `${value}${suffix}` : "未提供";
+    const fraction = (value) => Number.isFinite(value) ? `${(value * 100).toFixed(2)}%` : "未提供";
+    const translation = graphics.translation_pt || {};
+    const facts = [
+      ["候选分类", graphics.classification || changes[item.change]],
+      ["检测方法", graphics.method || "未提供"],
+      ["渲染分辨率", metric(graphics.dpi, " dpi")],
+      ["估计位移（pt）", `Δx ${metric(translation.dx, " pt")} / Δy ${metric(translation.dy, " pt")}`],
+      ["配准可靠性", alignment.accepted === true ? "配准已接受（不是工程内容确认）" : alignment.accepted === false ? "配准未接受 / 不可靠" : "未提供"],
+      ["配准方法 / 响应", `${text(alignment.method) || "未提供"} / ${metric(alignment.response)}（非准确率）`],
+      ["对应确定性", item.match?.certainty === "high" ? "高（非概率保证）" : "不确定，需人工复核"],
+      ["区域来源", ({ cu_figure: "CU 图形区域", page_fallback: "页面回退（对应关系需复核）" })[graphics.region_source] || text(graphics.region_source) || "未提供"],
+      ["残差像素（旧 / 新）", `${metric(graphics.changed_pixels?.old)} / ${metric(graphics.changed_pixels?.new)}`],
+      ["残差占比（旧 / 新）", `${fraction(graphics.residual_fraction?.old)} / ${fraction(graphics.residual_fraction?.new)}`]
+    ];
+    if (alignment.inlier_count != null) facts.push(["配准内点数", metric(alignment.inlier_count)]);
+    const list = el("dl", "graphics-metrics");
+    for (const [label, value] of facts) {
+      const row = el("div");
+      row.append(el("dt", "", label), el("dd", "", value));
+      list.append(row);
+    }
+    section.append(list, el("p", "graphics-disclaimer", "证据框仅来自实际局部残差像素。无残差框时可导航至已配对上下文，但不会将区域边界绘成变化框。未提供概率置信度，配准响应也不是准确率。"));
+    if (Array.isArray(graphics.limitations) && graphics.limitations.length) {
+      const limits = el("ul", "graphics-limitations");
+      graphics.limitations.forEach((limit) => limits.append(el("li", "", limit)));
+      section.append(el("h4", "", "方法限制"), limits);
+    }
+    return section;
+  }
   function renderDetails(item) {
     const content = $("detail-content");
     content.replaceChildren();
-    $("detail-meta").textContent = item ? `${item.id} · ${changes[item.change] || item.change} · 匹配 ${text(item.match?.method) || "未提供"} / 确定性 ${text(item.match?.certainty) || "未提供"} / 启发式得分 ${text(item.match?.score) || "未提供"}（非准确率）` : "选择索引或红框，联动定位两侧原文";
-    if (!item) { content.append(el("p", "detail-placeholder", "保留原文 · 分离解释 · 不推测缺失证据")); return; }
+    $("detail-meta").textContent = item ? `${item.id} · ${changes[item.change] || item.change} · 匹配 ${text(item.match?.method) || "未提供"} / 确定性 ${text(item.match?.certainty) || "未提供"} / 启发式得分 ${text(item.match?.score) || "未提供"}（非准确率）` : "选择索引或证据框，联动定位两侧证据";
+    if (!item) { content.append(el("p", "detail-placeholder", "保留原文 · 核对外观 · 不推测缺失证据")); return; }
+    const graphical = item.channel === "graphics";
+    if (graphical) content.append(renderGraphicsDetails(item));
     if (item.cell_comparison) {
       const cells = item.cell_comparison, section = el("section", "cell-diff");
       section.append(el("h3", "", "实际变化的列（CU 单元格证据）"));
@@ -433,17 +521,21 @@
     }
     if (unpaired(item)) {
       content.append(el("p", "review-reasons",
-        "此项不是已确认差异：自动配对未找到对应项，可能是 OCR 分段、漏识别或字段命名不同。另一侧没有配对证据不等于图纸没有该内容，不能认定新增或删除。"));
+        graphical
+          ? "图形区域尚未可靠配对，仅供人工查证。另一侧没有配对证据不等于图纸没有该内容，不能认定新增或删除。"
+          : "此项不是已确认差异：自动配对未找到对应项，可能是 OCR 分段、漏识别或字段命名不同。另一侧没有配对证据不等于图纸没有该内容，不能认定新增或删除。"));
     }
     for (const side of sides) {
       const source = item[side], section = el("section", "source-detail");
-      section.append(el("h3", "", `${sideName[side]} / ${item.cell_comparison ? "整行原文（上下文，非整行变更）" : "原始文本"}`));
-      section.append(el("p", "source-text", source ? (source.raw_text ?? "未提供原文") : "未配对到证据（不代表原图没有）"));
+      section.append(el("h3", "", `${sideName[side]} / ${graphical ? "本地渲染证据描述（非 OCR 原文）" : item.cell_comparison ? "整行原文（上下文，非整行变更）" : "原始文本"}`));
+      section.append(el("p", "source-text", source ? (source.raw_text ?? (graphical ? "未提供本地渲染描述" : "未提供原文")) : "未配对到证据（不代表原图没有）"));
       if (source) {
-        section.append(el("p", "source-meta", `来源：${text(source.source) || "未提供"} · 置信度：${text(source.confidence) || "未提供"}${source.location_error ? ` · 无法定位：${source.location_error}` : ""}`));
+        section.append(el("p", graphical ? "source-meta graphics-provenance" : "source-meta", graphical
+          ? `本地渲染来源：${text(source.source) || "未提供"}\n置信度：未提供概率置信度${source.location_error ? `\n定位说明：${source.location_error}` : ""}`
+          : `来源：${text(source.source) || "未提供"} · 置信度：${text(source.confidence) || "未提供"}${source.location_error ? ` · 无法定位：${source.location_error}` : ""}`));
         if (source.detail != null && source.detail !== "") {
           const detail = el("details");
-          detail.append(el("summary", "", "生成解释（不是原文，不单独作为变更依据）"), el("p", "", source.detail));
+          detail.append(el("summary", "", graphical ? "本地检测说明（非 OCR 原文，非工程结论）" : "生成解释（不是原文，不单独作为变更依据）"), el("p", "", source.detail));
           section.append(detail);
         }
       }
@@ -453,13 +545,55 @@
       const reasons = (item.review_reasons || []).map(text).join("；");
       content.append(el("p", "review-reasons", item.change === "interpretation_only"
         ? `仅生成解释存在差异，不代表图纸发生变更。${reasons}`
-        : `需要人工复核：${reasons || "请核对两侧原文及位置。"}`));
+        : `需要人工复核：${reasons || (graphical ? "请核对两侧图形、配准可靠性及定位依据。" : "请核对两侧原文及位置。")}`));
     }
+  }
+  function coverageFacts(value) {
+    const labels = {
+      pages: "页数", page_counts: "页数统计", page_count: "页数", old_pages: "旧版页数", new_pages: "新版页数",
+      regions: "区域", region_counts: "区域统计", region_count: "区域数", old_regions: "旧版区域数", new_regions: "新版区域数",
+      paired: "已配对", paired_pages: "已配对页数", paired_regions: "已配对区域数",
+      unpaired: "未配对（非确认增删）", unpaired_old: "旧侧未配对", unpaired_new: "新侧未配对",
+      old: "旧版", new: "新版", total: "总计", analyzed: "已分析", skipped: "已跳过",
+      warnings: "警告", limits: "运行限制", limitations: "方法限制", dpi: "渲染 DPI",
+      max_pages: "页数上限", max_regions: "区域数上限", max_pixels: "像素上限",
+      method: "方法", status: "状态", enabled: "已启用", candidates: "候选数"
+    };
+    if (Array.isArray(value)) {
+      const list = el("ul");
+      if (!value.length) list.append(el("li", "", "无"));
+      value.forEach((entry) => { const row = el("li"); row.append(coverageFacts(entry)); list.append(row); });
+      return list;
+    }
+    if (value && typeof value === "object") {
+      const list = el("dl", "coverage-facts");
+      for (const [key, entry] of Object.entries(value)) {
+        const row = el("div"), detail = el("dd");
+        detail.append(coverageFacts(entry));
+        row.append(el("dt", "", labels[key] || key), detail);
+        list.append(row);
+      }
+      return list;
+    }
+    return el("span", "", value == null ? "未提供" : typeof value === "boolean" ? (value ? "是" : "否") : value);
   }
   function renderCoverage(result) {
     const content = $("coverage-content");
-    content.replaceChildren(el("p", "", "对比仅覆盖成功提取的字段与 OCR 原文；未识别、未配对或无法定位不等于无变更。红框为证据边界，不是工程结论。"));
+    content.replaceChildren(el("p", "", state.graphicsEnabled
+      ? "对比仅覆盖成功提取的字段、OCR 原文及已处理的本地图形区域；未识别、未配对或无法定位不等于无变更。证据框不是工程结论。"
+      : `${graphicsUnavailable}对比仅覆盖成功提取的字段与 OCR 原文，不包含图形检测。未识别、未配对或无法定位不等于无变更。`));
     content.append(el("p", "", `覆盖信息：\n${text(result.coverage) || "未提供覆盖统计"}`));
+    if (state.graphicsEnabled && result.graphics_coverage != null) {
+      const graphics = el("section", "graphics-coverage");
+      graphics.append(el("h4", "", "本地图形覆盖与限制"), coverageFacts(result.graphics_coverage),
+        el("p", "", "局部像素差异仅提示外观候选；配准失败、回退页面或跳过区域必须人工复核。"));
+      const raw = el("details");
+      raw.append(el("summary", "", "完整图形覆盖统计（JSON）"), el("pre", "", text(result.graphics_coverage)));
+      graphics.append(raw);
+      content.append(graphics);
+    } else if (state.graphicsEnabled) {
+      content.append(el("p", "", "本轮未返回图形覆盖统计，不能据此认定图形无变化。"));
+    }
     if (result.warnings) content.append(el("p", "", `限制与警告：\n${Array.isArray(result.warnings) ? result.warnings.map(text).join("\n") || "无" : text(result.warnings)}`));
     for (const side of sides) {
       const meta = result.metadata?.[side];
@@ -501,14 +635,20 @@
               data.result.documents[side].sha256 === state[side].document?.sha256)) {
             throw new Error("结果文件与当前上传文件不一致，已拒绝显示旧结果或证据框，请重新对比。");
           }
-          state.result = data.result;
+          const result = state.graphicsEnabled ? data.result : {
+            ...data.result, items: data.result.items.filter((item) => item.channel !== "graphics"),
+            graphics_coverage: undefined
+          };
+          state.result = result;
           renderResults();
-          renderCoverage(data.result);
+          renderCoverage(result);
           sides.forEach((side) => { renderBoxes(side); evidenceNote(side); });
-          const hidden = data.result.items.filter((item) => item.change === "interpretation_only").length;
-          const unresolved = data.result.items.filter(unpaired).length;
-          const formatting = data.result.items.filter((item) => item.change === "formatting_only").length;
-          status(`对比完成 · ${data.result.items.filter(pairedDifference).length} 条已配对差异候选 · ${unresolved} 条未配对待复核 · ${formatting} 条仅格式差异${hidden ? ` · ${hidden} 个仅解释差异默认隐藏` : ""} · 非已确认变更数`);
+          const hidden = result.items.filter((item) => item.change === "interpretation_only").length;
+          const unresolved = result.items.filter(unpaired).length;
+          const formatting = result.items.filter((item) => item.change === "formatting_only").length;
+          const movements = result.items.filter((item) => item.change === "visual_moved").length;
+          const graphicsUncertain = result.items.filter((item) => item.change === "visual_uncertain").length;
+          status(`对比完成 · ${result.items.filter(pairedDifference).length} 条已配对差异候选${movements ? `（含 ${movements} 条仅位移，非内容修改）` : ""} · ${unresolved} 条未配对待复核${graphicsUncertain ? ` · ${graphicsUncertain} 条图形对应不确定，见人工复核` : ""} · ${formatting} 条仅格式差异${hidden ? ` · ${hidden} 个仅解释差异默认隐藏` : ""} · 非已确认变更数${state.graphicsEnabled ? "" : " · 图形检测未接入/未启用"}`);
           return;
         }
         if (!["queued", "running"].includes(data.status)) throw new Error("任务状态异常，请重试。");

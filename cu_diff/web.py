@@ -275,6 +275,12 @@ class Store:
             comparison = compare_responses(responses["old"], responses["new"])
             public_docs = {role: doc.public() for role, doc in documents.items()}
             result = web_result(comparison, public_docs, metadata)
+            from .graphics import compare_graphics
+            graphical = compare_graphics(
+                documents["old"].analysis_path, documents["new"].analysis_path,
+                responses["old"], responses["new"], pdf_lock=PDF_LOCK, progress=phase)
+            result["items"].extend(graphical["items"])
+            result["graphics_coverage"] = graphical["coverage"]
             with self.lock:
                 if job["invalidated"]:
                     job.update(status="stale", phase="文件已更换，旧结果已作废")
@@ -406,7 +412,7 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
                 csrf_token=session.csrf, revision=session.revision,
                 limits={"max_bytes": MAX_BYTES, "max_pages": MAX_PAGES,
                         "session_ttl_hours": SESSION_TTL},
-                azure_enabled=allow_azure, model=config.get("completion_model"),
+                azure_enabled=allow_azure, model=config.get("completion_model"), graphics_enabled=True,
                 documents={role: session.documents[role].public() if role in session.documents else None
                            for role in ("old", "new")},
                 storage_notice="文件仅存本地；会话闲置24小时后于后续请求/启动时清理。CU缓存单独保留，清理说明见README。",

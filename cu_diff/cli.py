@@ -115,6 +115,46 @@ def crop(args: argparse.Namespace) -> None:
         })
 
 
+def graphics(args: argparse.Namespace) -> None:
+    from .client import digest
+    from .graphics import compare_graphics
+    responses, hashes = {}, {}
+    for role in ("old", "new"):
+        path = getattr(args, role)
+        hashes[role] = digest(path.read_bytes())
+        response_path = getattr(args, f"{role}_response")
+        metadata_path = getattr(args, f"{role}_metadata")
+        if bool(response_path) != bool(metadata_path):
+            raise ValueError("CU layout requires both response and matching metadata; no inferred file association")
+        if response_path:
+            metadata = read_json(metadata_path)
+            if metadata.get("document_sha256") != hashes[role]:
+                raise ValueError(f"{role} cached CU document hash does not match the PDF")
+            responses[role] = read_json(response_path)
+            if responses[role].get("status") != "Succeeded":
+                raise ValueError(f"{role} CU response did not succeed")
+    result = compare_graphics(args.old, args.new, responses.get("old"), responses.get("new"), dpi=args.dpi)
+    result["provenance"] = {"document_sha256": hashes, "azure_calls": 0,
+                            "chronology": "User-supplied old/new direction",
+                            "coordinate_basis": "Displayed PDF page, normalized x/y; no elastic warp"}
+    args.output.mkdir(parents=True, exist_ok=True)
+    save_json(args.output / "graphics.json", result)
+    from .report import cell
+    lines = ["# 本地图形差异候选", "", "只使用本地PDF和可选已校验CU缓存，不调用Azure。",
+             "像素外观、标注布局、区域移动均为待复核候选，不推断实物尺寸或材料改变。",
+             "", "| 编号 | 类型 | 旧侧区域 | 新侧区域 |",
+             "|---|---|---|---|"]
+    for item in result["items"]:
+        lines.append("| " + " | ".join([
+            cell(item["id"]), cell(item["key"]), cell((item["old"] or {}).get("locations")),
+            cell((item["new"] or {}).get("locations")),
+        ]) + " |")
+    lines.extend(["", "## 覆盖与限制", "", "```json",
+                  json.dumps(result["coverage"], ensure_ascii=False, indent=2), "```"])
+    (args.output / "graphics.zh.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Local graphical comparison saved: {args.output.resolve()}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -142,6 +182,15 @@ def main() -> None:
     cropping.add_argument("--dpi", type=int, default=600)
     cropping.add_argument("--output", type=Path, required=True)
     cropping.set_defaults(action=crop)
+    graphical = commands.add_parser("graphics", help="Offline graphical comparison; never calls Azure")
+    graphical.add_argument("--old", type=Path, required=True)
+    graphical.add_argument("--new", type=Path, required=True)
+    for role in ("old", "new"):
+        graphical.add_argument(f"--{role}-response", type=Path)
+        graphical.add_argument(f"--{role}-metadata", type=Path)
+    graphical.add_argument("--dpi", type=int, default=200)
+    graphical.add_argument("--output", type=Path, default=Path("output") / "graphics")
+    graphical.set_defaults(action=graphics)
     args = parser.parse_args()
     try:
         args.action(args)

@@ -4,7 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pymupdf
 
@@ -131,6 +131,22 @@ class WebTests(unittest.TestCase):
             self.assertAlmostEqual(item[role]["locations"][0]["x"], 0.1)
             self.assertAlmostEqual(item[role]["locations"][0]["y"], 0.2)
         self.assertNotIn("protected_paths", result)
+        self.assertEqual(result["result"]["graphics_coverage"]["status"], "completed")
+        self.assertEqual(result["result"]["graphics_coverage"]["fallback_pages"], 2)
+
+    def test_bootstrap_reports_actual_graphical_pipeline(self):
+        self.assertIs(self.boot["graphics_enabled"], True)
+
+    def test_graphics_stage_failure_is_explicit_not_a_success_result(self):
+        from cu_diff.graphics import GraphicsError
+        self.upload("old", pdf_bytes("SYNTHETIC A"))
+        revision = self.upload("new", pdf_bytes("SYNTHETIC B")).get_json()["revision"]
+        with patch("cu_diff.graphics.compare_graphics", side_effect=GraphicsError("Synthetic graphical failure")):
+            job_id = self.compare(revision).get_json()["job_id"]
+            result = self.wait_job(job_id)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Synthetic graphical failure", result["error"])
+        self.assertNotIn("result", result)
 
     def test_replace_invalidates_result_and_old_file(self):
         self.upload("old")
