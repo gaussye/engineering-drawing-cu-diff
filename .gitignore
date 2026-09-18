@@ -1,0 +1,19 @@
+# Customer data must never be committed, including derived artifacts.
+output/
+local/
+.env
+.env.*
+!.env.example
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.log
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/

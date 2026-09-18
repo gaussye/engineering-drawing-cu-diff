@@ -1,0 +1,15 @@
+{
+  "endpoint": "https://YOUR-RESOURCE.services.ai.azure.com",
+  "api_version": "2025-11-01",
+  "completion_model": "gpt-5.4",
+  "model_deployments": {
+    "gpt-5.4": "YOUR-EXISTING-GPT54-DEPLOYMENT",
+    "text-embedding-3-large": "YOUR-EXISTING-EMBEDDING-DEPLOYMENT"
+  },
+  "deployment_versions": {
+    "YOUR-EXISTING-GPT54-DEPLOYMENT": "RECORD-ACTUAL-MODEL-VERSION-AND-SKU",
+    "YOUR-EXISTING-EMBEDDING-DEPLOYMENT": "RECORD-ACTUAL-MODEL-VERSION-AND-SKU"
+  },
+  "processing_location": "geography",
+  "timeout_seconds": 1800
+}
