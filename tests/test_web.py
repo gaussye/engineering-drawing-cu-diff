@@ -171,6 +171,18 @@ class WebTests(unittest.TestCase):
         self.upload("new")
         self.assertEqual(self.compare(0).status_code, 409)
 
+    def test_identical_bytes_are_rejected_before_any_cu_call(self):
+        data = pdf_bytes()
+        self.upload("old", data, name="old.pdf")
+        revision = self.upload("new", data, name="different-name.pdf").get_json()["revision"]
+        store = self.app.extensions["review_store"]
+        store.client_factory = Mock(side_effect=AssertionError("CU must not be called"))
+        response = self.compare(revision)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("SHA256相同", response.get_json()["error"])
+        store.client_factory.assert_not_called()
+        self.assertEqual(store.jobs, {})
+
     def test_host_origin_csrf_and_session_isolation(self):
         self.assertEqual(self.client.get("/api/health", base_url="http://evil.test:8765").status_code, 403)
         self.assertEqual(self.client.put("/api/documents/old", data=pdf_bytes(),

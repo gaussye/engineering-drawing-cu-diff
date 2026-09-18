@@ -230,6 +230,8 @@ class Store:
                 raise WebError("文件已更换，旧版本对比请求已失效。", 409)
             if session.uploading or set(session.documents) != {"old", "new"}:
                 raise WebError("请先上传原图和调整图。")
+            if session.documents["old"].sha256 == session.documents["new"].sha256:
+                raise WebError("两侧文件的SHA256相同：上传的是完全相同的文件字节，请更换其中一份；未调用CU。", 409)
             if self.active(session):
                 raise WebError("本会话已有分析作业；更换文件后请等待旧作业停止。", 409)
             if sum(job["status"] in ("queued", "running") for job in self.jobs.values()) >= 4:

@@ -5,7 +5,8 @@
   const sideName = { old: "旧版", new: "新版" };
   const changes = {
     modified: "提取原文不同", relocated: "行号重排", interpretation_only: "仅解释差异",
-    unpaired_old: "旧侧未配对", unpaired_new: "新侧未配对", unchanged: "提取原文相同"
+    unpaired_old: "旧侧未配对（非确认删除）", unpaired_new: "新侧未配对（非确认新增）",
+    unchanged: "提取原文相同", reconciled: "OCR 分段已合并（非原文变更）"
   };
   const channels = { schema: "结构化字段", ocr: "OCR 原文", unchanged: "一致项复核" };
   const state = {
@@ -49,10 +50,20 @@
     if (!response.ok) throw new Error(data.error || `请求失败（${response.status}），请重试。`);
     return data;
   }
+  function identicalFiles() {
+    return Boolean(state.old.document?.sha256) &&
+      state.old.document.sha256 === state.new.document?.sha256;
+  }
   function updateControls() {
     const busy = sides.some((side) => state[side].pending);
     $("compare-button").disabled = !state.ready || busy || state.comparing ||
-      !sides.every((side) => state[side].document);
+      !sides.every((side) => state[side].document) || identicalFiles();
+    $("file-identity-status").classList.toggle("identical", identicalFiles());
+    $("file-identity-status").textContent = identicalFiles()
+      ? "两侧 SHA256 完全相同：是同一份文件字节，已阻止重复对比，请更换其中一份。"
+      : sides.every((side) => state[side].document)
+        ? "两侧文件 SHA256 不同（不代表每处内容都不同）；固定按 A 原图 → B 调整图比较。"
+        : "上传后显示文件 SHA256，核对是否为同一份文件。";
     $("compare-button").textContent = state.comparing ? "正在对比…" : "开始对比 ↗";
     for (const side of sides) {
       const available = Boolean(state[side].document) && !state[side].pending;
@@ -167,6 +178,9 @@
     $(`${side}-empty`).hidden = Boolean(s.document);
     $(`${side}-filename`).textContent = s.document ? s.document.name : "未上传文件";
     $(`${side}-filename`).title = s.document ? s.document.name : "";
+    const hash = s.document?.sha256;
+    $(`${side}-identity`).textContent = hash ? `SHA256 ${hash.slice(0, 12)}…${hash.slice(-8)}` : "";
+    $(`${side}-identity`).title = hash || "";
     const menu = $(`${side}-page`);
     menu.replaceChildren();
     if (!s.document) {
@@ -251,14 +265,21 @@
     return (typeof certainty === "number" && certainty < 0.8) ||
       ["low", "uncertain", "ambiguous", "低", "低确定性"].includes(String(certainty).toLowerCase());
   }
+  function pairedDifference(item) {
+    return Boolean(item.old && item.new) && ["modified", "relocated"].includes(item.change);
+  }
+  function unpaired(item) {
+    return ["unpaired_old", "unpaired_new"].includes(item.change);
+  }
   function visibleItems() {
     return (state.result?.items || []).filter((item) => {
       if (!$("show-interpretation").checked && item.change === "interpretation_only") return false;
       if ($("channel-filter").value !== "all" && item.channel !== $("channel-filter").value) return false;
       switch ($("review-filter").value) {
+        case "paired": return pairedDifference(item);
         case "review": return Boolean(item.review_required);
         case "uncertain": return uncertain(item);
-        case "unpaired": return item.change === "unpaired_old" || item.change === "unpaired_new";
+        case "unpaired": return unpaired(item);
         default: return true;
       }
     });
@@ -313,7 +334,7 @@
         const box = bounds(loc);
         const rect = svgNode("rect", {
           x: box.x * 1000, y: box.y * 1000, width: box.width * 1000, height: box.height * 1000,
-          class: `evidence-box${item.id === state.selected ? " selected" : ""}`,
+          class: `evidence-box${pairedDifference(item) ? "" : " review-evidence"}${item.id === state.selected ? " selected" : ""}`,
           "data-id": item.id, "vector-effect": "non-scaling-stroke", tabindex: 0, role: "button",
           "aria-label": `${item.id} ${item.key || item.region || ""}，${sideName[side]}第 ${s.page} 页`
         });
@@ -325,10 +346,10 @@
         if (!labelled && (!state.selected || item.id === state.selected)) {
           const label = svgNode("text", {
             x: Math.min(box.x * 1000 + 2, 940), y: Math.max(18, box.y * 1000 - 5),
-            class: "evidence-label", "font-size": Math.max(10, 11 * 1000 / (stage.clientHeight || 1000)),
+            class: `evidence-label${pairedDifference(item) ? "" : " review-evidence"}`, "font-size": Math.max(10, 11 * 1000 / (stage.clientHeight || 1000)),
             "aria-hidden": "true"
           });
-          label.textContent = item.id;
+          label.textContent = `${item.id}${pairedDifference(item) ? "" : " 待核"}`;
           svg.append(label);
           labelled = true;
         }
@@ -338,9 +359,9 @@
   function evidenceNote(side) {
     const item = state.result?.items.find((i) => i.id === state.selected);
     const node = $(`${side}-evidence-note`);
-    if (!item) { node.textContent = state.result ? "点击红框或差异索引，查看对应原文。" : "预览已就绪，等待开始对比。"; return; }
+    if (!item) { node.textContent = state.result ? "点击证据框或索引查看原文；黄色虚框不是确认变更。" : "预览已就绪，等待开始对比。"; return; }
     const source = item[side], located = locations(item, side);
-    if (!source) node.textContent = `${item.id} · 无对应证据`;
+    if (!source) node.textContent = `${item.id} · 未配对到证据，不代表本侧图纸没有该内容`;
     else if (!located.length) node.textContent = `${item.id} · 无法定位${source.location_error ? `：${source.location_error}` : "；保留原文，不绘制推测框"}`;
     else if (!located.some((loc) => loc.page === state[side].page)) node.textContent = `${item.id} · 本页无对应证据；证据位于第 ${[...new Set(located.map((loc) => loc.page))].join("、")} 页`;
     else node.textContent = `${item.id} · 第 ${state[side].page} 页证据${located.length > 1 ? ` · 共 ${located.length} 处，可切换页码查看` : ""}`;
@@ -380,10 +401,14 @@
     content.replaceChildren();
     $("detail-meta").textContent = item ? `${item.id} · ${changes[item.change] || item.change} · 匹配 ${text(item.match?.method) || "未提供"} / 确定性 ${text(item.match?.certainty) || "未提供"} / 启发式得分 ${text(item.match?.score) || "未提供"}（非准确率）` : "选择索引或红框，联动定位两侧原文";
     if (!item) { content.append(el("p", "detail-placeholder", "保留原文 · 分离解释 · 不推测缺失证据")); return; }
+    if (unpaired(item)) {
+      content.append(el("p", "review-reasons",
+        "此项不是已确认差异：自动配对未找到对应项，可能是 OCR 分段、漏识别或字段命名不同。另一侧没有配对证据不等于图纸没有该内容，不能认定新增或删除。"));
+    }
     for (const side of sides) {
       const source = item[side], section = el("section", "source-detail");
       section.append(el("h3", "", `${sideName[side]} / 原始文本`));
-      section.append(el("p", "source-text", source ? (source.raw_text ?? "未提供原文") : "无对应证据"));
+      section.append(el("p", "source-text", source ? (source.raw_text ?? "未提供原文") : "未配对到证据（不代表原图没有）"));
       if (source) {
         section.append(el("p", "source-meta", `来源：${text(source.source) || "未提供"} · 置信度：${text(source.confidence) || "未提供"}${source.location_error ? ` · 无法定位：${source.location_error}` : ""}`));
         if (source.detail != null && source.detail !== "") {
@@ -408,7 +433,7 @@
     if (result.warnings) content.append(el("p", "", `限制与警告：\n${Array.isArray(result.warnings) ? result.warnings.map(text).join("\n") || "无" : text(result.warnings)}`));
     for (const side of sides) {
       const meta = result.metadata?.[side];
-      if (meta) content.append(el("p", "", `${sideName[side]}：${meta.cache_hit ? "缓存命中" : "本轮提取"}\n${meta.cache_hit ? "历史分析用量（非本次新增计费）" : "分析用量"}：${text(meta.usage) || "未提供"}`));
+      if (meta) content.append(el("p", "", `${sideName[side]}：${meta.cache_hit ? "缓存命中" : "本轮提取"}\n上传原件 SHA256：${result.documents?.[side]?.sha256 || "未提供"}\nCU 分析文件 SHA256：${meta.document_sha256 || "未提供"}\n坐标依据：${meta.coordinate_basis || "未提供"}\n${meta.cache_hit ? "历史分析用量（非本次新增计费）" : "分析用量"}：${text(meta.usage) || "未提供"}`));
     }
   }
   function wait(ms, signal) {
@@ -442,12 +467,17 @@
         if (data.status === "failed") throw new Error(data.error || "对比失败，请重试。");
         if (data.status === "succeeded") {
           if (!data.result || !Array.isArray(data.result.items)) throw new Error("返回的对比结果不完整，请重试。");
+          if (!sides.every((side) => data.result.documents?.[side]?.id === state[side].document?.id &&
+              data.result.documents[side].sha256 === state[side].document?.sha256)) {
+            throw new Error("结果文件与当前上传文件不一致，已拒绝显示旧结果或证据框，请重新对比。");
+          }
           state.result = data.result;
           renderResults();
           renderCoverage(data.result);
           sides.forEach((side) => { renderBoxes(side); evidenceNote(side); });
           const hidden = data.result.items.filter((item) => item.change === "interpretation_only").length;
-          status(`对比完成 · ${data.result.items.length} 条证据候选${hidden ? ` · ${hidden} 个仅解释差异默认隐藏` : ""} · 不是已确认变更数量`);
+          const unresolved = data.result.items.filter(unpaired).length;
+          status(`对比完成 · ${data.result.items.filter(pairedDifference).length} 条已配对差异候选 · ${unresolved} 条未配对转入待复核${hidden ? ` · ${hidden} 个仅解释差异默认隐藏` : ""} · 不是已确认变更数量`);
           return;
         }
         if (!["queued", "running"].includes(data.status)) throw new Error("任务状态异常，请重试。");

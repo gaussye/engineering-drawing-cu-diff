@@ -74,8 +74,15 @@ class BrowserTests(unittest.TestCase):
             "() => document.querySelector('#new-stage img')?.naturalWidth > 0")
         self.page.wait_for_function("() => !document.querySelector('#compare-button').disabled")
 
-    def wait_result(self):
+    def wait_result(self, review_filter=None):
         self.page.locator("#compare-button").click()
+        if review_filter:
+            self.page.wait_for_function(
+                "() => document.querySelector('#job-status').textContent.includes('对比完成')",
+                timeout=15000)
+            self.assertEqual(self.page.locator("#results-list .result-item").count(), 0)
+            self.assertEqual(self.page.locator("rect.evidence-box").count(), 0)
+            self.page.locator("#review-filter").select_option(review_filter)
         self.page.wait_for_selector("#results-list .result-item", timeout=15000)
 
     def alignment(self, role):
@@ -125,6 +132,36 @@ class BrowserTests(unittest.TestCase):
             "() => document.body.textContent.includes('Synthetic CU failure')", timeout=15000)
         self.assertEqual(self.page.locator("rect.evidence-box").count(), 0)
 
+    def test_identical_uploads_are_visible_and_comparison_is_disabled(self):
+        self.page.locator("#old-upload").set_input_files(self.old)
+        self.page.wait_for_function(
+            "() => document.querySelector('#old-stage img')?.naturalWidth > 0")
+        self.page.locator("#new-upload").set_input_files(self.old)
+        self.page.wait_for_function(
+            "() => document.querySelector('#new-stage img')?.naturalWidth > 0")
+        self.assertTrue(self.page.locator("#compare-button").is_disabled())
+        self.assertIn("完全相同", self.page.locator("#file-identity-status").inner_text())
+        self.assertEqual(self.page.locator("#old-identity").get_attribute("title"),
+                         self.page.locator("#new-identity").get_attribute("title"))
+        self.assertEqual(self.page.locator("rect.evidence-box").count(), 0)
+
+    def test_wrong_source_results_are_rejected(self):
+        self.upload_pair()
+        for field in ("id", "sha256"):
+            with self.subTest(field=field):
+                documents = self.page.evaluate(
+                    "async () => (await (await fetch('/api/bootstrap')).json()).documents")
+                documents["new"][field] = "wrong-source"
+                result = {"items": [], "documents": documents}
+                self.page.route("**/api/jobs/*", lambda route: route.fulfill(
+                    json={"status": "succeeded", "result": result}))
+                self.page.locator("#compare-button").click()
+                self.page.wait_for_function(
+                    "() => document.querySelector('#error-message').textContent.includes('结果文件与当前上传文件不一致')")
+                self.assertEqual(self.page.locator("#results-list .result-item").count(), 0)
+                self.assertEqual(self.page.locator("rect.evidence-box").count(), 0)
+                self.page.unroute("**/api/jobs/*")
+
     def test_replacement_during_analysis_discards_late_results(self):
         self.upload_pair()
         FakeClient.gate = threading.Event()
@@ -154,7 +191,7 @@ class BrowserTests(unittest.TestCase):
                   "metadata": {"old": {"cache_hit": True}, "new": {"cache_hit": True}}}
         self.page.route("**/api/jobs/*", lambda route: route.fulfill(
             json={"status": "succeeded", "phase": "synthetic", "result": result}))
-        self.wait_result()
+        self.wait_result(review_filter="unpaired")
         self.page.locator("#results-list .result-item").first.click()
         self.assertEqual(self.page.locator("rect.evidence-box").count(), 0)
         self.assertIn("无法定位", self.page.locator("body").inner_text())
@@ -178,11 +215,17 @@ class BrowserTests(unittest.TestCase):
                   "metadata": {"old": {"cache_hit": True}, "new": {"cache_hit": True}}}
         self.page.route("**/api/jobs/*", lambda route: route.fulfill(
             json={"status": "succeeded", "phase": "synthetic", "result": result}))
-        self.wait_result()
+        self.wait_result(review_filter="unpaired")
         self.page.locator("#results-list .result-item").first.click()
         self.page.wait_for_selector("#new-stage rect.evidence-box")
         self.assertEqual(self.page.locator("#old-stage rect.evidence-box").count(), 0)
         self.assertEqual(self.page.locator("#new-stage rect.evidence-box").count(), 1)
+        self.assertEqual(self.page.locator("#new-stage rect.evidence-box.review-evidence").count(), 1)
+        self.assertNotEqual(self.page.locator("#new-stage rect.evidence-box").evaluate(
+            "node => getComputedStyle(node).strokeDasharray"), "none")
+        self.assertIn("待核", self.page.locator("#new-stage .evidence-label").text_content())
+        self.assertIn("不是已确认差异", self.page.locator("#detail-content").inner_text())
+        self.assertIn("不代表本侧图纸没有", self.page.locator("#old-evidence-note").inner_text())
         self.alignment("new")
 
 
