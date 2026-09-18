@@ -10,7 +10,7 @@ import pymupdf
 from .evidence import parse_source
 
 
-VERSION = "local-graphics-v1"
+VERSION = "local-graphics-v2"
 MAX_PIXELS = 8_000_000
 MAX_BOXES = 24
 LIMITATIONS = [
@@ -347,6 +347,110 @@ def _side(region, size, locations, scale, origin=None):
     }
 
 
+def _refine_subviews(ink, origins, scale, regions, sizes, masks, alignment, residuals, emit):
+    from .subviews import extract_subviews, order_reversals, pair_subviews
+
+    _, np = _libraries()
+    stats = dict.fromkeys(("old_candidates", "new_candidates", "matched", "moved", "unresolved",
+                          "omitted", "resolved_residual_pairs", "order_reversal_pairs"), 0)
+    candidates, omitted = {}, {}
+    for role in ink:
+        candidates[role], omitted[role] = extract_subviews(ink[role], scale)
+    if max(len(views) for views in candidates.values()) < 2:
+        return stats, 0, 0
+    for role in ink:
+        stats[f"{role}_candidates"] = len(candidates[role]) + omitted[role]
+    stats["omitted"] = sum(omitted.values())
+    # Truncation must not hide an indistinguishable competitor and create a false match.
+    pairs = [] if stats["omitted"] else pair_subviews(candidates["old"], candidates["new"])
+    stats["matched"] = len(pairs)
+    stats["unresolved"] = stats["old_candidates"] + stats["new_candidates"] - 2 * len(pairs)
+    reversals = order_reversals(candidates["old"], candidates["new"], pairs)
+    stats["order_reversal_pairs"] = sum(map(len, reversals.values())) // 2
+    parent_motion = ((origins["new"][0] - origins["old"][0] + alignment["dx_pixels"]) / scale,
+                     (origins["new"][1] - origins["old"][1] + alignment["dy_pixels"]) / scale)
+    emitted, unshown = 0, 0
+    for i, j, identity in pairs:
+        views = {"old": candidates["old"][i], "new": candidates["new"][j]}
+        boxes = {role: view.box for role, view in views.items()}
+        absolute = {role: tuple((v + origins[role][k % 2]) / scale for k, v in enumerate(box))
+                    for role, box in boxes.items()}
+        dimensions = {role: [box[2]-box[0], box[3]-box[1]] for role, box in absolute.items()}
+        delta = [(absolute["new"][axis] + absolute["new"][axis+2]
+                  - absolute["old"][axis] - absolute["old"][axis+2]) / 2 for axis in (0, 1)]
+        moved = any(abs(delta[axis]) > 1 + abs(
+            dimensions["new"][axis] - dimensions["old"][axis]) / 2 for axis in (0, 1))
+        independent = moved and any(abs(delta[axis] - parent_motion[axis]) > 2 for axis in (0, 1))
+        if alignment["accepted"] and not independent and not reversals[i]:
+            continue
+        shape = tuple(max(boxes[role][axis+2]-boxes[role][axis] for role in ink) for axis in (1, 0))
+        child_ink, child_masks, child_origins, child_regions = {}, {}, {}, {}
+        for role, box in boxes.items():
+            x0, y0, x1, y1 = box
+            child_ink[role] = np.zeros(shape, dtype=np.uint8)
+            child_masks[role] = np.zeros(shape, dtype=np.uint8)
+            child_ink[role][:y1-y0, :x1-x0] = ink[role][y0:y1, x0:x1]
+            child_masks[role][:y1-y0, :x1-x0] = masks[role][y0:y1, x0:x1]
+            child_origins[role] = (origins[role][0] + x0, origins[role][1] + y0)
+            child_regions[role] = Region(regions[role].page, absolute[role], "local_subview")
+        child_residuals, child_alignment = _align(
+            child_ink["old"], child_ink["new"], max(1, int(np.ceil(scale * .3))))
+        subview = {"old_index": i+1, "new_index": j+1, "identity": identity,
+                   "order_reversal": reversals[i],
+                   "old_size_pt": dimensions["old"], "new_size_pt": dimensions["new"]}
+        subview["drawing_size_changed"] = any(
+            abs(dimensions["new"][axis] - dimensions["old"][axis]) > 1
+            and abs(dimensions["new"][axis] / dimensions["old"][axis] - 1) > .02
+            for axis in (0, 1))
+        metadata = {
+            "method": VERSION, "pairing_method": "mutual_subview_shape_and_ink",
+            "region_source": "local_subview", "dpi": scale * 72,
+            "old_region_pt": list(absolute["old"]), "new_region_pt": list(absolute["new"]),
+            "center_displacement_pt": {"dx": round(delta[0], 4), "dy": round(delta[1], 4)},
+            "alignment": child_alignment, "subview": subview,
+            "limitations": LIMITATIONS + [
+                "子图仅按封闭轮廓与内部墨迹建立候选对应，不识别零件种类或实物身份。",
+                "指纹归一化只用于配对；外观比较保持原物理尺度。中心位移不等于实物部件移动。",
+                "位置变化不表示内容一致；未可靠对齐的外观仍留在父区域待核。",
+                "子图绘图尺寸变化会产生轮廓残差，不能据此认定实物结构或尺寸改变。",
+            ],
+        }
+        if moved:
+            direction = ("左右顺序反转" if reversals[i][0]["axis"] == "horizontal" else "上下顺序反转"
+                         ) if reversals[i] else "中心位置变化"
+            emit("visual_moved",
+                 *[_side(child_regions[role], sizes[role],
+                         [_location(absolute[role], regions[role].page, sizes[role])],
+                         scale, child_origins[role]) for role in ink],
+                 {**metadata, "classification": f"子图{i+1} → 子图{j+1}：{direction}候选"},
+                 identity["score"])
+            stats["moved"] += 1
+            emitted += 1
+        if not child_alignment["accepted"]:
+            continue
+        stats["resolved_residual_pairs"] += 1
+        for role, residual in zip(ink, residuals):
+            x0, y0, x1, y1 = boxes[role]
+            residual[y0:y1, x0:x1] = 0
+        for text, change, label in ((False, "visual_modified", "外观"),
+                                   (True, "visual_annotation", "文字/标注")):
+            evidence, pixels, fractions = {}, {}, {}
+            for role, residual in zip(ink, child_residuals):
+                mask = residual & (child_masks[role] if text else 1 - child_masks[role])
+                locations, count, omitted_count = _components(
+                    mask, child_origins[role], scale, child_regions[role], sizes[role])
+                unshown += omitted_count
+                evidence[role] = _side(child_regions[role], sizes[role], locations, scale, child_origins[role])
+                pixels[role] = count
+                fractions[role] = round(count / max(1, int(child_ink[role].sum())), 6)
+            if max(pixels.values()) >= max(20, round(scale * scale * 2)):
+                emit(change, evidence["old"], evidence["new"],
+                     {**metadata, "classification": f"子图{i+1} → 子图{j+1}：独立对齐后{label}候选",
+                      "changed_pixels": pixels, "residual_fraction": fractions}, identity["score"])
+                emitted += 1
+    return stats, emitted, unshown
+
+
 def compare_graphics(old_path: Path, new_path: Path, old_response=None, new_response=None,
                      *, dpi=200, pdf_lock=None, progress=None):
     """Compare all CU figures (or a whole-page fallback), keeping per-side evidence."""
@@ -362,20 +466,31 @@ def compare_graphics(old_path: Path, new_path: Path, old_response=None, new_resp
                 "old_pages": len(sizes["old"]), "new_pages": len(sizes["new"]),
                 "paired_regions": 0, "unchanged_regions": 0, "unpaired_regions": 0, "uncertain_regions": 0,
                 "fallback_pages": 0, "unshown_components": 0, "warnings": [],
+                "subview_matching": dict.fromkeys(
+                    ("old_candidates", "new_candidates", "matched", "moved", "unresolved",
+                     "omitted", "resolved_residual_pairs", "order_reversal_pairs"), 0),
                 "page_geometry_changes": [],
                 "parameters": {"ink_threshold": 180, "pixel_tolerance_pt": .3,
-                               "min_component_area_pt2": 1, "max_render_pixels": MAX_PIXELS},
+                               "min_component_area_pt2": 1, "max_render_pixels": MAX_PIXELS,
+                               "subviews": {"min_edge_pt": 14, "max_candidates_per_region": 24,
+                                            "min_identity_score": .80, "min_identity_margin": .06,
+                                            "min_center_displacement_pt": 1}},
                 "limits": LIMITATIONS + [
                     f"每侧每图形类别最多显示{MAX_BOXES}个像素区域，超出数量明确记录。",
                     "按物理页序比较；页重排需复核。CU未标出的图形可能未被覆盖。",
+                    "子图仅在已配对父区域内跨位置匹配；开口/相连轮廓、重复视图可能无法唯一拆分或对应。",
                 ]}
 
     def emit(change, left, right, metadata, score=0):
+        if change == "visual_moved":
+            for side in (left, right):
+                if side:
+                    side["detail"] = "框为对应视图的位置范围，非变化像素框；内容残差另行报告或待核。"
         items.append({
             "id": f"G{len(items)+1:03d}", "channel": "graphics", "change": change,
             "region": "本地图形", "key": metadata["classification"], "review_required": True,
             "review_reasons": metadata.get("limitations", []) + ["图形外观候选需按原图复核。"],
-            "match": {"method": "mutual_region_overlap_and_literal_anchors",
+            "match": {"method": metadata.get("pairing_method", "mutual_region_overlap_and_literal_anchors"),
                       "score": round(score, 4), "certainty": "uncertain"},
             "old": left, "new": right, "graphics": metadata,
         })
@@ -441,7 +556,14 @@ def compare_graphics(old_path: Path, new_path: Path, old_response=None, new_resp
             }
             masks = {role: _text_mask(responses[role], sizes[role], pair[role],
                                      origins[role], shape, scale) for role in sizes}
-            emitted = False
+            subview_stats, child_emitted, child_omitted = _refine_subviews(
+                ink, origins, scale, pair, {role: sizes[role][page_number-1] for role in sizes},
+                masks, alignment, residuals, emit)
+            for key, value in subview_stats.items():
+                coverage["subview_matching"][key] += value
+            coverage["unshown_components"] += child_omitted
+            emitted = child_emitted > 0
+            parent_emitted = False
             line_runs = {role: alignment.get(f"left_lines_{role}_pixels", []) for role in sizes}
             if alignment.get("outline_old_pixels") and len(line_runs["old"]) != len(line_runs["new"]):
                 outlines = {role: alignment[f"outline_{role}_pixels"] for role in sizes}
@@ -474,6 +596,7 @@ def compare_graphics(old_path: Path, new_path: Path, old_response=None, new_resp
                     "limitations": LIMITATIONS + ["线条数量是渲染特征，不自动解释为封口工艺或实物结构。"],
                 }, score)
                 emitted = True
+                parent_emitted = True
             for channel, change, label in (
                 (False, "visual_modified", "图形/线条外观变化候选"),
                 (True, "visual_annotation", "文字/标注布局变化候选"),
@@ -489,6 +612,7 @@ def compare_graphics(old_path: Path, new_path: Path, old_response=None, new_resp
                 if max(pixels.values()) < max(20, round(scale * scale * 2)):
                     continue
                 emitted = True
+                parent_emitted = True
                 actual_change = change if alignment["accepted"] else "visual_uncertain"
                 emit(actual_change, side_values["old"], side_values["new"], {
                     "classification": label if alignment["accepted"] else "图形像素差异待核（未可靠对齐）",
@@ -499,7 +623,7 @@ def compare_graphics(old_path: Path, new_path: Path, old_response=None, new_resp
                 }, score)
             same_outline_size = all(abs(alignment.get(key, 1) - 1) <= .01
                                     for key in ("outline_width_ratio", "outline_height_ratio"))
-            moved = (alignment["accepted"] and same_outline_size
+            moved = (alignment["accepted"] and same_outline_size and not subview_stats["moved"]
                      and max(abs(v) for v in translation.values()) > 1)
             if moved:
                 emit("visual_moved",
@@ -512,8 +636,14 @@ def compare_graphics(old_path: Path, new_path: Path, old_response=None, new_resp
                       "region_source": pair["old"].kind, "limitations": LIMITATIONS}, score)
             if not emitted and not moved:
                 coverage["unchanged_regions"] += 1
-            if emitted and not alignment["accepted"]:
+            if parent_emitted and not alignment["accepted"]:
                 coverage["uncertain_regions"] += 1
+    if coverage["subview_matching"]["unresolved"]:
+        coverage["warnings"].append(
+            f"{coverage['subview_matching']['unresolved']}个子图候选未建立唯一对应；"
+            "保留父区域像素复核，不将未配对解释为增删。")
+    if coverage["subview_matching"]["omitted"]:
+        coverage["warnings"].append("某父区封闭子图超过24个，跳过该区子图配对，避免截断造成假唯一匹配。")
     if coverage["unshown_components"]:
         coverage["warnings"].append(f"{coverage['unshown_components']}个小区域未绘制，不能据此认定无变化。")
     if coverage["uncertain_regions"]:

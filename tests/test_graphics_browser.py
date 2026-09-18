@@ -369,6 +369,43 @@ class GraphicsBrowserTests(unittest.TestCase):
         self.page.locator("#old-fit").click()
         expect(self.page.locator('#old-stage rect[data-id="G007"]')).to_have_count(0)
 
+    def test_crossed_subviews_show_independent_locations_and_identity_not_accuracy(self):
+        item = next(entry for entry in self.result["items"] if entry["id"] == "G003")
+        item["old"]["locations"] = [location(x=.1, y=.2)]
+        item["new"]["locations"] = [location(x=.7, y=.2)]
+        item["graphics"].update({
+            "region_source": "local_subview",
+            "center_displacement_pt": {"dx": 450, "dy": 0},
+            "subview": {"old_index": 1, "new_index": 2,
+                        "identity": {"score": .93, "old_margin": .21, "new_margin": .23},
+                        "order_reversal": [{"axis": "horizontal", "old_index": 2, "new_index": 1}],
+                        "drawing_size_changed": True},
+        })
+        self.result["graphics_coverage"]["subview_matching"] = {
+            "old_candidates": 2, "new_candidates": 2, "matched": 2, "moved": 2,
+            "unresolved": 0, "omitted": 0, "resolved_residual_pairs": 2, "order_reversal_pairs": 1,
+        }
+        self.compare()
+        self.select("G003")
+        detail = self.page.locator(".graphics-detail")
+        for text in ("旧子图 1 → 新子图 2", "子图中心位移", "Δx 450 pt", "0.21 / 0.23",
+                     "相对顺序反转", "非语义零件识别", "不等于实物尺寸变化", "但不表示内容相同"):
+            expect(detail).to_contain_text(text)
+        for side in ("old", "new"):
+            for zoom in ("fit", "150", "200"):
+                self.page.locator(f"#{side}-zoom").select_option(zoom)
+                self.assert_geometry(side, "G003", item[side]["locations"][0])
+            expect(self.page.locator(f"#{side}-evidence-note")).to_contain_text("非残差框")
+        self.select("G001")
+        expect(self.page.locator(".graphics-detail")).to_contain_text("实际局部残差像素")
+        expect(self.page.locator(".graphics-detail")).not_to_contain_text("子图中心位移")
+        self.page.locator(".coverage-panel > summary").click()
+        expect(self.page.locator(".graphics-coverage")).to_contain_text("相对顺序反转对数")
+        self.page.locator("#new-upload").set_input_files({
+            "name": "replacement.pdf", "mimeType": "application/pdf", "buffer": b"%PDF-1.4\n%%EOF"})
+        expect(self.page.locator("rect.evidence-box")).to_have_count(0)
+        expect(self.page.locator(".graphics-detail")).to_have_count(0)
+
     def test_multisource_navigation_and_keyboard_selection(self):
         self.compare()
         button = self.page.locator('.result-item[data-id="G002"] button')
