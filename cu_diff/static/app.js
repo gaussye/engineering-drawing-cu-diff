@@ -157,7 +157,8 @@
           state[side].pending = false;
           updateControls();
           if (!sides.some((s) => state[s].pending)) {
-            status(sides.every((s) => state[s].document) ? "两份图纸已就绪，请开始对比。" : "等待上传有效的旧版和新版图纸。");
+            status(identicalFiles() ? "两侧是同一份文件，请更换其中一份后再对比。"
+              : sides.every((s) => state[s].document) ? "两份图纸已就绪，请开始对比。" : "等待上传有效的旧版和新版图纸。");
           }
         }
       }

@@ -141,6 +141,7 @@ class BrowserTests(unittest.TestCase):
             "() => document.querySelector('#new-stage img')?.naturalWidth > 0")
         self.assertTrue(self.page.locator("#compare-button").is_disabled())
         self.assertIn("完全相同", self.page.locator("#file-identity-status").inner_text())
+        self.assertIn("请更换其中一份", self.page.locator("#job-status").inner_text())
         self.assertEqual(self.page.locator("#old-identity").get_attribute("title"),
                          self.page.locator("#new-identity").get_attribute("title"))
         self.assertEqual(self.page.locator("rect.evidence-box").count(), 0)
