@@ -2,7 +2,9 @@
 
 ``compare_documents(old, new)`` compares custom ``Items`` and full OCR lines
 independently. Unpaired evidence is never called a confirmed addition/deletion.
-Only NFC and whitespace normalization are used for text equality. Coordinates
+NFC and whitespace normalization establish literal equality; validated date
+spacing in explicitly named title-date fields is classified as formatting_only.
+Coordinates
 are kept in their original coordinate system; no scale, warp, or rotation is
 applied. All input evidence is retained in each entry's ``raw`` member.
 Page geometry inherits a content-level unit when the page has no explicit unit.
@@ -20,59 +22,20 @@ from difflib import SequenceMatcher
 import json
 import math
 import re
-import unicodedata
+
+from .evidence import normalize_date_spacing, normalize_text, parse_source
+from .table_diff import refine_bom
 
 
 _CATEGORIES = {
     "BOM", "certification", "packaging", "dimension", "label", "note",
     "drawing", "title", "other",
 }
-_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
-_SOURCE = re.compile(r"D\(\s*(\d+)\s*((?:,\s*" + _NUMBER + r"\s*)+)\)")
 _BOM_ROW_NUMBER = re.compile(r"^(\d+)[.)]?\s+(.+)$")
 _BOM_QUANTITY = re.compile(r"(?<!\S)\d+(?:[.,]\d+)?\s*(?:pcs|g)\b", re.IGNORECASE)
-
-
-def normalize_text(value):
-    """Normalize whitespace and NFC, never case, punctuation, or identifiers."""
-    return " ".join(unicodedata.normalize("NFC", value).split())
-
-
-def parse_source(source):
-    """Parse REST D(page,x,y,width,height) and four-vertex polygon sources.
-
-    Multiple polygons separated by whitespace, commas, or semicolons, and lists
-    of supported source strings are accepted. Unsupported/partially understood
-    source syntax returns no polygons; the caller still retains the raw source.
-    Rectangle widths/heights become polygon extents in the original units;
-    they are not interpreted as bottom-right coordinates or scaled to a page.
-    """
-    if isinstance(source, list):
-        if not source:
-            return []
-        parsed = [parse_source(part) for part in source]
-        return [polygon for group in parsed for polygon in group] if all(parsed) else []
-    if not isinstance(source, str) or not source.strip():
-        return []
-    matches = list(_SOURCE.finditer(source))
-    if not matches or re.sub(r"[\s;,]", "", _SOURCE.sub("", source)):
-        return []
-    polygons = []
-    for match in matches:
-        page = int(match.group(1))
-        coordinates = [float(value.strip()) for value in match.group(2).split(",")[1:]]
-        if page < 1 or len(coordinates) not in (4, 8) or not all(map(math.isfinite, coordinates)):
-            return []
-        if len(coordinates) == 4:
-            x, y, width, height = coordinates
-            if width <= 0 or height <= 0 or not all(map(math.isfinite, (x + width, y + height))):
-                return []
-            coordinates = [x, y, x + width, y, x + width, y + height, x, y + height]
-        polygons.append({
-            "page_number": page,
-            "points": [coordinates[index:index + 2] for index in range(0, 8, 2)],
-        })
-    return polygons
+_DATE_KEY = re.compile(
+    r"date|(?:design(?:ed)?|drawn|drawing|check(?:ed)?|approv(?:ed)?)(?:\s+by|\s+date)"
+    r"|(?:设计|绘图|审核|核准)(?:人|者|日期)?|日期", re.IGNORECASE)
 
 
 def _valid_number(value):
@@ -388,7 +351,12 @@ def _record(old, new, method, score, certainty):
         change = "unpaired_old"
     else:
         if _text(old) != _text(new):
-            change = "modified"
+            date_fields = all(
+                value["category"] == "title" and _DATE_KEY.fullmatch(normalize_text(value["key"]))
+                for value in (old, new))
+            change = ("formatting_only" if date_fields and
+                      normalize_date_spacing(old["raw_text"]) == normalize_date_spacing(new["raw_text"])
+                      else "modified")
         elif detail_changed or _identity(old) != _identity(new):
             change = "interpretation_only"
         else:
@@ -398,6 +366,8 @@ def _record(old, new, method, score, certainty):
         reasons.append("generated Detail changed; retained separately from document text")
     if change == "interpretation_only":
         reasons.append("generated interpretation changed without a RawText modification")
+    if change == "formatting_only":
+        reasons.append("valid title date differs only in separator-adjacent spacing")
     for side, value in (("old", old), ("new", new)):
         if value is not None:
             reasons.extend(f"{side}: {reason}" for reason in value["review_reasons"])
@@ -665,6 +635,7 @@ def _coverage(records, old_count, new_count):
         "unpaired_new": sum(record["change"] == "unpaired_new" for record in records),
         "modified_pairs": sum(record["change"] == "modified" for record in records),
         "interpretation_only_pairs": sum(record["change"] == "interpretation_only" for record in records),
+        "formatting_only_pairs": sum(record["change"] == "formatting_only" for record in records),
         "unchanged_pairs": sum(record["change"] == "unchanged" for record in records),
         "reconciled_groups": sum(record["change"] == "reconciled" for record in records),
         "relocated_pairs": sum(record["change"] == "relocated" for record in records),
@@ -692,6 +663,7 @@ def compare_documents(old, new, *, confidence_threshold=0.8):
     uncertainties = old_uncertainties + new_uncertainties
     service_warnings = old_service_warnings + new_service_warnings
     item_records, pairing_warnings = _compare_items(old_items, new_items)
+    refine_bom(item_records, old, new)
     ocr_records = _compare_lines(old_lines, new_lines)
     warnings = old_warnings + new_warnings + pairing_warnings + old_diagnostics + new_diagnostics
     review_required = (bool(warnings) or bool(uncertainties) or bool(service_warnings)

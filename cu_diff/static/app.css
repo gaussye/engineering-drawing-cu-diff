@@ -112,6 +112,12 @@ summary { cursor: pointer; }
 .detail-content { overflow: auto; flex: 1; padding: 14px 20px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px 24px; }
 .detail-placeholder { grid-column: 1 / -1; align-self: center; text-align: center; color: var(--cp-text-soft); font-size: 12px; letter-spacing: 1px; }
 .source-detail { min-width: 0; }
+.cell-diff { grid-column: 1 / -1; font-size: 12px; }
+.cell-diff h3 { font-size: 12px; margin-bottom: 8px; }
+.cell-diff table { width: 100%; border-collapse: collapse; text-align: left; }
+.cell-diff th, .cell-diff td { border: 1px solid var(--cp-border); padding: 6px 10px; overflow-wrap: anywhere; }
+.cell-diff thead { background: var(--cp-surface-soft); }
+.cell-diff p { color: var(--cp-text-muted); font-size: 11px; margin-top: 8px; }
 .source-detail h3 { font-size: 11px; color: var(--cp-text-soft); margin-bottom: 6px; font-weight: 500; }
 .source-text { font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .source-detail details { margin-top: 8px; color: var(--cp-text-muted); font-size: 11px; }

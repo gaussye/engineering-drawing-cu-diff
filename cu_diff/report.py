@@ -8,6 +8,7 @@ CHANGE_LABELS = {
     "modified": "提取原文不同",
     "relocated": "行号/位置重排",
     "interpretation_only": "仅生成解释不同（不是原文变更）",
+    "formatting_only": "仅日期空格/表格格式不同（不计变更）",
     "unpaired_old": "仅旧侧未配对（不确认删除）",
     "unpaired_new": "仅新侧未配对（不确认新增）",
     "unchanged": "提取原文相同",
@@ -58,6 +59,23 @@ def write_report(result: dict, path: Path) -> None:
             cell(f"{(old or {}).get('confidence')} / {(new or {}).get('confidence')}"),
             cell(match) + ("；需人工复核" if diff.get("review_required") else "；候选匹配"),
         ]) + " |")
+    lines.extend(["", "### BOM单元格细化", "",
+                  "仅列出配对后的变化列；缺失或冲突时保留整行原文，但不把整行当作变化位置。",
+                  "", "| 项目 | 列 | 旧值 | 新值 | 旧 / 新单元格来源 |",
+                  "|---|---|---|---|---|"])
+    for diff in result.get("differences", []):
+        cells = diff.get("cell_comparison")
+        if not cells:
+            continue
+        if cells["status"] != "complete":
+            lines.append(f"| {cell(diff['key'])} | 无法细化 | — | — | {cell(cells['issues'])} |")
+        for field in cells["fields"]:
+            if field["change"] not in ("modified", "relocated"):
+                continue
+            lines.append("| " + " | ".join([
+                cell(diff["key"]), cell(field["label"]), evidence(field["old"]), evidence(field["new"]),
+                cell(f"{field['old']['source']} / {field['new']['source']}"),
+            ]) + " |")
     lines.extend([
         "", "## 覆盖与遗漏检查", "", "```json",
         json.dumps(result.get("coverage", {}), ensure_ascii=False, indent=2), "```", "",

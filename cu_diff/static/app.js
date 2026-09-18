@@ -5,6 +5,7 @@
   const sideName = { old: "旧版", new: "新版" };
   const changes = {
     modified: "提取原文不同", relocated: "行号重排", interpretation_only: "仅解释差异",
+    formatting_only: "仅格式差异（不计变更）",
     unpaired_old: "旧侧未配对（非确认删除）", unpaired_new: "新侧未配对（非确认新增）",
     unchanged: "提取原文相同", reconciled: "OCR 分段已合并（非原文变更）"
   };
@@ -278,6 +279,7 @@
       if ($("channel-filter").value !== "all" && item.channel !== $("channel-filter").value) return false;
       switch ($("review-filter").value) {
         case "paired": return pairedDifference(item);
+        case "formatting": return item.change === "formatting_only";
         case "review": return Boolean(item.review_required);
         case "uncertain": return uncertain(item);
         case "unpaired": return unpaired(item);
@@ -337,7 +339,8 @@
           x: box.x * 1000, y: box.y * 1000, width: box.width * 1000, height: box.height * 1000,
           class: `evidence-box${pairedDifference(item) ? "" : " review-evidence"}${item.id === state.selected ? " selected" : ""}`,
           "data-id": item.id, "vector-effect": "non-scaling-stroke", tabindex: 0, role: "button",
-          "aria-label": `${item.id} ${item.key || item.region || ""}，${sideName[side]}第 ${s.page} 页`
+          "data-field": loc.field || "",
+          "aria-label": `${item.id} ${loc.label || item.key || item.region || ""}，${sideName[side]}第 ${s.page} 页`
         });
         rect.addEventListener("click", () => selectItem(item.id));
         rect.addEventListener("keydown", (event) => {
@@ -402,13 +405,39 @@
     content.replaceChildren();
     $("detail-meta").textContent = item ? `${item.id} · ${changes[item.change] || item.change} · 匹配 ${text(item.match?.method) || "未提供"} / 确定性 ${text(item.match?.certainty) || "未提供"} / 启发式得分 ${text(item.match?.score) || "未提供"}（非准确率）` : "选择索引或红框，联动定位两侧原文";
     if (!item) { content.append(el("p", "detail-placeholder", "保留原文 · 分离解释 · 不推测缺失证据")); return; }
+    if (item.cell_comparison) {
+      const cells = item.cell_comparison, section = el("section", "cell-diff");
+      section.append(el("h3", "", "实际变化的列（CU 单元格证据）"));
+      if (cells.status === "complete") {
+        const changed = cells.fields.filter((field) => ["modified", "relocated"].includes(field.change));
+        const table = el("table"), header = el("tr");
+        for (const label of ["列", "旧图", "新图"]) header.append(el("th", "", label));
+        const head = el("thead"); head.append(header); table.append(head);
+        const body = el("tbody");
+        for (const field of changed) {
+          const row = el("tr");
+          row.dataset.field = field.key;
+          row.append(el("th", "", field.label), el("td", "", field.old.raw_text),
+            el("td", "", field.new.raw_text));
+          body.append(row);
+        }
+        table.append(body); section.append(table);
+        section.append(el("p", "", `${changed.length} 列变化候选；其余 ${cells.fields.length - changed.length} 列值相同，不画差异框。数量/单位合列与拆列按相同语义比较；单元格没有独立置信度，不代表已签核。`));
+      } else {
+        section.append(el("p", "", `未能可靠细化到单元格，不再整行标红：${cells.issues.join("；")}`));
+      }
+      content.append(section);
+    }
+    if (item.change === "formatting_only") {
+      content.append(el("p", "review-reasons", "仅有效日期分隔符旁的空格，或表格列值一致的排版/数量单位格式不同；原文保留，不计工程变更。"));
+    }
     if (unpaired(item)) {
       content.append(el("p", "review-reasons",
         "此项不是已确认差异：自动配对未找到对应项，可能是 OCR 分段、漏识别或字段命名不同。另一侧没有配对证据不等于图纸没有该内容，不能认定新增或删除。"));
     }
     for (const side of sides) {
       const source = item[side], section = el("section", "source-detail");
-      section.append(el("h3", "", `${sideName[side]} / 原始文本`));
+      section.append(el("h3", "", `${sideName[side]} / ${item.cell_comparison ? "整行原文（上下文，非整行变更）" : "原始文本"}`));
       section.append(el("p", "source-text", source ? (source.raw_text ?? "未提供原文") : "未配对到证据（不代表原图没有）"));
       if (source) {
         section.append(el("p", "source-meta", `来源：${text(source.source) || "未提供"} · 置信度：${text(source.confidence) || "未提供"}${source.location_error ? ` · 无法定位：${source.location_error}` : ""}`));
@@ -478,7 +507,8 @@
           sides.forEach((side) => { renderBoxes(side); evidenceNote(side); });
           const hidden = data.result.items.filter((item) => item.change === "interpretation_only").length;
           const unresolved = data.result.items.filter(unpaired).length;
-          status(`对比完成 · ${data.result.items.filter(pairedDifference).length} 条已配对差异候选 · ${unresolved} 条未配对转入待复核${hidden ? ` · ${hidden} 个仅解释差异默认隐藏` : ""} · 不是已确认变更数量`);
+          const formatting = data.result.items.filter((item) => item.change === "formatting_only").length;
+          status(`对比完成 · ${data.result.items.filter(pairedDifference).length} 条已配对差异候选 · ${unresolved} 条未配对待复核 · ${formatting} 条仅格式差异${hidden ? ` · ${hidden} 个仅解释差异默认隐藏` : ""} · 非已确认变更数`);
           return;
         }
         if (!["queued", "running"].includes(data.status)) throw new Error("任务状态异常，请重试。");

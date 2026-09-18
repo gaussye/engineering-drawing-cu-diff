@@ -17,6 +17,10 @@ from playwright.sync_api import sync_playwright
 from waitress import create_server
 
 from cu_diff.web import create_app
+from cu_diff.compare import compare_documents
+from cu_diff.web_evidence import web_result
+from test_compare import item, source
+from test_table_diff import bom_operation
 from test_web import FakeClient, pdf_bytes
 
 
@@ -131,6 +135,68 @@ class BrowserTests(unittest.TestCase):
         self.page.wait_for_function(
             "() => document.body.textContent.includes('Synthetic CU failure')", timeout=15000)
         self.assertEqual(self.page.locator("rect.evidence-box").count(), 0)
+
+    def bom_result(self, missing_table=False):
+        old, new = bom_operation(), bom_operation("SYN-B", "BRAVO", split=True)
+        for response, date in ((old, "2024. 02. 29"), (new, "2024.02.29")):
+            response["result"]["contents"][0]["fields"]["Items"]["valueArray"].append(
+                item(f"Design by TEST {date}", region="title", category="title",
+                     key="designed by", evidence=source(x=200, y=200, width=100)))
+        if missing_table:
+            del new["result"]["contents"][0]["tables"]
+        documents = self.page.evaluate(
+            "async () => (await (await fetch('/api/bootstrap')).json()).documents")
+        result = web_result(compare_documents(old, new), documents, {})
+        self.page.route("**/api/jobs/*", lambda route: route.fulfill(
+            json={"status": "succeeded", "result": result}))
+        return result
+
+    def test_changed_cells_only_at_fit_and_zoom_and_date_not_in_changes(self):
+        self.upload_pair()
+        result = self.bom_result()
+        bom = next(entry for entry in result["items"] if entry.get("cell_comparison"))
+        date = next(entry for entry in result["items"] if entry["key"] == "designed by")
+        self.wait_result()
+        self.assertEqual(self.page.locator("#results-list .result-item").count(), 1)
+        self.page.locator(f'.result-item[data-id="{bom["id"]}"] button').click()
+        self.assertEqual(self.page.locator(".cell-diff tbody tr").count(), 2)
+        for role in ("old", "new"):
+            for zoom in ("fit", "150", "fit"):
+                self.page.locator(f"#{role}-zoom").select_option(zoom)
+                boxes = self.page.locator(f'#{role}-stage rect[data-id="{bom["id"]}"]')
+                self.assertEqual(boxes.count(), 2)
+                self.assertEqual({box.get_attribute("data-field") for box in boxes.all()},
+                                 {"part_number", "manufacturer"})
+                for expected in bom[role]["locations"]:
+                    box = self.page.locator(f'#{role}-stage rect[data-field="{expected["field"]}"]')
+                    # Compare source geometry, excluding the SVG selection stroke.
+                    actual = box.evaluate("""node => {
+                      const r = node.getBoundingClientRect();
+                      return {x:r.x, y:r.y, width:r.width, height:r.height};
+                    }""")
+                    image = self.page.locator(f"#{role}-stage img").bounding_box()
+                    for measured, target in (
+                        (actual["x"] - image["x"], image["width"] * expected["x"]),
+                        (actual["y"] - image["y"], image["height"] * expected["y"]),
+                        (actual["width"], image["width"] * expected["width"]),
+                        (actual["height"], image["height"] * expected["height"]),
+                    ):
+                        self.assertAlmostEqual(measured, target, delta=2)
+        self.assertEqual(self.page.locator(f'rect[data-id="{date["id"]}"]').count(), 0)
+        self.page.locator("#review-filter").select_option("formatting")
+        self.page.locator(f'.result-item[data-id="{date["id"]}"] button').click()
+        self.assertIn("不计工程变更", self.page.locator("#detail-content").inner_text())
+        for box in self.page.locator(f'rect[data-id="{date["id"]}"]').all():
+            self.assertIn("review-evidence", box.get_attribute("class"))
+
+    def test_missing_cell_evidence_does_not_fall_back_to_red_row(self):
+        self.upload_pair()
+        self.bom_result(missing_table=True)
+        self.wait_result()
+        self.page.locator("#results-list .result-item").first.click()
+        self.assertEqual(self.page.locator("rect.evidence-box").count(), 0)
+        self.assertIn("不再整行标红", self.page.locator("#detail-content").inner_text())
+        self.assertIn("无法可靠定位变化单元格", self.page.locator("#old-evidence-note").inner_text())
 
     def test_identical_uploads_are_visible_and_comparison_is_disabled(self):
         self.page.locator("#old-upload").set_input_files(self.old)

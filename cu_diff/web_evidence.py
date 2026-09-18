@@ -100,12 +100,37 @@ def web_result(comparison: dict, documents: dict, metadata: dict) -> dict:
     )
     for channel, records in channels:
         for record in records:
-            items.append({key: record.get(key) for key in
+            item = {key: record.get(key) for key in
                           ("region", "key", "change", "review_required", "review_reasons", "match")} | {
                 "id": f"D{len(items) + 1:03d}", "channel": channel,
                 "old": side(record.get("old"), "old"),
                 "new": side(record.get("new"), "new"),
-            })
+            }
+            cells = record.get("cell_comparison")
+            if cells:
+                fields = [{key: field[key] for key in ("key", "label", "change")} | {
+                    role: side(field[role], role) for role in ("old", "new")
+                } for field in cells["fields"]]
+                item["cell_comparison"] = {
+                    "status": cells["status"], "issues": cells["issues"], "fields": fields,
+                }
+                if record["change"] in ("modified", "relocated"):
+                    for role in ("old", "new"):
+                        entry = item[role]
+                        entry["context_locations"] = entry["locations"]
+                        changed = [field for field in fields if field["change"] in ("modified", "relocated")]
+                        entry["locations"] = [
+                            dict(location, field=field["key"], label=field["label"])
+                            for field in changed for location in field[role]["locations"]
+                        ]
+                        errors = [field[role]["location_error"] for field in changed
+                                  if field[role]["location_error"]]
+                        if cells["status"] != "complete":
+                            errors.extend(cells["issues"])
+                        if not entry["locations"]:
+                            errors.append("无法可靠定位变化单元格；仅保留整行原文，不将整行画成差异框")
+                        entry["location_error"] = "；".join(dict.fromkeys(errors)) or None
+            items.append(item)
     return {
         "items": items, "coverage": comparison["coverage"], "warnings": comparison["warnings"],
         "metadata": {role: {key: data.get(key) for key in
