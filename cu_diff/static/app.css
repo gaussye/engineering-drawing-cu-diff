@@ -64,7 +64,9 @@ input[type="checkbox"] { accent-color: var(--cp-evidence); width: 15px; height: 
 .result-change { color: var(--cp-chrome-muted); font-size: 10px; white-space: nowrap; }
 .result-subtitle { grid-column: 2 / -1; color: var(--cp-chrome-muted); font-size: 11px; overflow-wrap: anywhere; }
 .result-item[data-channel="graphics"] .result-change { grid-column: 2 / -1; white-space: normal; }
-.result-item[data-change="visual_uncertain"] .result-change { color: var(--cp-warning); }
+.result-item[data-change="visual_uncertain"] .result-change,
+.result-item[data-change="visual_moved"] .result-change,
+.result-item[data-change="visual_scaled"] .result-change { color: var(--cp-warning); }
 .coverage-panel { border-top: 1px solid var(--cp-chrome-border); padding: 12px 20px; font-size: 12px; max-height: 32%; overflow: auto; }
 summary { cursor: pointer; }
 #coverage-content { padding-top: 10px; color: var(--cp-chrome-muted); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }

@@ -278,7 +278,8 @@ class Store:
             from .graphics import compare_graphics
             graphical = compare_graphics(
                 documents["old"].analysis_path, documents["new"].analysis_path,
-                responses["old"], responses["new"], pdf_lock=PDF_LOCK, progress=phase)
+                responses["old"], responses["new"], pdf_lock=PDF_LOCK, progress=phase,
+                include_transformations=True)
             result["items"].extend(graphical["items"])
             result["graphics_coverage"] = graphical["coverage"]
             with self.lock:

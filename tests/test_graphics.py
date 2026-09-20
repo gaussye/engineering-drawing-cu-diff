@@ -17,7 +17,9 @@ from cu_diff.cli import graphics as run_graphics_cli
 from cu_diff.graphics import GraphicsError, compare_graphics
 
 
-def drawing(path, *, dx=0, dy=0, lines=(20,), width=300, label="TEST A", pages=1, rotation=0):
+def drawing(path, *, dx=0, dy=0, lines=(20,), width=300, label="TEST A", pages=1, rotation=0,
+            scale_x=1, scale_y=None):
+    scale_y = scale_x if scale_y is None else scale_y
     with pymupdf.open() as pdf:
         for _ in range(pages):
             page = pdf.new_page(width=600, height=400)
@@ -29,12 +31,21 @@ def drawing(path, *, dx=0, dy=0, lines=(20,), width=300, label="TEST A", pages=1
                 page.draw_line((x+dx, 150+dy), (x+dx, 200+dy), width=.7)
             page.draw_circle((340+dx, 170+dy), 15, width=.7)
             page.insert_text((240+dx, 215+dy), label, fontsize=12)
-            page.set_rotation(rotation)
-        pdf.save(path)
+        with pymupdf.open() as output:
+            for page in pdf:
+                target = output.new_page(width=600, height=400)
+                target.show_pdf_page(pymupdf.Rect(100*(1-scale_x), 100*(1-scale_y),
+                                                100+500*scale_x, 100+300*scale_y),
+                                     pdf, page.number, keep_proportion=False)
+                target.set_rotation(rotation)
+            output.save(path)
 
 
-def layout(dx=0, dy=0, width=300, words=True):
+def layout(dx=0, dy=0, width=300, words=True, scale_x=1, scale_y=None):
+    scale_y = scale_x if scale_y is None else scale_y
     def src(box):
+        box = tuple(100+(value-100)*(scale_x if axis % 2 == 0 else scale_y)
+                    for axis, value in enumerate(box))
         x0, y0, x1, y1 = (value/72 for value in box)
         return f"D(1,{x0},{y0},{x1},{y0},{x1},{y1},{x0},{y1})"
     return {"status": "Succeeded", "result": {"contents": [{
@@ -94,6 +105,129 @@ class GraphicsTests(unittest.TestCase):
                     if i["graphics"]["method"] == "rectangular_interior_vertical_runs"]
         self.assertEqual(feature["old"]["locations"], [])
         self.assertEqual(len(feature["new"]["locations"]), 2)
+
+    def test_uniform_scale_is_not_default_design_content(self):
+        drawing(self.new, scale_x=1.2)
+        old, new = layout(), layout(scale_x=1.2)
+        plain = self.run_pair(old, new)
+        optional = compare_graphics(self.old, self.new, old, new, include_transformations=True)
+        self.assertEqual(plain["items"], [])
+        self.assertEqual(optional["coverage"]["design_content_items"], 0)
+        scaled, = [item for item in optional["items"] if item["change"] == "visual_scaled"]
+        for ratio in scaled["graphics"]["scale_ratio"].values():
+            self.assertAlmostEqual(ratio, 1.2, delta=.01)
+        self.assertAlmostEqual(scaled["graphics"]["alignment"]["scale_ratio"], 1.2, delta=.01)
+        self.assertEqual(scaled["graphics"]["evidence_role"], "transformation_frame")
+        self.assertTrue(scaled["graphics"]["optional_transformation"])
+        for role in ("old", "new"):
+            self.assertEqual(scaled[role]["locations"], scaled[role]["context_locations"])
+            self.assertEqual(scaled[role]["evidence_role"], "transformation_frame")
+        self.assertIn("uniform_drawing_scale", plain["coverage"]["ignored_changes"])
+
+    def test_uniform_scaling_range_and_raster_rounding(self):
+        for factor in (.65, .8, .96, 1.05, 1.3, 1.5):
+            with self.subTest(scale=factor):
+                drawing(self.new, scale_x=factor)
+                result = compare_graphics(self.old, self.new, layout(), layout(scale_x=factor),
+                                          include_transformations=True)
+                self.assertEqual(result["coverage"]["design_content_items"], 0)
+                scaled, = [item for item in result["items"] if item["change"] == "visual_scaled"]
+                for ratio in scaled["graphics"]["scale_ratio"].values():
+                    self.assertAlmostEqual(ratio, factor, delta=.01)
+
+    def test_near_uniform_scale_diagnostics_keep_actual_axis_ratios(self):
+        for factor, aspect_delta in ((.96, .002), (.96, .007), (1.05, .002), (1.05, .007)):
+            with self.subTest(scale=factor, aspect_delta=aspect_delta):
+                sy = factor*(1+aspect_delta)
+                drawing(self.new, scale_x=factor, scale_y=sy, lines=(8, 13, 20), label="TEST B")
+                old, new = layout(), layout(scale_x=factor, scale_y=sy)
+                plain = compare_graphics(self.old, self.new, old, new)
+                optional = compare_graphics(self.old, self.new, old, new, include_transformations=True)
+                self.assertEqual(plain["items"], [item for item in optional["items"]
+                                                 if not item["graphics"].get("optional_transformation")])
+                self.assertIn("visual_annotation", {item["change"] for item in plain["items"]})
+                feature, = [item for item in plain["items"]
+                            if item["graphics"]["method"] == "rectangular_interior_vertical_runs"]
+                self.assertEqual(feature["old"]["locations"], [])
+                self.assertEqual(len(feature["new"]["locations"]), 2)
+                scaled, = [item for item in optional["items"] if item["change"] == "visual_scaled"]
+                self.assertAlmostEqual(scaled["graphics"]["scale_ratio"]["x"], factor, delta=.005)
+                self.assertAlmostEqual(scaled["graphics"]["scale_ratio"]["y"], sy, delta=.005)
+                self.assertIsInstance(scaled["graphics"]["alignment"]["scale_ratio"], float)
+                self.assertTrue(optional["coverage"]["transformations_included"])
+                self.assertEqual(optional["coverage"]["transformation_candidates"]["visual_scaled"], 1)
+                self.assertFalse(plain["coverage"]["transformations_included"])
+
+    def test_centered_uniform_scaling_does_not_invent_translation(self):
+        drawing(self.new, scale_x=1.2, dx=-25, dy=-70/6)
+        result = compare_graphics(self.old, self.new, layout(),
+                                  layout(scale_x=1.2, dx=-25, dy=-70/6),
+                                  include_transformations=True)
+        self.assertEqual([item["change"] for item in result["items"]], ["visual_scaled"])
+
+    def test_optional_translation_is_separate_from_content(self):
+        drawing(self.new, dx=18, dy=12)
+        result = compare_graphics(self.old, self.new, layout(), layout(dx=18, dy=12),
+                                  include_transformations=True)
+        moved, = result["items"]
+        self.assertEqual(moved["change"], "visual_moved")
+        self.assertAlmostEqual(moved["graphics"]["translation_pt"]["dx"], 18, delta=.5)
+        self.assertAlmostEqual(moved["graphics"]["translation_pt"]["dy"], 12, delta=.5)
+        self.assertEqual(result["coverage"]["design_content_items"], 0)
+
+    def test_scale_with_new_or_deleted_lines_preserves_design_and_stable_ids(self):
+        for old_lines, new_lines in (((20,), (8, 13, 20)), ((8, 13, 20), (20,))):
+            with self.subTest(old=old_lines, new=new_lines):
+                drawing(self.old, lines=old_lines)
+                drawing(self.new, scale_x=1.2, lines=new_lines)
+                old, new = layout(), layout(scale_x=1.2)
+                plain = self.run_pair(old, new)
+                optional = compare_graphics(self.old, self.new, old, new, include_transformations=True)
+                content = [item for item in optional["items"]
+                           if not item["graphics"].get("optional_transformation")]
+                self.assertEqual(content, plain["items"])
+                self.assertTrue(content)
+                self.assertTrue(any(i["change"] == "visual_scaled" for i in optional["items"]))
+                feature, = [i for i in content if i["graphics"]["method"]
+                            == "rectangular_interior_vertical_runs"]
+                empty = "old" if len(new_lines) > len(old_lines) else "new"
+                self.assertEqual(feature[empty]["locations"], [])
+                self.assertEqual(len(feature["new" if empty == "old" else "old"]["locations"]), 2)
+
+    def test_scale_with_changed_text_remains_annotation(self):
+        drawing(self.new, scale_x=1.2, label="TEST B")
+        result = self.run_pair(new=layout(scale_x=1.2))
+        self.assertTrue(any(item["change"] == "visual_annotation" for item in result["items"]))
+
+    def test_translation_and_scale_are_separate_optional_frames(self):
+        drawing(self.new, dx=18, dy=12, scale_x=1.2)
+        old, new = layout(), layout(dx=18, dy=12, scale_x=1.2)
+        self.assertEqual(self.run_pair(old, new)["items"], [])
+        result = compare_graphics(self.old, self.new, old, new, include_transformations=True)
+        self.assertEqual({item["change"] for item in result["items"]}, {"visual_moved", "visual_scaled"})
+        moved = next(item for item in result["items"] if item["change"] == "visual_moved")
+        self.assertAlmostEqual(moved["graphics"]["translation_pt"]["dx"], 51.6, delta=1)
+        self.assertAlmostEqual(moved["graphics"]["translation_pt"]["dy"], 28.4, delta=1)
+
+    def test_nonuniform_deformation_is_not_normalized(self):
+        drawing(self.new, scale_x=1.2, scale_y=1.05)
+        result = compare_graphics(self.old, self.new, layout(),
+                                  layout(scale_x=1.2, scale_y=1.05), include_transformations=True)
+        self.assertTrue(any(item["change"] in {"visual_modified", "visual_uncertain"}
+                            for item in result["items"]))
+        self.assertNotIn("visual_scaled", {item["change"] for item in result["items"]})
+
+    def test_uniform_scale_rotated_page_has_bounded_original_evidence(self):
+        drawing(self.old, rotation=90)
+        drawing(self.new, scale_x=1.2, rotation=90)
+        result = compare_graphics(self.old, self.new, include_transformations=True)
+        self.assertEqual(result["coverage"]["design_content_items"], 0)
+        self.assertIn("visual_scaled", {item["change"] for item in result["items"]})
+        for item in result["items"]:
+            for role in ("old", "new"):
+                for loc in item[role]["locations"]:
+                    self.assertTrue(0 <= loc["x"] < loc["x"]+loc["width"] <= 1)
+                    self.assertTrue(0 <= loc["y"] < loc["y"]+loc["height"] <= 1)
 
     def test_resizing_is_not_warped_away_or_reported_as_pure_translation(self):
         drawing(self.new, width=330)
@@ -184,6 +318,24 @@ class GraphicsTests(unittest.TestCase):
         result = json.loads((output / "graphics.json").read_text(encoding="utf-8"))
         self.assertEqual(result["provenance"]["azure_calls"], 0)
         self.assertTrue((output / "graphics.zh.md").exists())
+
+    def test_cli_transformation_flags_filter_json_and_report(self):
+        drawing(self.new, scale_x=1.2, dx=18, dy=12)
+        for translation, scaling in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(translation=translation, scaling=scaling):
+                output = self.root / f"results-{translation}-{scaling}"
+                run_graphics_cli(argparse.Namespace(
+                    old=self.old, new=self.new, old_response=None, new_response=None,
+                    old_metadata=None, new_metadata=None, dpi=160, output=output,
+                    include_translation=translation, include_scaling=scaling))
+                result = json.loads((output / "graphics.json").read_text(encoding="utf-8"))
+                report = (output / "graphics.zh.md").read_text(encoding="utf-8")
+                changes = {item["change"] for item in result["items"]}
+                self.assertEqual("visual_moved" in changes, translation)
+                self.assertEqual("visual_scaled" in changes, scaling)
+                self.assertEqual(result["coverage"]["design_content_items"], 0)
+                for item in result["items"]:
+                    self.assertIn(item["id"], report)
 
     def test_cli_rejects_wrong_cu_document_hash(self):
         drawing(self.new)

@@ -9,6 +9,7 @@
     unpaired_old: "旧侧未配对（非确认删除）", unpaired_new: "新侧未配对（非确认新增）",
     unchanged: "提取原文相同", reconciled: "OCR 分段已合并（非原文变更）",
     visual_modified: "外观变化候选", visual_annotation: "文字/标注外观残差候选",
+    visual_moved: "视图平移（非内容变更）", visual_scaled: "绘图缩放（非实物尺寸）",
     visual_uncertain: "图形对应不确定（待复核）"
   };
   const channels = { schema: "结构化字段", graphics: "本地图形候选", ocr: "OCR 原文", unchanged: "一致项复核" };
@@ -65,11 +66,12 @@
     option.disabled = !state.graphicsEnabled;
     option.textContent = state.graphicsEnabled ? "本地图形候选" : "本地图形候选（未启用）";
     if (!state.graphicsEnabled && menu.value === "graphics") menu.value = "primary";
+    for (const id of ["show-translation", "show-scaling"]) $(id).disabled = !state.graphicsEnabled;
     $("graphics-status").textContent = state.graphicsEnabled
-      ? "本地图形检测已启用；只比较设计内容，忽略视图位置和顺序变化。候选不代表工程结论。"
+      ? "本地图形检测已启用；默认只比较设计内容。平移、绘图缩放可单独勾选显示，不计内容变更。"
       : graphicsUnavailable;
     $("filter-note").textContent = state.graphicsEnabled
-      ? "只比较设计内容，不报告视图平移或左右交换；跨位置配对仍用于核对内容。红色实框：原文或局部外观残差候选；黄色虚框：待复核证据。图形候选不能推断真实材质或尺寸变化；不确定项请切换「需要人工复核」。"
+      ? "平移和绘图缩放默认隐藏；勾选只改变本地显示，不重新调用 CU。红色实框：原文或内容残差候选；黄色虚框：复核证据或可选视图范围。缩放伴随内容修改时，内容候选仍保留；不确定项请切换「需要人工复核」。"
       : "默认显示结构化字段，不重复展示 OCR。红色实框为原文差异候选；黄色虚框仅供复核，不是确认变更。";
     $("coverage-content").textContent = `尚未运行对比。${state.graphicsEnabled ? "图形覆盖以本轮服务返回的统计为准。" : graphicsUnavailable}系统不会将缺失位置的证据推测成红框。`;
   }
@@ -300,6 +302,9 @@
     return Boolean(item.old && item.new) &&
       ["modified", "relocated", "visual_modified", "visual_annotation"].includes(item.change);
   }
+  function transformation(item) {
+    return ["visual_moved", "visual_scaled"].includes(item.change);
+  }
   function evidenceStyle(item) {
     return pairedDifference(item) ? "" : " review-evidence";
   }
@@ -309,13 +314,15 @@
   function visibleItems() {
     return (state.result?.items || []).filter((item) => {
       if (!state.graphicsEnabled && item.channel === "graphics") return false;
+      if (item.change === "visual_moved" && !$("show-translation").checked) return false;
+      if (item.change === "visual_scaled" && !$("show-scaling").checked) return false;
       if (!$("show-interpretation").checked && item.change === "interpretation_only") return false;
       const channel = $("channel-filter").value;
       if (channel === "primary") {
         if (!["schema", "graphics"].includes(item.channel)) return false;
       } else if (channel !== "all" && item.channel !== channel) return false;
       switch ($("review-filter").value) {
-        case "paired": return pairedDifference(item);
+        case "paired": return pairedDifference(item) || Boolean(item.old && item.new && transformation(item));
         case "formatting": return item.change === "formatting_only";
         case "review": return Boolean(item.review_required);
         case "uncertain": return uncertain(item);
@@ -328,6 +335,7 @@
     const list = $("results-list");
     list.replaceChildren();
     const items = visibleItems();
+    renderResultStatus(items);
     $("result-count").textContent = state.result ? String(items.length) : "—";
     $("result-count").title = state.result ? `当前显示 ${items.length} / 总计 ${state.result.items.length}` : "";
     if (!items.length) {
@@ -357,6 +365,16 @@
         row.append(button);
         list.append(row);
       }
+    }
+    function renderResultStatus(visible) {
+      const result = state.result;
+      if (!result) return;
+      const hidden = result.items.filter((item) => item.change === "interpretation_only").length;
+      const unresolved = result.items.filter(unpaired).length;
+      const formatting = result.items.filter((item) => item.change === "formatting_only").length;
+      const graphicsUncertain = result.items.filter((item) => item.change === "visual_uncertain").length;
+      const optional = visible.filter(transformation).length;
+      status(`对比完成 · ${result.items.filter(pairedDifference).length} 条已配对差异候选 · ${unresolved} 条未配对待复核${graphicsUncertain ? ` · ${graphicsUncertain} 条图形对应不确定，见人工复核` : ""} · ${formatting} 条仅格式差异${hidden ? ` · ${hidden} 个仅解释差异默认隐藏` : ""} · 非已确认变更数${state.graphicsEnabled ? optional ? ` · 另显示 ${optional} 条平移/缩放提示（不计内容变更）` : " · 仅设计内容" : " · 图形检测未接入/未启用"}`);
     }
   }
   function svgNode(tag, attributes) {
@@ -393,7 +411,7 @@
             class: `evidence-label${evidenceStyle(item)}`, "font-size": Math.max(10, 11 * 1000 / (stage.clientHeight || 1000)),
             "aria-hidden": "true"
           });
-          label.textContent = `${item.id}${pairedDifference(item) ? "" : " 待核"}`;
+          label.textContent = `${item.id}${transformation(item) ? " 视图范围" : pairedDifference(item) ? "" : " 待核"}`;
           svg.append(label);
           labelled = true;
         }
@@ -414,7 +432,7 @@
     }
     else if (!located.length) node.textContent = `${item.id} · 无法定位${source.location_error ? `：${source.location_error}` : "；保留原文，不绘制推测框"}`;
     else if (!located.some((loc) => loc.page === state[side].page)) node.textContent = `${item.id} · 本页无对应证据；证据位于第 ${[...new Set(located.map((loc) => loc.page))].join("、")} 页`;
-    else node.textContent = `${item.id} · 第 ${state[side].page} 页${item.channel === "graphics" ? "局部像素残差（候选）" : "证据"}${located.length > 1 ? ` · 共 ${located.length} 处，可切换页码查看` : ""}`;
+    else node.textContent = `${item.id} · 第 ${state[side].page} 页${transformation(item) ? "对应视图范围（平移/缩放提示，非内容残差）" : item.channel === "graphics" ? "局部像素残差（候选）" : "证据"}${located.length > 1 ? ` · 共 ${located.length} 处，可切换页码查看` : ""}`;
   }
   function selectItem(id) {
     const item = state.result?.items.find((i) => i.id === id);
@@ -448,9 +466,12 @@
   }
   function renderGraphicsDetails(item) {
     const graphics = item.graphics || {}, alignment = graphics.alignment || {}, subview = graphics.subview;
+    const optional = transformation(item);
     const section = el("section", "graphics-detail");
-    section.append(el("h3", "", "本地图形证据 · 候选，非工程结论"));
-    section.append(el("p", "graphics-disclaimer", item.change === "visual_uncertain"
+    section.append(el("h3", "", optional ? "可选视图提示 · 不计设计内容变更" : "本地图形证据 · 候选，非工程结论"));
+    section.append(el("p", "graphics-disclaimer", optional
+        ? "框表示对应视图的范围，不是变化像素。平移/绘图缩放不等于实物移动或尺寸改变，也不表示视图内容一定相同；内容残差独立保留。"
+        : item.change === "visual_uncertain"
         ? "无法可靠建立图形对应关系，必须人工复核；不能认定内容变化或无变化。"
         : "仅核对独立对齐后的设计内容；忽略视图位置变化，外观残差仍需复核，不能推断真实材质或尺寸。"));
     const metric = (value, suffix = "") => Number.isFinite(value) ? `${value}${suffix}` : "未提供";
@@ -462,10 +483,21 @@
       ["配准可靠性", alignment.accepted === true ? "配准已接受（不是工程内容确认）" : alignment.accepted === false ? "配准未接受 / 不可靠" : "未提供"],
       ["配准方法 / 响应", `${text(alignment.method) || "未提供"} / ${metric(alignment.response)}（非准确率）`],
       ["对应确定性", item.match?.certainty === "high" ? "高（非概率保证）" : "不确定，需人工复核"],
-      ["区域来源", ({ cu_figure: "CU 图形区域", local_subview: "本地轮廓子图（非语义零件识别）", page_fallback: "页面回退（对应关系需复核）" })[graphics.region_source] || text(graphics.region_source) || "未提供"],
-      ["残差像素（旧 / 新）", `${metric(graphics.changed_pixels?.old)} / ${metric(graphics.changed_pixels?.new)}`],
-      ["残差占比（旧 / 新）", `${fraction(graphics.residual_fraction?.old)} / ${fraction(graphics.residual_fraction?.new)}`]
+      ["区域来源", ({ cu_figure: "CU 图形区域", local_subview: "本地轮廓子图（非语义零件识别）", page_fallback: "页面回退（对应关系需复核）" })[graphics.region_source] || text(graphics.region_source) || "未提供"]
     ];
+    if (item.change === "visual_moved") {
+      facts.push(["纸面中心平移（非实物移动）",
+        `Δx ${metric(graphics.translation_pt?.dx, " pt")} / Δy ${metric(graphics.translation_pt?.dy, " pt")}`]);
+    } else if (item.change === "visual_scaled") {
+      const ratio = (value) => Number.isFinite(value) ? `${(value * 100).toFixed(2)}%` : "未提供";
+      facts.push(["纸面宽 / 高比例（新版 ÷ 旧版）",
+        `${ratio(graphics.scale_ratio?.x)} / ${ratio(graphics.scale_ratio?.y)}（非实物尺寸）`]);
+    } else {
+      facts.push(
+        ["残差像素（旧 / 新）", `${metric(graphics.changed_pixels?.old)} / ${metric(graphics.changed_pixels?.new)}`],
+        ["残差占比（旧 / 新）", `${fraction(graphics.residual_fraction?.old)} / ${fraction(graphics.residual_fraction?.new)}`]
+      );
+    }
     if (subview) {
       facts.push(
         ["跨位置对应", `旧子图 ${metric(subview.old_index)} → 新子图 ${metric(subview.new_index)}`],
@@ -474,6 +506,10 @@
         ["绘图尺寸变化", subview.drawing_size_changed === true ? "有候选，不等于实物尺寸变化" : subview.drawing_size_changed === false ? "未超过当前阈值" : "未提供"]
       );
     }
+    if (alignment.method === "verified_uniform_scale" && Number.isFinite(alignment.scale_ratio)) {
+      facts.push(["内容比较采用的等比绘图校正",
+        `${(alignment.scale_ratio * 100).toFixed(2)}%（单一系数；剩余内容残差仍保留）`]);
+    }
     if (alignment.inlier_count != null) facts.push(["配准内点数", metric(alignment.inlier_count)]);
     const list = el("dl", "graphics-metrics");
     for (const [label, value] of facts) {
@@ -481,7 +517,9 @@
       row.append(el("dt", "", label), el("dd", "", value));
       list.append(row);
     }
-    section.append(list, el("p", "graphics-disclaimer", "证据框仅来自实际局部残差像素。无残差框时可导航至已配对上下文，但不会将区域边界绘成变化框。未提供概率置信度，配准响应也不是准确率。"));
+    section.append(list, el("p", "graphics-disclaimer", optional
+      ? "黄色虚框只标出视图范围，不标为内容变化红框。取消对应复选框即可隐藏，文字、尺寸标注和其他内容差异不受影响。"
+      : "证据框仅来自实际局部残差像素。无残差框时可导航至已配对上下文，但不会将区域边界绘成变化框。未提供概率置信度，配准响应也不是准确率。"));
     if (Array.isArray(graphics.limitations) && graphics.limitations.length) {
       const limits = el("ul", "graphics-limitations");
       graphics.limitations.forEach((limit) => limits.append(el("li", "", limit)));
@@ -564,7 +602,10 @@
       subview_matching: "子图跨位置配对", old_candidates: "旧侧子图候选", new_candidates: "新侧子图候选",
       matched: "唯一外观配对", unresolved: "未唯一配对（保留父区复核）",
       omitted: "超限未处理", resolved_residual_pairs: "独立对齐并替换父区残差的配对",
-      comparison_policy: "比较策略", ignored_changes: "不作为差异的项目"
+      comparison_policy: "比较策略", ignored_changes: "不作为差异的项目",
+      transformations_included: "已提供可选平移/缩放提示", transformation_candidates: "可选视图提示数量",
+      design_content_items: "设计内容候选数量",
+      visual_moved: "平移提示", visual_scaled: "绘图缩放提示"
     };
     if (Array.isArray(value)) {
       const list = el("ul");
@@ -582,7 +623,10 @@
       }
       return list;
     }
-    const descriptions = { design_content_only: "仅设计内容", view_translation: "视图平移", view_order: "视图顺序" };
+    const descriptions = {
+      design_content_only: "仅设计内容", view_translation: "视图平移",
+      view_order: "视图顺序", uniform_drawing_scale: "等比绘图缩放"
+    };
     return el("span", "", value == null ? "未提供" : typeof value === "boolean" ? (value ? "是" : "否") : Object.hasOwn(descriptions, value) ? descriptions[value] : value);
   }
   function renderCoverage(result) {
@@ -645,8 +689,7 @@
           }
           const result = {
             ...data.result,
-            items: data.result.items.filter((item) => item.change !== "visual_moved" &&
-              (state.graphicsEnabled || item.channel !== "graphics")),
+            items: data.result.items.filter((item) => state.graphicsEnabled || item.channel !== "graphics"),
             graphics_coverage: state.graphicsEnabled ? data.result.graphics_coverage : undefined
           };
           if (result.graphics_coverage?.subview_matching) {
@@ -657,11 +700,6 @@
           renderResults();
           renderCoverage(result);
           sides.forEach((side) => { renderBoxes(side); evidenceNote(side); });
-          const hidden = result.items.filter((item) => item.change === "interpretation_only").length;
-          const unresolved = result.items.filter(unpaired).length;
-          const formatting = result.items.filter((item) => item.change === "formatting_only").length;
-          const graphicsUncertain = result.items.filter((item) => item.change === "visual_uncertain").length;
-          status(`对比完成 · ${result.items.filter(pairedDifference).length} 条已配对差异候选 · ${unresolved} 条未配对待复核${graphicsUncertain ? ` · ${graphicsUncertain} 条图形对应不确定，见人工复核` : ""} · ${formatting} 条仅格式差异${hidden ? ` · ${hidden} 个仅解释差异默认隐藏` : ""} · 非已确认变更数${state.graphicsEnabled ? " · 仅设计内容" : " · 图形检测未接入/未启用"}`);
           return;
         }
         if (!["queued", "running"].includes(data.status)) throw new Error("任务状态异常，请重试。");
@@ -698,7 +736,7 @@
       mutate(side, event.dataTransfer.files[0]);
     });
   }
-  for (const name of ["channel-filter", "review-filter", "show-interpretation"]) $(name).addEventListener("change", () => {
+  for (const name of ["channel-filter", "review-filter", "show-interpretation", "show-translation", "show-scaling"]) $(name).addEventListener("change", () => {
     if (!visibleItems().some((item) => item.id === state.selected)) { state.selected = null; renderDetails(null); }
     renderResults();
     sides.forEach((side) => { renderBoxes(side); evidenceNote(side); });

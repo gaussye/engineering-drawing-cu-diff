@@ -37,7 +37,7 @@ def document(path, parts, *, rotation=0, frame=False, extra_line=False, label="O
                 page.draw_line(point(70, 10), point(10, 90), width=.7)
             if changed:
                 page.draw_line(point(17, 23), point(62, 52), width=1)
-            page.insert_text((x, y + 112 * scale), outside_label, fontsize=7)
+            page.insert_text((x, y + 112 * scale), outside_label, fontsize=7 * scale)
         if extra_line:
             page.draw_line((330, 210), (450, 250), width=1)
         page.set_rotation(rotation)
@@ -51,8 +51,9 @@ def cu_layout(parts):
     return {"result": {"contents": [{
         "unit": "pixel",
         "pages": [{"pageNumber": 1, "width": 500, "height": 300,
-                   "words": [{"content": "SYNTHETIC", "source": source((x+8, y+80, x+55, y+94))}
-                             for kind, x, y, _, _ in parts if kind == "window"]}],
+                   "words": [{"content": "SYNTHETIC",
+                              "source": source((x+8*s, y+80*s, x+55*s, y+94*s))}
+                             for kind, x, y, s, _ in parts if kind == "window"]}],
         "figures": [{"source": source((20, 20, 470, 275))}],
     }]}}
 
@@ -69,11 +70,13 @@ class SubviewTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def compare(self, old=OLD, new=SWAPPED, *, old_options=None, new_options=None, layout=True):
+    def compare(self, old=OLD, new=SWAPPED, *, old_options=None, new_options=None, layout=True,
+                include_transformations=False):
         document(self.old, old, **(old_options or {}))
         document(self.new, new, **(new_options or {}))
         return compare_graphics(self.old, self.new,
-                                cu_layout(old) if layout else None, cu_layout(new) if layout else None)
+                                cu_layout(old) if layout else None, cu_layout(new) if layout else None,
+                                include_transformations=include_transformations)
 
     def moves(self, result):
         return [item for item in result["items"] if item["change"] == "visual_moved"
@@ -86,6 +89,14 @@ class SubviewTests(unittest.TestCase):
         self.assertEqual(result["coverage"]["subview_matching"]["resolved_residual_pairs"], 2)
         self.assertNotIn("order_reversal_pairs", result["coverage"]["subview_matching"])
         self.assertEqual(result["coverage"]["uncertain_regions"], 0)
+
+    def test_optional_swap_frames_are_not_design_residuals(self):
+        result = self.compare(include_transformations=True)
+        self.assertEqual(result["coverage"]["design_content_items"], 0)
+        self.assertEqual(len(self.moves(result)), 2)
+        self.assertEqual({i["change"] for i in result["items"]}, {"visual_moved"})
+        for item in result["items"]:
+            self.assertEqual(item["graphics"]["evidence_role"], "transformation_frame")
 
     def test_one_moves_while_other_stays_and_order_is_not_fabricated(self):
         result = self.compare(new=[("window", 50, 160, 1, False), OLD[1]])
@@ -130,14 +141,73 @@ class SubviewTests(unittest.TestCase):
         self.assertEqual(self.moves(result), [])
         self.assertEqual(result["items"], [])
 
-    def test_size_change_is_preserved_and_is_not_false_motion(self):
+    def test_uniform_subview_scale_has_no_default_design_residual(self):
         result = self.compare(new=[("window", 50, 50, 1.2, False), OLD[1]])
         self.assertEqual(self.moves(result), [])
-        changed = [i for i in result["items"] if i["change"] == "visual_modified"]
-        self.assertTrue(changed)
-        sizes = [i["graphics"]["subview"] for i in changed if "subview" in i["graphics"]]
-        self.assertTrue(any(v["drawing_size_changed"] for v in sizes))
-        self.assertTrue(all(i["graphics"]["alignment"]["note"] for i in changed))
+        self.assertEqual(result["items"], [])
+        result = self.compare(new=[("window", 50, 50, 1.2, False), OLD[1]],
+                              include_transformations=True)
+        scaled, = [i for i in result["items"] if i["change"] == "visual_scaled"]
+        self.assertTrue(scaled["graphics"]["subview"]["drawing_size_changed"])
+        for ratio in scaled["graphics"]["scale_ratio"].values():
+            self.assertAlmostEqual(ratio, 1.2, delta=.01)
+
+    def test_scaled_subview_shape_and_text_edits_remain_reported(self):
+        for changed, label in ((True, "ONE"), (False, "TWO")):
+            with self.subTest(shape=changed, label=label):
+                result = self.compare(new=[("window", 240, 50, 1.2, changed), SWAPPED[1]],
+                                      new_options={"label": label}, include_transformations=True)
+                content = [i for i in result["items"] if not i["graphics"].get("optional_transformation")]
+                self.assertTrue(content)
+                self.assertTrue(any(i["change"] == "visual_scaled" for i in result["items"]))
+                self.assertIn("visual_modified" if changed else "visual_annotation",
+                              {i["change"] for i in content})
+                self.assertTrue(any(i["new"]["locations"] for i in content))
+
+    def test_scaled_subview_preserves_uncovered_ink_and_neighbor_edits(self):
+        result = self.compare(new=[("window", 50, 50, 1.2, False), OLD[1]],
+                              new_options={"extra_line": True})
+        self.assertTrue(any(i["new"]["locations"] for i in result["items"]))
+        self.assertTrue(any(i["graphics"]["region_source"] != "local_subview"
+                            for i in result["items"]))
+        result = self.compare(new=[("window", 50, 50, 1.3, False), OLD[1]],
+                              new_options={"outside_label": "CHANGED VIEW"})
+        self.assertTrue(any(i["new"]["locations"] for i in result["items"]))
+
+    def test_scaled_halo_does_not_clear_neighbor_candidate_edit(self):
+        old = [OLD[0], ("ribs", 150, 50, 1, False)]
+        new = [("window", 50, 50, 1.2, False), ("ribs", 150, 50, 1, True)]
+        result = self.compare(old=old, new=new)
+        self.assertTrue(any(box["x"] >= 150/500
+                            for item in result["items"] for box in item["new"]["locations"]))
+
+    def test_single_portrait_view_scaling_and_scaled_label_halo(self):
+        for factor in (.7, .8, .96, 1.05, 1.3, 1.5):
+            with self.subTest(scale=factor):
+                result = self.compare(old=[OLD[0]], new=[("window", 50, 50, factor, False)],
+                                      include_transformations=True)
+                self.assertEqual(result["coverage"]["design_content_items"], 0)
+                self.assertIn("visual_scaled", {item["change"] for item in result["items"]})
+
+    def test_scaled_rotated_subview_uses_original_page_coordinates(self):
+        result = self.compare(new=[("window", 240, 50, 1.2, True), SWAPPED[1]], layout=False,
+                              old_options={"rotation": 90}, new_options={"rotation": 90},
+                              include_transformations=True)
+        self.assertTrue(any(i["change"] == "visual_modified" for i in result["items"]))
+        self.assertTrue(any(i["change"] == "visual_scaled" for i in result["items"]))
+        for item in result["items"]:
+            for role in ("old", "new"):
+                for box in item[role]["locations"]:
+                    self.assertTrue(0 <= box["x"] < box["x"]+box["width"] <= 1)
+                    self.assertTrue(0 <= box["y"] < box["y"]+box["height"] <= 1)
+
+    def test_repeated_scaled_views_remain_unresolved_without_transform_frames(self):
+        repeated = [OLD[0], ("window", 240, 50, 1, False)]
+        result = self.compare(old=repeated, new=[("window", 50, 50, 1.2, False), repeated[1]],
+                              include_transformations=True)
+        self.assertEqual(result["coverage"]["subview_matching"]["matched"], 0)
+        self.assertTrue(result["items"])
+        self.assertFalse(any(i["graphics"].get("optional_transformation") for i in result["items"]))
 
     def test_full_page_border_does_not_hide_nested_views(self):
         result = self.compare(layout=False, old_options={"frame": True}, new_options={"frame": True})

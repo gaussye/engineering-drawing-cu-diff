@@ -133,7 +133,15 @@ def graphics(args: argparse.Namespace) -> None:
             responses[role] = read_json(response_path)
             if responses[role].get("status") != "Succeeded":
                 raise ValueError(f"{role} CU response did not succeed")
-    result = compare_graphics(args.old, args.new, responses.get("old"), responses.get("new"), dpi=args.dpi)
+    selected = {change for change, flag in (("visual_moved", "include_translation"),
+                                           ("visual_scaled", "include_scaling"))
+                if getattr(args, flag, False)}
+    result = compare_graphics(args.old, args.new, responses.get("old"), responses.get("new"),
+                              dpi=args.dpi, include_transformations=bool(selected))
+    result["items"] = [item for item in result["items"]
+                       if item["change"] not in {"visual_moved", "visual_scaled"}
+                       or item["change"] in selected]
+    result["coverage"]["selected_transformations"] = sorted(selected)
     result["provenance"] = {"document_sha256": hashes, "azure_calls": 0,
                             "chronology": "User-supplied old/new direction",
                             "coordinate_basis": "Displayed PDF page, normalized x/y; no elastic warp"}
@@ -141,7 +149,8 @@ def graphics(args: argparse.Namespace) -> None:
     save_json(args.output / "graphics.json", result)
     from .report import cell
     lines = ["# 本地图形差异候选", "", "只使用本地PDF和可选已校验CU缓存，不调用Azure。",
-             "只比较设计内容；视图平移和顺序交换不作为差异。外观残差仍需复核，不推断实物尺寸或材料改变。",
+             "设计内容单独比较；仅按命令行选项列出视图平移/等比绘图缩放，变换框不是设计残差。"
+             "外观残差仍需复核，不推断实物尺寸或材料改变。",
              "", "| 编号 | 类型 | 旧侧区域 | 新侧区域 |",
              "|---|---|---|---|"]
     for item in result["items"]:
@@ -189,6 +198,10 @@ def main() -> None:
         graphical.add_argument(f"--{role}-response", type=Path)
         graphical.add_argument(f"--{role}-metadata", type=Path)
     graphical.add_argument("--dpi", type=int, default=200)
+    graphical.add_argument("--include-translation", action="store_true",
+                           help="Include optional full-view translation frames, not design changes")
+    graphical.add_argument("--include-scaling", action="store_true",
+                           help="Include verified uniform drawing scale, not physical part dimensions")
     graphical.add_argument("--output", type=Path, default=Path("output") / "graphics")
     graphical.set_defaults(action=graphics)
     args = parser.parse_args()

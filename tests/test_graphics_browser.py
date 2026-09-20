@@ -127,6 +127,12 @@ def result_fixture(documents):
                       old=source([location(x=0.65, y=0.5)]),
                       new=source([location(x=0.7, y=0.6)]))
     moved["graphics"]["classification"] = "刚性位移候选"
+    scaled = graphical("G008", "visual_scaled",
+                       old=source([location(x=.1, y=.1, width=.2, height=.2)]),
+                       new=source([location(x=.1, y=.1, width=.22, height=.22)]))
+    scaled["graphics"].update({
+        "classification": "绘图缩放提示", "scale_ratio": {"x": 1.1, "y": 1.1},
+    })
     uncertain = graphical("G004", "visual_uncertain",
                           old=source([], [location(2, 0.65, 0.7, 0.2, 0.2)]),
                           new=source([], [location(2, 0.6, 0.7, 0.2, 0.2)]))
@@ -141,7 +147,7 @@ def result_fixture(documents):
     context_only["graphics"]["changed_pixels"]["old"] = 0
     return {
         "items": [schema, ocr, formatting, interpretation, modified, annotation,
-                  moved, uncertain, unpaired_old, unpaired_new, context_only],
+                  moved, uncertain, unpaired_old, unpaired_new, context_only, scaled],
         "documents": copy.deepcopy(documents), "coverage": {"schema": 1}, "warnings": [],
         "metadata": {"old": {"cache_hit": True, "usage": {"tokens": 10}},
                      "new": {"cache_hit": True, "usage": {"tokens": 12}}},
@@ -181,6 +187,7 @@ class GraphicsBrowserTests(unittest.TestCase):
         self.hold_uploads = False
         self.hold_jobs = False
         self.graphics_enabled = True
+        self.compare_requests = 0
         self.open_context()
 
     def open_context(self, dpr=2):
@@ -225,6 +232,7 @@ class GraphicsBrowserTests(unittest.TestCase):
         elif path.startswith("/api/documents/") and "/pages/" in path:
             route.fulfill(body=self.png, content_type="image/png")
         elif path == "/api/compare":
+            self.compare_requests += 1
             self.assertEqual(request.headers.get("x-csrf-token"), "synthetic-csrf")
             self.assertEqual(request.post_data_json, {"revision": self.revision})
             route.fulfill(json={"job_id": "synthetic-job", "status": "queued", "revision": self.revision})
@@ -282,6 +290,9 @@ class GraphicsBrowserTests(unittest.TestCase):
         expect(self.page.locator('#channel-filter option[value="graphics"]')).to_be_enabled()
         expect(self.page.locator("#graphics-status")).to_contain_text("本地图形检测已启用")
         expect(self.page.locator("#review-filter")).to_have_value("paired")
+        for name in ("translation", "scaling"):
+            expect(self.page.locator(f"#show-{name}")).not_to_be_checked()
+            expect(self.page.locator(f"#show-{name}")).to_be_enabled()
         expect(self.page.locator("rect.evidence-box")).to_have_count(0)
         self.compare()
         self.assertEqual(set(self.visible_ids()), {"D001", "G001", "G002", "G007"})
@@ -327,7 +338,7 @@ class GraphicsBrowserTests(unittest.TestCase):
                 for side in ("old", "new"):
                     self.assert_geometry(side, "G001", item[side]["locations"][0])
 
-    def test_legacy_movement_is_excluded_from_every_filter_overlay_and_count(self):
+    def test_transformations_default_off_in_every_filter_overlay_and_design_count(self):
         self.compare()
         expect(self.page.locator("#job-status")).to_contain_text("5 条已配对差异候选")
         expect(self.page.locator("#job-status")).not_to_contain_text("位移")
@@ -337,7 +348,65 @@ class GraphicsBrowserTests(unittest.TestCase):
             for review in ("paired", "review", "uncertain", "all"):
                 self.page.locator("#review-filter").select_option(review)
                 self.assertNotIn("G003", self.visible_ids())
+                self.assertNotIn("G008", self.visible_ids())
                 expect(self.page.locator('rect[data-id="G003"]')).to_have_count(0)
+                expect(self.page.locator('rect[data-id="G008"]')).to_have_count(0)
+
+    def test_transform_checkboxes_independent_local_and_reversible(self):
+        self.compare()
+        base = {"D001", "G001", "G002", "G007"}
+        self.page.locator("#show-translation").check()
+        self.assertEqual(set(self.visible_ids()), base | {"G003"})
+        expect(self.page.locator("#job-status")).to_contain_text("5 条已配对差异候选")
+        expect(self.page.locator("#job-status")).to_contain_text("另显示 1 条平移/缩放提示")
+        self.select("G003")
+        expect(self.page.locator(".graphics-detail")).to_contain_text("Δx 12 pt / Δy -6.25 pt")
+        expect(self.page.locator(".graphics-detail")).to_contain_text("不是变化像素")
+        for side in ("old", "new"):
+            expect(self.page.locator(f'#{side}-stage rect[data-id="G003"]')).to_have_class(
+                "evidence-box review-evidence selected")
+            expect(self.page.locator(f"#{side}-evidence-note")).to_contain_text("非内容残差")
+        self.page.locator("#show-translation").uncheck()
+        self.assertEqual(set(self.visible_ids()), base)
+        expect(self.page.locator(".graphics-detail")).to_have_count(0)
+        expect(self.page.locator('rect[data-id="G003"]')).to_have_count(0)
+        self.page.locator("#show-scaling").focus()
+        self.page.locator("#show-scaling").press("Space")
+        self.assertEqual(set(self.visible_ids()), base | {"G008"})
+        self.select("G008")
+        expect(self.page.locator(".graphics-detail")).to_contain_text("110.00% / 110.00%")
+        expect(self.page.locator(".graphics-detail")).to_contain_text("非实物尺寸")
+        item = next(i for i in self.result["items"] if i["id"] == "G008")
+        for side in ("old", "new"):
+            for zoom in ("fit", "150", "200"):
+                self.page.locator(f"#{side}-zoom").select_option(zoom)
+                self.assert_geometry(side, "G008", item[side]["locations"][0])
+        self.page.locator("#show-translation").check()
+        self.assertEqual(set(self.visible_ids()), base | {"G003", "G008"})
+        expect(self.page.locator("#job-status")).to_contain_text("另显示 2 条平移/缩放提示")
+        self.page.locator("#channel-filter").select_option("schema")
+        self.assertEqual(self.visible_ids(), ["D001"])
+        self.page.locator("#channel-filter").select_option("primary")
+        self.page.locator("#show-scaling").uncheck()
+        self.page.locator("#show-translation").uncheck()
+        self.assertEqual(set(self.visible_ids()), base)
+        expect(self.page.locator("#job-status")).to_contain_text("仅设计内容")
+        self.assertEqual(self.compare_requests, 1)
+
+    def test_scaled_view_content_changes_are_not_hidden_by_scale_checkbox(self):
+        item = next(i for i in self.result["items"] if i["id"] == "G001")
+        item["graphics"]["subview"] = {"drawing_size_changed": True}
+        item["graphics"]["alignment"].update(method="verified_uniform_scale", scale_ratio=1.1)
+        self.compare()
+        for enabled in (True, False):
+            self.page.locator("#show-scaling").set_checked(enabled)
+            self.assertIn("G001", self.visible_ids())
+            self.select("G001")
+            expect(self.page.locator('#old-stage rect[data-id="G001"]')).to_have_class(
+                "evidence-box selected")
+            expect(self.page.locator(".graphics-detail")).to_contain_text("实际局部残差像素")
+            expect(self.page.locator(".graphics-detail")).to_contain_text("110.00%（单一系数")
+        self.assertEqual(self.compare_requests, 1)
 
     def test_context_navigates_without_inventing_residual_boxes(self):
         self.compare()
@@ -463,6 +532,7 @@ class GraphicsBrowserTests(unittest.TestCase):
 
     def test_replacement_immediately_clears_graphics_context_and_coverage(self):
         self.compare()
+        self.page.locator("#show-scaling").check()
         self.select("G007")
         self.hold_uploads = True
         with self.page.expect_request("**/api/documents/new"):
@@ -547,6 +617,8 @@ class GraphicsBrowserTests(unittest.TestCase):
                 self.graphics_enabled = capability
                 self.open_context()
                 expect(self.page.locator('#channel-filter option[value="graphics"]')).to_be_disabled()
+                for name in ("translation", "scaling"):
+                    expect(self.page.locator(f"#show-{name}")).to_be_disabled()
                 expect(self.page.locator('#channel-filter option[value="primary"]')).to_have_text("结构化字段（默认）")
                 expect(self.page.locator("#graphics-status")).to_contain_text("图形检测未接入/未启用")
                 expect(self.page.locator("#coverage-content")).to_contain_text("图形检测未接入/未启用")

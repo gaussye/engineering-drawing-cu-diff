@@ -92,7 +92,7 @@ class BrowserTests(unittest.TestCase):
     def alignment(self, role):
         metrics = self.page.evaluate("""role => {
           const image = document.querySelector(`#${role}-stage img`).getBoundingClientRect();
-          const box = document.querySelector(`#${role}-stage rect.evidence-box`).getBoundingClientRect();
+          const box = document.querySelector(`#${role}-stage rect.evidence-box.selected[data-channel="schema"]`).getBoundingClientRect();
           return {dx: box.x-image.x,dy:box.y-image.y,w:box.width,h:box.height,iw:image.width,ih:image.height};
         }""", role)
         self.assertAlmostEqual(metrics["dx"], metrics["iw"] * 0.1, delta=2)
@@ -214,6 +214,9 @@ class BrowserTests(unittest.TestCase):
 
     def test_wrong_source_results_are_rejected(self):
         self.upload_pair()
+        # Mock submission too, so a forged result cannot leave a real worker running.
+        self.page.route("**/api/compare", lambda route: route.fulfill(
+            json={"job_id": "synthetic-wrong-source", "status": "queued"}))
         for field in ("id", "sha256"):
             with self.subTest(field=field):
                 documents = self.page.evaluate(
