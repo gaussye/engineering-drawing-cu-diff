@@ -141,7 +141,7 @@ def graphics(args: argparse.Namespace) -> None:
     save_json(args.output / "graphics.json", result)
     from .report import cell
     lines = ["# 本地图形差异候选", "", "只使用本地PDF和可选已校验CU缓存，不调用Azure。",
-             "像素外观、标注布局、区域移动均为待复核候选，不推断实物尺寸或材料改变。",
+             "只比较设计内容；视图平移和顺序交换不作为差异。外观残差仍需复核，不推断实物尺寸或材料改变。",
              "", "| 编号 | 类型 | 旧侧区域 | 新侧区域 |",
              "|---|---|---|---|"]
     for item in result["items"]:

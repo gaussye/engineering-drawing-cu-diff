@@ -79,13 +79,21 @@ class GraphicsTests(unittest.TestCase):
             self.assertLess(box["x"], 120/600)
             self.assertGreater(box["height"], 130/400)
 
-    def test_translation_is_separate_from_content_modification(self):
+    def test_pure_translation_produces_no_design_difference(self):
         drawing(self.new, dx=18, dy=12)
         result = self.run_pair(new=layout(dx=18, dy=12))
-        self.assertEqual({item["change"] for item in result["items"]}, {"visual_moved"})
-        movement = result["items"][0]["graphics"]["translation_pt"]
-        self.assertAlmostEqual(movement["dx"], 18, delta=.6)
-        self.assertAlmostEqual(movement["dy"], 12, delta=.6)
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["coverage"]["unchanged_regions"], 1)
+        self.assertEqual(result["coverage"]["comparison_policy"], "design_content_only")
+
+    def test_translation_with_added_lines_keeps_design_difference(self):
+        drawing(self.new, dx=18, dy=12, lines=(8, 13, 20))
+        result = self.run_pair(new=layout(dx=18, dy=12))
+        self.assertNotIn("visual_moved", {item["change"] for item in result["items"]})
+        feature, = [i for i in result["items"]
+                    if i["graphics"]["method"] == "rectangular_interior_vertical_runs"]
+        self.assertEqual(feature["old"]["locations"], [])
+        self.assertEqual(len(feature["new"]["locations"]), 2)
 
     def test_resizing_is_not_warped_away_or_reported_as_pure_translation(self):
         drawing(self.new, width=330)

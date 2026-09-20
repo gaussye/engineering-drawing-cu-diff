@@ -284,11 +284,11 @@ class GraphicsBrowserTests(unittest.TestCase):
         expect(self.page.locator("#review-filter")).to_have_value("paired")
         expect(self.page.locator("rect.evidence-box")).to_have_count(0)
         self.compare()
-        self.assertEqual(set(self.visible_ids()), {"D001", "G001", "G002", "G003", "G007"})
+        self.assertEqual(set(self.visible_ids()), {"D001", "G001", "G002", "G007"})
         self.page.locator("#channel-filter").select_option("graphics")
-        self.assertEqual(set(self.visible_ids()), {"G001", "G002", "G003", "G007"})
+        self.assertEqual(set(self.visible_ids()), {"G001", "G002", "G007"})
         self.page.locator("#review-filter").select_option("review")
-        self.assertEqual(set(self.visible_ids()), {f"G{i:03}" for i in range(1, 8)})
+        self.assertEqual(set(self.visible_ids()), {f"G{i:03}" for i in range(1, 8) if i != 3})
         self.page.locator("#review-filter").select_option("uncertain")
         self.assertEqual(self.visible_ids(), ["G004"])
         self.select("G004")
@@ -327,28 +327,17 @@ class GraphicsBrowserTests(unittest.TestCase):
                 for side in ("old", "new"):
                     self.assert_geometry(side, "G001", item[side]["locations"][0])
 
-    def test_movement_has_amber_dashes_and_is_not_content_modification(self):
+    def test_legacy_movement_is_excluded_from_every_filter_overlay_and_count(self):
         self.compare()
-        self.select("G003")
-        expect(self.page.locator("#detail-meta")).to_contain_text("位移候选（非内容变更）")
-        expect(self.page.locator(".graphics-detail")).to_contain_text("不计为内容修改")
-        expect(self.page.locator(".graphics-detail")).to_contain_text("Δx 12 pt / Δy -6.25 pt")
-        expect(self.page.locator("#job-status")).to_contain_text("仅位移，非内容修改")
-        for side in ("old", "new"):
-            moved = self.page.locator(f'#{side}-stage rect[data-id="G003"]')
-            changed = self.page.locator(f'#{side}-stage rect[data-id="G001"]')
-            self.assertIn("movement-evidence", moved.get_attribute("class"))
-            self.assertNotIn("review-evidence", changed.get_attribute("class"))
-            colors = moved.evaluate("""node => {
-              const swatch = document.createElement('span');
-              swatch.style.color = 'var(--cp-warning)'; document.body.append(swatch);
-              const expected = getComputedStyle(swatch).color; swatch.remove();
-              const style = getComputedStyle(node);
-              return {stroke:style.stroke, dash:style.strokeDasharray, expected};
-            }""")
-            self.assertEqual(colors["stroke"], colors["expected"])
-            self.assertNotEqual(colors["dash"], "none")
-            expect(self.page.locator(f"#{side}-stage .evidence-label")).to_have_text("G003 位移")
+        expect(self.page.locator("#job-status")).to_contain_text("5 条已配对差异候选")
+        expect(self.page.locator("#job-status")).not_to_contain_text("位移")
+        expect(self.page.locator("#graphics-status")).to_contain_text("只比较设计内容")
+        for channel in ("primary", "graphics", "all"):
+            self.page.locator("#channel-filter").select_option(channel)
+            for review in ("paired", "review", "uncertain", "all"):
+                self.page.locator("#review-filter").select_option(review)
+                self.assertNotIn("G003", self.visible_ids())
+                expect(self.page.locator('rect[data-id="G003"]')).to_have_count(0)
 
     def test_context_navigates_without_inventing_residual_boxes(self):
         self.compare()
@@ -371,6 +360,8 @@ class GraphicsBrowserTests(unittest.TestCase):
 
     def test_crossed_subviews_show_independent_locations_and_identity_not_accuracy(self):
         item = next(entry for entry in self.result["items"] if entry["id"] == "G003")
+        item["change"] = "visual_modified"
+        item["graphics"]["classification"] = "独立对齐后的内容残差"
         item["old"]["locations"] = [location(x=.1, y=.2)]
         item["new"]["locations"] = [location(x=.7, y=.2)]
         item["graphics"].update({
@@ -388,19 +379,22 @@ class GraphicsBrowserTests(unittest.TestCase):
         self.compare()
         self.select("G003")
         detail = self.page.locator(".graphics-detail")
-        for text in ("旧子图 1 → 新子图 2", "子图中心位移", "Δx 450 pt", "0.21 / 0.23",
-                     "相对顺序反转", "非语义零件识别", "不等于实物尺寸变化", "但不表示内容相同"):
+        for text in ("旧子图 1 → 新子图 2", "0.21 / 0.23",
+                     "非语义零件识别", "不等于实物尺寸变化", "忽略视图位置变化"):
             expect(detail).to_contain_text(text)
+        expect(detail).not_to_contain_text("Δx")
+        expect(detail).not_to_contain_text("相对顺序反转")
         for side in ("old", "new"):
             for zoom in ("fit", "150", "200"):
                 self.page.locator(f"#{side}-zoom").select_option(zoom)
                 self.assert_geometry(side, "G003", item[side]["locations"][0])
-            expect(self.page.locator(f"#{side}-evidence-note")).to_contain_text("非残差框")
+            expect(self.page.locator(f"#{side}-evidence-note")).to_contain_text("局部像素残差")
         self.select("G001")
         expect(self.page.locator(".graphics-detail")).to_contain_text("实际局部残差像素")
         expect(self.page.locator(".graphics-detail")).not_to_contain_text("子图中心位移")
         self.page.locator(".coverage-panel > summary").click()
-        expect(self.page.locator(".graphics-coverage")).to_contain_text("相对顺序反转对数")
+        expect(self.page.locator(".graphics-coverage")).to_contain_text("唯一外观配对")
+        expect(self.page.locator(".graphics-coverage")).not_to_contain_text("order_reversal_pairs")
         self.page.locator("#new-upload").set_input_files({
             "name": "replacement.pdf", "mimeType": "application/pdf", "buffer": b"%PDF-1.4\n%%EOF"})
         expect(self.page.locator("rect.evidence-box")).to_have_count(0)
@@ -521,7 +515,7 @@ class GraphicsBrowserTests(unittest.TestCase):
         expect(self.page.locator("#old-evidence-note")).to_contain_text("不绘制推测框")
         expect(self.page.locator('#new-stage rect[data-id="G005"]')).to_have_count(0)
 
-    def test_pure_movement_context_is_navigation_only_and_residuals_take_priority(self):
+    def test_legacy_movement_context_does_not_navigate_or_displace_residuals(self):
         moved = next(item for item in self.result["items"] if item["id"] == "G003")
         for side in ("old", "new"):
             moved[side]["locations"] = []
@@ -530,15 +524,21 @@ class GraphicsBrowserTests(unittest.TestCase):
         for side in ("old", "new"):
             modified[side]["context_locations"] = [location(2)]
         self.compare()
-        self.select("G003")
         for side in ("old", "new"):
-            expect(self.page.locator(f"#{side}-page")).to_have_value("2")
+            expect(self.page.locator(f"#{side}-page")).to_have_value("1")
             expect(self.page.locator(f'#{side}-stage rect[data-id="G003"]')).to_have_count(0)
-        expect(self.page.locator(".graphics-detail")).to_contain_text("不计为内容修改")
+        self.assertNotIn("G003", self.visible_ids())
         self.select("G001")
         for side in ("old", "new"):
             expect(self.page.locator(f"#{side}-page")).to_have_value("1")
             self.assert_geometry(side, "G001", modified[side]["locations"][0])
+
+    def test_only_legacy_movement_returns_zero_design_candidates(self):
+        self.result["items"] = [item for item in self.result["items"] if item["id"] == "G003"]
+        self.compare()
+        expect(self.page.locator("#job-status")).to_contain_text("0 条已配对差异候选")
+        self.assertEqual(self.visible_ids(), [])
+        expect(self.page.locator("rect.evidence-box")).to_have_count(0)
 
     def test_missing_or_false_graphics_capability_preserves_schema_and_hides_graphics(self):
         for capability in (None, False):

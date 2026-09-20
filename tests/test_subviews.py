@@ -13,7 +13,8 @@ if not all(importlib.util.find_spec(name) for name in ("cv2", "numpy")):
 from cu_diff.graphics import compare_graphics
 
 
-def document(path, parts, *, rotation=0, frame=False, extra_line=False, label="ONE"):
+def document(path, parts, *, rotation=0, frame=False, extra_line=False, label="ONE",
+             outside_label="SYNTHETIC VIEW"):
     with pymupdf.open() as pdf:
         page = pdf.new_page(width=500, height=300)
         if frame:
@@ -36,7 +37,7 @@ def document(path, parts, *, rotation=0, frame=False, extra_line=False, label="O
                 page.draw_line(point(70, 10), point(10, 90), width=.7)
             if changed:
                 page.draw_line(point(17, 23), point(62, 52), width=1)
-            page.insert_text((x, y + 112 * scale), "SYNTHETIC VIEW", fontsize=7)
+            page.insert_text((x, y + 112 * scale), outside_label, fontsize=7)
         if extra_line:
             page.draw_line((330, 210), (450, 250), width=1)
         page.set_rotation(rotation)
@@ -80,41 +81,34 @@ class SubviewTests(unittest.TestCase):
 
     def test_distinct_views_swap_by_appearance_not_same_position(self):
         result = self.compare()
-        moves = self.moves(result)
-        self.assertEqual(len(moves), 2)
-        self.assertEqual(result["coverage"]["subview_matching"]["order_reversal_pairs"], 1)
-        self.assertEqual({(m["graphics"]["subview"]["old_index"], m["graphics"]["subview"]["new_index"])
-                          for m in moves}, {(1, 2), (2, 1)})
-        for item in moves:
-            self.assertEqual(item["match"]["method"], "mutual_subview_shape_and_ink")
-            delta = item["graphics"]["center_displacement_pt"]
-            self.assertAlmostEqual(abs(delta["dx"]), 190, delta=.5)
-            self.assertAlmostEqual(delta["dy"], 0, delta=.5)
-            self.assertEqual(item["graphics"]["subview"]["order_reversal"][0]["axis"], "horizontal")
-            self.assertEqual(len(item["old"]["locations"]), 1)
-            self.assertEqual(len(item["new"]["locations"]), 1)
-        self.assertFalse(any(item["change"] == "visual_uncertain" for item in result["items"]))
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["coverage"]["subview_matching"]["matched"], 2)
+        self.assertEqual(result["coverage"]["subview_matching"]["resolved_residual_pairs"], 2)
+        self.assertNotIn("order_reversal_pairs", result["coverage"]["subview_matching"])
         self.assertEqual(result["coverage"]["uncertain_regions"], 0)
 
     def test_one_moves_while_other_stays_and_order_is_not_fabricated(self):
         result = self.compare(new=[("window", 50, 160, 1, False), OLD[1]])
-        move, = self.moves(result)
-        self.assertAlmostEqual(move["graphics"]["center_displacement_pt"]["dy"], 110, delta=.5)
-        self.assertEqual(move["graphics"]["subview"]["order_reversal"], [])
+        self.assertEqual(result["items"], [])
         self.assertEqual(result["coverage"]["subview_matching"]["matched"], 2)
 
     def test_movement_does_not_hide_changed_shape_or_invent_old_residual(self):
         result = self.compare(new=[("window", 240, 50, 1, True), SWAPPED[1]])
-        self.assertEqual(len(self.moves(result)), 2)
+        self.assertEqual(self.moves(result), [])
         changes = [i for i in result["items"] if i["change"] == "visual_modified"
                    and i["graphics"]["region_source"] == "local_subview"]
         self.assertTrue(changes)
         self.assertTrue(any(item["new"]["locations"] for item in changes))
         self.assertTrue(all(not item["old"]["locations"] for item in changes))
+        for item in changes:
+            self.assertEqual(item["graphics"]["subview"]["old_index"], 1)
+            self.assertEqual(item["graphics"]["subview"]["new_index"], 2)
+            self.assertNotIn("center_displacement_pt", item["graphics"])
+            self.assertNotIn("order_reversal", item["graphics"]["subview"])
 
     def test_moved_label_change_remains_annotation(self):
         result = self.compare(new_options={"label": "TWO"})
-        self.assertEqual(len(self.moves(result)), 2)
+        self.assertEqual(self.moves(result), [])
         self.assertTrue(any(item["change"] == "visual_annotation"
                             and item["graphics"]["region_source"] == "local_subview"
                             for item in result["items"]))
@@ -134,7 +128,7 @@ class SubviewTests(unittest.TestCase):
         translated = [(k, x+12, y+9, s, c) for k, x, y, s, c in OLD]
         result = self.compare(new=translated)
         self.assertEqual(self.moves(result), [])
-        self.assertEqual(len([i for i in result["items"] if i["change"] == "visual_moved"]), 1)
+        self.assertEqual(result["items"], [])
 
     def test_size_change_is_preserved_and_is_not_false_motion(self):
         result = self.compare(new=[("window", 50, 50, 1.2, False), OLD[1]])
@@ -147,23 +141,33 @@ class SubviewTests(unittest.TestCase):
 
     def test_full_page_border_does_not_hide_nested_views(self):
         result = self.compare(layout=False, old_options={"frame": True}, new_options={"frame": True})
-        self.assertEqual(len(self.moves(result)), 2)
+        self.assertEqual(result["items"], [])
         self.assertEqual(result["coverage"]["fallback_pages"], 1)
 
     def test_rotation_and_page_relative_boxes_preserve_vertical_swap(self):
         result = self.compare(layout=False, old_options={"rotation": 90}, new_options={"rotation": 90})
-        moves = self.moves(result)
-        self.assertEqual(len(moves), 2)
-        for item in moves:
-            self.assertEqual(item["graphics"]["subview"]["order_reversal"][0]["axis"], "vertical")
-            self.assertAlmostEqual(abs(item["graphics"]["center_displacement_pt"]["dy"]), 190, delta=.5)
+        self.assertEqual(result["items"], [])
+        result = self.compare(
+            new=[("window", 240, 50, 1, True), SWAPPED[1]], layout=False,
+            old_options={"rotation": 90}, new_options={"rotation": 90})
+        changes = [i for i in result["items"] if i["graphics"]["region_source"] == "local_subview"]
+        self.assertTrue(changes)
+        for item in changes:
             for role in ("old", "new"):
-                loc, = item[role]["locations"]
-                box = item[role]["source"]["region_pt"]
-                self.assertAlmostEqual(loc["x"], box[0] / 300)
-                self.assertAlmostEqual(loc["y"], box[1] / 500)
-                self.assertLessEqual(loc["x"] + loc["width"], 1)
-                self.assertLessEqual(loc["y"] + loc["height"], 1)
+                for loc in item[role]["locations"]:
+                    box = item[role]["source"]["region_pt"]
+                    self.assertGreaterEqual(loc["x"], box[0] / 300)
+                    self.assertGreaterEqual(loc["y"], box[1] / 500)
+                    self.assertLessEqual(loc["x"] + loc["width"], box[2] / 300 + .001)
+                    self.assertLessEqual(loc["y"] + loc["height"], box[3] / 500 + .001)
+
+    def test_neighboring_label_edit_is_not_erased_with_view_translation(self):
+        result = self.compare(
+            new=[("window", 50, 160, 1, False), OLD[1]],
+            new_options={"outside_label": "CHANGED VIEW"})
+        self.assertEqual(self.moves(result), [])
+        self.assertTrue(result["items"])
+        self.assertTrue(any(item["new"]["locations"] for item in result["items"]))
 
     def test_unmatched_view_and_uncovered_ink_remain_in_parent_evidence(self):
         result = self.compare(new=OLD + [("cross", 350, 155, 1, False)])
