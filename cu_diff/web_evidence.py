@@ -90,7 +90,7 @@ def web_result(comparison: dict, documents: dict, metadata: dict) -> dict:
         mapped, error = locations(entry, documents[role]["pages"])
         return {key: entry.get(key) for key in ("raw_text", "detail", "confidence", "source")} | {
             "locations": mapped, "location_error": error,
-        }
+        } | ({"schema_sources": entry["schema_sources"]} if "schema_sources" in entry else {})
 
     items = []
     channels = (
@@ -107,6 +107,12 @@ def web_result(comparison: dict, documents: dict, metadata: dict) -> dict:
                 "new": side(record.get("new"), "new"),
             }
             cells = record.get("cell_comparison")
+            if record.get("table_comparison"):
+                item["table_comparison"] = record["table_comparison"]
+                item["table_context"] = {
+                    role: side(record.get("table_context", {}).get(role), role)
+                    for role in ("old", "new")
+                }
             if cells:
                 fields = [{key: field[key] for key in ("key", "label", "change")} | {
                     role: side(field[role], role) for role in ("old", "new")

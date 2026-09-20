@@ -10,6 +10,7 @@
     unchanged: "提取原文相同", reconciled: "OCR 分段已合并（非原文变更）",
     visual_modified: "外观变化候选", visual_annotation: "文字/标注外观残差候选",
     visual_moved: "视图平移（非内容变更）", visual_scaled: "绘图缩放（非实物尺寸）",
+    table_row_added: "表格新增行候选", table_row_removed: "表格删除行候选",
     visual_uncertain: "图形对应不确定（待复核）"
   };
   const channels = { schema: "结构化字段", graphics: "本地图形候选", ocr: "OCR 原文", unchanged: "一致项复核" };
@@ -298,6 +299,9 @@
   }
   function navigationLocations(item, side) {
     const evidence = locations(item, side);
+    if (!evidence.length && tableRowChange(item)) {
+      return validLocations(item.table_context?.[side]?.locations, side);
+    }
     const counterparts = counterpartLocations(item, side);
     if (counterparts.length) return counterparts;
     // Context is only a navigation fallback for a paired graphical region, never a change box.
@@ -313,11 +317,19 @@
     return Boolean(item.old && item.new) &&
       ["modified", "relocated", "visual_modified", "visual_annotation"].includes(item.change);
   }
+  function tableRowChange(item) {
+    return item?.channel === "schema" && item.table_comparison?.status === "complete" &&
+      ((item.change === "table_row_added" && !item.old && Boolean(item.new)) ||
+       (item.change === "table_row_removed" && !item.new && Boolean(item.old)));
+  }
+  function contentDifference(item) {
+    return pairedDifference(item) || tableRowChange(item);
+  }
   function transformation(item) {
     return ["visual_moved", "visual_scaled"].includes(item.change);
   }
   function evidenceStyle(item) {
-    return pairedDifference(item) ? "" : " review-evidence";
+    return contentDifference(item) ? "" : " review-evidence";
   }
   function unpaired(item) {
     return ["unpaired_old", "unpaired_new"].includes(item.change);
@@ -333,7 +345,7 @@
         if (!["schema", "graphics"].includes(item.channel)) return false;
       } else if (channel !== "all" && item.channel !== channel) return false;
       switch ($("review-filter").value) {
-        case "paired": return pairedDifference(item) || Boolean(item.old && item.new && transformation(item));
+        case "paired": return contentDifference(item) || Boolean(item.old && item.new && transformation(item));
         case "formatting": return item.change === "formatting_only";
         case "review": return Boolean(item.review_required);
         case "uncertain": return uncertain(item);
@@ -385,7 +397,8 @@
       const formatting = result.items.filter((item) => item.change === "formatting_only").length;
       const graphicsUncertain = result.items.filter((item) => item.change === "visual_uncertain").length;
       const optional = visible.filter(transformation).length;
-      status(`对比完成 · ${result.items.filter(pairedDifference).length} 条已配对差异候选 · ${unresolved} 条未配对待复核${graphicsUncertain ? ` · ${graphicsUncertain} 条图形对应不确定，见人工复核` : ""} · ${formatting} 条仅格式差异${hidden ? ` · ${hidden} 个仅解释差异默认隐藏` : ""} · 非已确认变更数${state.graphicsEnabled ? optional ? ` · 另显示 ${optional} 条平移/缩放提示（不计内容变更）` : " · 仅设计内容" : " · 图形检测未接入/未启用"}`);
+      const rowChanges = result.items.filter(tableRowChange).length;
+      status(`对比完成 · ${result.items.filter(pairedDifference).length} 条已配对差异候选${rowChanges ? ` · ${rowChanges} 条表格行增删候选` : ""} · ${unresolved} 条未配对待复核${graphicsUncertain ? ` · ${graphicsUncertain} 条图形对应不确定，见人工复核` : ""} · ${formatting} 条仅格式差异${hidden ? ` · ${hidden} 个仅解释差异默认隐藏` : ""} · 非已确认变更数${state.graphicsEnabled ? optional ? ` · 另显示 ${optional} 条平移/缩放提示（不计内容变更）` : " · 仅设计内容" : " · 图形检测未接入/未启用"}`);
     }
   }
   function svgNode(tag, attributes) {
@@ -428,7 +441,7 @@
             class: `evidence-label${style}`, "font-size": Math.max(10, 11 * 1000 / (stage.clientHeight || 1000)),
             "aria-hidden": "true"
           });
-          label.textContent = `${item.id}${counterpart ? " 对应" : transformation(item) ? " 视图范围" : pairedDifference(item) ? "" : " 待核"}`;
+          label.textContent = `${item.id}${counterpart ? " 对应" : transformation(item) ? " 视图范围" : contentDifference(item) ? "" : " 待核"}`;
           svg.append(label);
           labelled = true;
         }
@@ -440,7 +453,11 @@
     const node = $(`${side}-evidence-note`);
     if (!item) { node.textContent = state.result ? "点击证据框或索引查看证据；黄色虚框不是确认内容变更。" : "预览已就绪，等待开始对比。"; return; }
     const source = item[side], located = locations(item, side), counterparts = counterpartLocations(item, side);
-    if (!source) node.textContent = `${item.id} · 未配对到证据，不代表本侧图纸没有该内容`;
+    if (!source && tableRowChange(item)) {
+      const context = navigationLocations(item, side);
+      node.textContent = `${item.id} · 本侧CU表格未提取到该行，仍需核对原图${context.length ? "；定位到对应表格（仅上下文，不伪造缺失行红框）" : "；缺少表格定位来源"}`;
+    }
+    else if (!source) node.textContent = `${item.id} · 未配对到证据，不代表本侧图纸没有该内容`;
     else if (counterparts.length) {
       node.textContent = `${item.id} · 本侧无残差框；红色虚框为${sideName[counterparts[0].from_side]}残差映射的对应位置（非本侧修改证据）${counterparts.some((loc) => loc.page === state[side].page) ? "" : `；位于第 ${[...new Set(counterparts.map((loc) => loc.page))].join("、")} 页`}`;
     }
@@ -540,6 +557,10 @@
     section.append(list, el("p", "graphics-disclaimer", optional
       ? "黄色虚框只标出视图范围，不标为内容变化红框。取消对应复选框即可隐藏，文字、尺寸标注和其他内容差异不受影响。"
       : "红色实框来自实际局部残差像素；红色虚框是对侧残差经已接受配准映射的对应位置，不是本侧实测变化。未提供可靠映射时仅导航上下文，不将整个区域边界冒充差异点。配准响应不是准确率。"));
+    if (item.change === "visual_annotation") {
+      section.append(el("p", "graphics-disclaimer",
+        "本项是文字区域的像素残差，不代表完整文字比较；料号及表格内容请结合结构化字段中的旧值、新值和单元格证据。"));
+    }
     if (Array.isArray(graphics.limitations) && graphics.limitations.length) {
       const limits = el("ul", "graphics-limitations");
       graphics.limitations.forEach((limit) => limits.append(el("li", "", limit)));
@@ -554,6 +575,10 @@
     if (!item) { content.append(el("p", "detail-placeholder", "保留原文 · 核对外观 · 不推测缺失证据")); return; }
     const graphical = item.channel === "graphics";
     if (graphical) content.append(renderGraphicsDetails(item));
+    if (tableRowChange(item)) {
+      content.append(el("p", "review-reasons",
+        `${changes[item.change]}：来自已建立对应、单元格网格完整的CU表格，不是把普通未配对字段当作增删。只在有该行提取证据的一侧标红，另一侧仅定位到对应表格。OCR仍可能遗漏，需按两侧原图确认。`));
+    }
     if (item.cell_comparison) {
       const cells = item.cell_comparison, section = el("section", "cell-diff");
       section.append(el("h3", "", "实际变化的列（CU 单元格证据）"));
@@ -591,6 +616,12 @@
       section.append(el("h3", "", `${sideName[side]} / ${graphical ? "本地渲染证据描述（非 OCR 原文）" : item.cell_comparison ? "整行原文（上下文，非整行变更）" : "原始文本"}`));
       section.append(el("p", "source-text", source ? (source.raw_text ?? (graphical ? "未提供本地渲染描述" : "未提供原文")) : "未配对到证据（不代表原图没有）"));
       if (source) {
+        if (Array.isArray(source.schema_sources) && source.schema_sources.length) {
+          const originals = el("details");
+          originals.append(el("summary", "", "CU 原始提取分组（标签 / 值）"),
+            el("p", "source-text", source.schema_sources.map((entry) => entry.raw_text).join("\n")));
+          section.append(originals);
+        }
         if (graphical && !transformation(item)) {
           section.append(el("p", "source-meta",
             `实际残差框 ${locations(item, side).length} 处 · 对应定位框 ${counterpartLocations(item, side).length} 处（不计入残差像素或变化数量）${source.counterpart_location_error ? `；映射限制：${source.counterpart_location_error}` : ""}`));

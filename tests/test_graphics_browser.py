@@ -315,6 +315,55 @@ class GraphicsBrowserTests(unittest.TestCase):
         expect(self.page.locator('#new-stage rect[data-id="G005"]')).to_have_count(0)
         expect(self.page.locator('#old-stage rect[data-id="G005"]')).to_have_class("evidence-box review-evidence selected")
 
+    def test_grounded_table_row_changes_are_default_visible_with_table_context(self):
+        for change, present, absent in (
+            ("table_row_added", "new", "old"), ("table_row_removed", "old", "new")
+        ):
+            with self.subTest(change=change):
+                row = {
+                    "id": "D010", "channel": "schema", "region": "BOM", "key": "ADDED LABEL",
+                    "change": change, "old": None, "new": None, "review_required": True,
+                    "review_reasons": ["完整提取表格的增删候选，仍需核对原图"],
+                    "match": {"method": "complete_table_rows", "certainty": "uncertain", "score": 1},
+                    "table_comparison": {"status": "complete"},
+                    "table_context": {side: source([location(2, .5, .4, .3, .4)]) for side in ("old", "new")},
+                }
+                row[present] = source([location(2, .55, .42, .2, .03)], raw_text="6 ADDED LABEL 1 EA")
+                self.result["items"] = [row]
+                self.compare()
+                self.assertEqual(self.visible_ids(), ["D010"])
+                expect(self.page.locator("#job-status")).to_contain_text("1 条表格行增删候选")
+                expect(self.page.locator("#job-status")).to_contain_text("0 条未配对待复核")
+                self.select("D010")
+                for side in ("old", "new"):
+                    expect(self.page.locator(f"#{side}-page")).to_have_value("2")
+                expect(self.page.locator(f'#{present}-stage rect[data-id="D010"]')).to_have_class(
+                    "evidence-box selected")
+                expect(self.page.locator(f'#{absent}-stage rect[data-id="D010"]')).to_have_count(0)
+                expect(self.page.locator(f"#{absent}-evidence-note")).to_contain_text("对应表格")
+                expect(self.page.locator("#detail-content")).to_contain_text("OCR仍可能遗漏")
+                row["table_comparison"]["status"] = "unavailable"
+                self.compare()
+                self.assertEqual(self.visible_ids(), [])
+                expect(self.page.locator("#job-status")).not_to_contain_text("表格行增删候选")
+
+    def test_title_value_boxes_preserve_original_extraction_groups(self):
+        row = copy.deepcopy(self.result["items"][0])
+        row.pop("cell_comparison")
+        row.update(key="Customer P/N", region="title")
+        row["old"]["raw_text"], row["new"]["raw_text"] = "SYN-A", "N/A"
+        row["old"]["schema_sources"] = [{"raw_text": "Customer P/N :"}, {"raw_text": "SYN-A"}]
+        row["new"]["schema_sources"] = [{"raw_text": "Customer P/N : N/A"}]
+        self.result["items"] = [row]
+        self.compare()
+        self.select("D001")
+        for side in ("old", "new"):
+            self.assert_geometry(side, "D001", row[side]["locations"][0])
+        for summary in self.page.locator(".source-detail details summary").all():
+            summary.click()
+        expect(self.page.locator("#detail-content")).to_contain_text("Customer P/N : N/A")
+        expect(self.page.locator("#detail-content")).to_contain_text("CU 原始提取分组")
+
     def test_residual_geometry_tracks_fit_zoom_resize_and_dpr(self):
         for dpr in (2, 1):
             with self.subTest(dpr=dpr):

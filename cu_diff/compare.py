@@ -24,13 +24,15 @@ import math
 import re
 
 from .evidence import normalize_date_spacing, normalize_text, parse_source
-from .table_diff import refine_bom
+from .table_diff import reconcile_bom, refine_bom
+from .title_diff import reconcile_title_fields
 
 
 _CATEGORIES = {
     "BOM", "certification", "packaging", "dimension", "label", "note",
     "drawing", "title", "other",
 }
+_CATEGORY_NAMES = {category.casefold(): category for category in _CATEGORIES}
 _BOM_ROW_NUMBER = re.compile(r"^(\d+)[.)]?\s+(.+)$")
 _BOM_QUANTITY = re.compile(r"(?<!\S)\d+(?:[.,]\d+)?\s*(?:pcs|g)\b", re.IGNORECASE)
 _DATE_KEY = re.compile(
@@ -208,14 +210,16 @@ def _extract(operation, side, threshold):
             text_field = text_field if isinstance(text_field, dict) else {}
             source, confidence = text_field.get("source"), text_field.get("confidence")
             issues.extend(_evidence_issues(source, confidence, threshold))
-            if normalize_text(strings["Category"]) not in _CATEGORIES:
+            category = _CATEGORY_NAMES.get(normalize_text(strings["Category"]).casefold())
+            if category is None:
                 issues.append("unknown category")
             if not normalize_text(strings["Region"]) or not normalize_text(strings["Key"]):
                 issues.append("missing stable region or key")
             polygons = parse_source(source)
             items.append({
                 "id": identity, "content_index": content_index,
-                "region": strings["Region"], "category": strings["Category"],
+                "region": strings["Region"], "category": category or strings["Category"],
+                "raw_category": strings["Category"],
                 "key": strings["Key"], "raw_text": strings["RawText"],
                 "detail": strings["Detail"], "source": deepcopy(source),
                 "confidence": deepcopy(confidence), "polygons": polygons,
@@ -624,6 +628,8 @@ def _compare_lines(old, new):
 
 def _coverage(records, old_count, new_count):
     def size(value):
+        if "schema_item_ids" in value:
+            return len(value["schema_item_ids"])
         return len(value["lines"]) if "lines" in value else 1
 
     paired = [record for record in records if record["old"] is not None and record["new"] is not None]
@@ -639,6 +645,8 @@ def _coverage(records, old_count, new_count):
         "unchanged_pairs": sum(record["change"] == "unchanged" for record in records),
         "reconciled_groups": sum(record["change"] == "reconciled" for record in records),
         "relocated_pairs": sum(record["change"] == "relocated" for record in records),
+        "table_row_added_candidates": sum(record["change"] == "table_row_added" for record in records),
+        "table_row_removed_candidates": sum(record["change"] == "table_row_removed" for record in records),
         "review_required": sum(record["review_required"] for record in records),
     }
 
@@ -662,10 +670,16 @@ def compare_documents(old, new, *, confidence_threshold=0.8):
     new_uncertainties, new_service_warnings, new_diagnostics = _diagnostics(new, "new")
     uncertainties = old_uncertainties + new_uncertainties
     service_warnings = old_service_warnings + new_service_warnings
-    item_records, pairing_warnings = _compare_items(old_items, new_items)
+    title_pairs, old_remaining, new_remaining, title_warnings = reconcile_title_fields(
+        old_items, new_items, old_lines, new_lines)
+    item_records, pairing_warnings = _compare_items(old_remaining, new_remaining)
+    item_records.extend(_record(left, right, "printed_title_label_value", 1.0, "high")
+                        for left, right in title_pairs)
+    table_warnings = reconcile_bom(item_records, old, new)
     refine_bom(item_records, old, new)
     ocr_records = _compare_lines(old_lines, new_lines)
-    warnings = old_warnings + new_warnings + pairing_warnings + old_diagnostics + new_diagnostics
+    warnings = (old_warnings + new_warnings + pairing_warnings + title_warnings + table_warnings
+                + old_diagnostics + new_diagnostics)
     review_required = (bool(warnings) or bool(uncertainties) or bool(service_warnings)
                        or any(record["review_required"] for record in item_records + ocr_records))
     if review_required:

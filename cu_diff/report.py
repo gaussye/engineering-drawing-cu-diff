@@ -11,6 +11,8 @@ CHANGE_LABELS = {
     "formatting_only": "仅日期空格/表格格式不同（不计变更）",
     "unpaired_old": "仅旧侧未配对（不确认删除）",
     "unpaired_new": "仅新侧未配对（不确认新增）",
+    "table_row_added": "对应CU表格的新增行候选（需原图确认）",
+    "table_row_removed": "对应CU表格的删除行候选（需原图确认）",
     "unchanged": "提取原文相同",
     "split_merge": "OCR拆分/合并候选",
 }
@@ -51,15 +53,20 @@ def write_report(result: dict, path: Path) -> None:
     for number, diff in enumerate(result.get("differences", []), 1):
         old, new = diff.get("old"), diff.get("new")
         match = diff.get("match", {})
+        row_change = diff.get("change") in ("table_row_added", "table_row_removed")
+        missing_row = "对应CU表格未提取到该行（需原图确认）"
         lines.append("| " + " | ".join([
             str(number), cell(f"{diff.get('region', '')} / {diff.get('key', '')}"),
-            evidence(old), evidence(new),
+            missing_row if row_change and old is None else evidence(old),
+            missing_row if row_change and new is None else evidence(new),
             cell(CHANGE_LABELS.get(diff.get("change"), diff.get("change"))),
             cell(f"{(old or {}).get('source')} / {(new or {}).get('source')}"),
             cell(f"{(old or {}).get('confidence')} / {(new or {}).get('confidence')}"),
             cell(match) + ("；需人工复核" if diff.get("review_required") else "；候选匹配"),
         ]) + " |")
-    lines.extend(["", "### BOM单元格细化", "",
+    lines.extend(["", "表格行增删候选要求两侧CU表格网格完整且对应关系可靠；"
+                  "这不保证OCR无遗漏。JSON中的 `table_context` 保留对侧表格定位，"
+                  "不伪造不存在的行坐标。", "", "### BOM单元格细化", "",
                   "仅列出配对后的变化列；缺失或冲突时保留整行原文，但不把整行当作变化位置。",
                   "", "| 项目 | 列 | 旧值 | 新值 | 旧 / 新单元格来源 |",
                   "|---|---|---|---|---|"])
