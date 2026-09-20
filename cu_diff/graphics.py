@@ -2,6 +2,7 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 import re
 
@@ -10,7 +11,7 @@ import pymupdf
 from .evidence import parse_source
 
 
-VERSION = "local-graphics-v4"
+VERSION = "local-graphics-v5"
 MAX_PIXELS = 8_000_000
 MAX_BOXES = 24
 LIMITATIONS = [
@@ -20,6 +21,7 @@ LIMITATIONS = [
     "绘图缩放不等于实物尺寸变化；原始尺寸、零件与BOM字段仍独立比较。",
     "文字掩膜仅用于区分含文字区域；OCR遗漏可能让文字变化进入图形通道。",
     "小于渲染分辨率或噪声阈值的细线/符号可能漏检；框内并非每个像素都改变。",
+    "单侧残差可按已接受的配准映射到另一侧；映射定位框不是本侧实测残差，也不增加变化像素数。",
 ]
 
 
@@ -409,10 +411,56 @@ def _side(region, size, locations, scale, origin=None):
         "raw_text": "本地PDF渲染证据（不是OCR原文）", "detail": "框为变化像素包围区域，非框内全部内容改变。",
         "confidence": None, "source": {"kind": "local_pdf_render", "page": region.page,
             "dpi": round(scale * 72, 3), "region_pt": list(region.box),
+            "render_scale": scale, "page_size_pt": list(size),
             "crop_origin_pixels": list(origin) if origin is not None else None, "version": VERSION},
         "locations": locations, "context_locations": [_location(region.box, region.page, size)],
-        "location_error": None if locations else "本侧没有达到阈值的变化像素；上下文仅供定位，不推测差异框",
+        "location_error": None if locations else "本侧没有达到阈值的变化像素框；对应定位与实测残差分开记录",
     }
+
+
+def _link_counterparts(left, right, metadata):
+    """Project one-sided residual boxes without changing observed evidence."""
+    alignment = metadata.get("alignment", {})
+    if not left or not right or alignment.get("accepted") is not True:
+        return
+    factor = alignment.get("scale_ratio", 1.0)
+    offsets = (alignment.get("dx_pixels"), alignment.get("dy_pixels"))
+    if not all(isinstance(v, (int, float)) and isfinite(v) for v in (factor, *offsets)) or factor <= 0:
+        raise GraphicsError("已接受的图形配准缺少有效平移/缩放参数，无法生成对应定位框。")
+    for source_role, source, target in (("old", left, right), ("new", right, left)):
+        if target["locations"] or not source["locations"]:
+            continue
+        a, b = source["source"], target["source"]
+        if a.get("crop_origin_pixels") is None or b.get("crop_origin_pixels") is None:
+            target["counterpart_location_error"] = "缺少渲染裁切原点，不能映射对侧残差。"
+            continue
+        projected = []
+        for index, location in enumerate(source["locations"]):
+            points = ((location["x"], location["y"]),
+                      (location["x"] + location["width"], location["y"] + location["height"]))
+            mapped = []
+            for point in points:
+                for axis in (0, 1):
+                    pixel = point[axis] * a["page_size_pt"][axis] * a["render_scale"] - a["crop_origin_pixels"][axis]
+                    pixel = factor * pixel + offsets[axis] if source_role == "old" else (pixel - offsets[axis]) / factor
+                    mapped.append((pixel + b["crop_origin_pixels"][axis]) / b["render_scale"])
+            pw, ph = b["page_size_pt"]
+            if min(pw, mapped[2]) <= max(0, mapped[0]) or min(ph, mapped[3]) <= max(0, mapped[1]):
+                target["counterpart_location_error"] = "部分对侧残差映射到页面外，未绘制越界定位框。"
+                continue
+            projected.append({
+                **_location(mapped, b["page"], b["page_size_pt"]),
+                "evidence_role": "projected_counterpart", "label": "对应位置，非本侧残差",
+                "from_side": source_role, "source_location_index": index,
+            })
+        target["counterpart_locations"] = projected
+        target["counterpart_source"] = {
+            "kind": "registered_residual_projection", "from_side": source_role,
+            "alignment_method": alignment["method"], "scale_ratio": factor,
+            "dx_pixels": offsets[0], "dy_pixels": offsets[1],
+            "source_crop_origin_pixels": a["crop_origin_pixels"],
+            "target_crop_origin_pixels": b["crop_origin_pixels"],
+        }
 
 
 def _transformations(regions, sizes, origins, scale, alignment, metadata, emit):
@@ -632,6 +680,8 @@ def compare_graphics(old_path: Path, new_path: Path, old_response=None, new_resp
         transformations.append(args)
 
     def emit(change, left, right, metadata, score=0):
+        if change in ("visual_modified", "visual_annotation"):
+            _link_counterparts(left, right, metadata)
         items.append({
             "id": f"G{len(items)+1:03d}", "channel": "graphics", "change": change,
             "region": "本地图形", "key": metadata["classification"], "review_required": True,

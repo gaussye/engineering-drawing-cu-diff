@@ -116,6 +116,9 @@ class SubviewTests(unittest.TestCase):
             self.assertEqual(item["graphics"]["subview"]["new_index"], 2)
             self.assertNotIn("center_displacement_pt", item["graphics"])
             self.assertNotIn("order_reversal", item["graphics"]["subview"])
+            self.assertEqual(len(item["old"]["counterpart_locations"]), len(item["new"]["locations"]))
+            self.assertTrue(all(loc["evidence_role"] == "projected_counterpart"
+                                for loc in item["old"]["counterpart_locations"]))
 
     def test_moved_label_change_remains_annotation(self):
         result = self.compare(new_options={"label": "TWO"})

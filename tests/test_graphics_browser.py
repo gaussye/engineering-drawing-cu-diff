@@ -427,6 +427,76 @@ class GraphicsBrowserTests(unittest.TestCase):
         self.page.locator("#old-fit").click()
         expect(self.page.locator('#old-stage rect[data-id="G007"]')).to_have_count(0)
 
+    def test_counterpart_red_frame_is_separate_from_observed_evidence(self):
+        item = next(i for i in self.result["items"] if i["id"] == "G007")
+        counterpart = location(2, .52, .45, .08, .1, evidence_role="projected_counterpart",
+                               from_side="new", source_location_index=0, label="对应位置，非本侧残差")
+        item["old"]["counterpart_locations"] = [counterpart]
+        self.compare()
+        self.select("G007")
+        expect(self.page.locator("#old-page")).to_have_value("2")
+        old = self.page.locator('#old-stage rect[data-id="G007"]')
+        new = self.page.locator('#new-stage rect[data-id="G007"]')
+        expect(old).to_have_class("evidence-box counterpart-evidence selected")
+        expect(old).to_have_attribute("data-evidence-role", "projected_counterpart")
+        expect(new).to_have_attribute("data-evidence-role", "observed")
+        self.assertEqual(old.evaluate("n => getComputedStyle(n).stroke"),
+                         new.evaluate("n => getComputedStyle(n).stroke"))
+        self.assertNotEqual(old.evaluate("n => getComputedStyle(n).strokeDasharray"), "none")
+        expect(old).to_have_attribute("aria-label", "G007 对应位置，非本侧残差，对侧残差映射定位，非本侧修改证据，旧版第 2 页")
+        expect(self.page.locator("#old-evidence-note")).to_contain_text("红色虚框")
+        expect(self.page.locator("#old-evidence-note")).to_contain_text("非本侧修改证据")
+        expect(self.page.locator("#detail-content")).to_contain_text("实际残差框 0 处 · 对应定位框 1 处")
+        expect(self.page.locator(".graphics-detail")).to_contain_text("0 / 36")
+        expect(self.page.locator("#job-status")).to_contain_text("5 条已配对差异候选")
+        for zoom in ("fit", "150", "200"):
+            self.page.locator("#old-zoom").select_option(zoom)
+            self.assert_geometry("old", "G007", counterpart)
+        old.focus()
+        old.press("Enter")
+        expect(self.page.locator('.result-item[data-id="G007"] button')).to_have_attribute("aria-pressed", "true")
+        self.page.locator("#channel-filter").select_option("schema")
+        expect(self.page.locator('rect[data-evidence-role="projected_counterpart"]')).to_have_count(0)
+        self.page.locator("#channel-filter").select_option("primary")
+        self.select("G007")
+        self.page.locator("#new-upload").set_input_files({
+            "name": "replacement.pdf", "mimeType": "application/pdf", "buffer": b"%PDF-1.4\n%%EOF"})
+        expect(self.page.locator("rect.evidence-box")).to_have_count(0)
+
+    def test_new_side_counterpart_and_untrusted_projections(self):
+        item = next(i for i in self.result["items"] if i["id"] == "G001")
+        item["new"]["locations"] = []
+        item["new"]["counterpart_locations"] = [
+            location(1, .42, .4, .08, .12, evidence_role="projected_counterpart",
+                     from_side="old", source_location_index=0)]
+        self.compare()
+        self.select("G001")
+        expect(self.page.locator('#new-stage rect[data-id="G001"]')).to_have_class(
+            "evidence-box counterpart-evidence selected")
+        self.assert_geometry("new", "G001", item["new"]["counterpart_locations"][0])
+        for invalid in ("unaccepted", "wrong_origin", "invalid_index", "missing_role", "outside", "two_sided"):
+            with self.subTest(invalid=invalid):
+                bad = copy.deepcopy(item)
+                loc = bad["new"]["counterpart_locations"][0]
+                if invalid == "unaccepted":
+                    bad["graphics"]["alignment"]["accepted"] = False
+                elif invalid == "wrong_origin":
+                    loc["from_side"] = "new"
+                elif invalid == "invalid_index":
+                    loc["source_location_index"] = 100
+                elif invalid == "missing_role":
+                    loc.pop("evidence_role")
+                elif invalid == "outside":
+                    bad["new"]["counterpart_locations"] = [
+                        location(page=99, evidence_role="projected_counterpart",
+                                 from_side="old", source_location_index=0)]
+                else:
+                    bad["new"]["locations"] = [location()]
+                self.result["items"] = [bad]
+                self.compare()
+                self.select("G001")
+                expect(self.page.locator('rect[data-evidence-role="projected_counterpart"]')).to_have_count(0)
+
     def test_crossed_subviews_show_independent_locations_and_identity_not_accuracy(self):
         item = next(entry for entry in self.result["items"] if entry["id"] == "G003")
         item["change"] = "visual_modified"

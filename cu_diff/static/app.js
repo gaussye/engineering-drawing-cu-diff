@@ -71,7 +71,7 @@
       ? "本地图形检测已启用；默认只比较设计内容。平移、绘图缩放可单独勾选显示，不计内容变更。"
       : graphicsUnavailable;
     $("filter-note").textContent = state.graphicsEnabled
-      ? "平移和绘图缩放默认隐藏；勾选只改变本地显示，不重新调用 CU。红色实框：原文或内容残差候选；黄色虚框：复核证据或可选视图范围。缩放伴随内容修改时，内容候选仍保留；不确定项请切换「需要人工复核」。"
+      ? "平移和绘图缩放默认隐藏；勾选只改变本地显示，不重新调用 CU。红色实框：实际残差；红色虚框：对侧映射的对应位置，非本侧残差；黄色虚框：复核证据或可选视图范围。缩放伴随内容修改时，内容候选仍保留。"
       : "默认显示结构化字段，不重复展示 OCR。红色实框为原文差异候选；黄色虚框仅供复核，不是确认变更。";
     $("coverage-content").textContent = `尚未运行对比。${state.graphicsEnabled ? "图形覆盖以本轮服务返回的统计为准。" : graphicsUnavailable}系统不会将缺失位置的证据推测成红框。`;
   }
@@ -287,8 +287,19 @@
   function locations(item, side) {
     return validLocations(item?.[side]?.locations, side);
   }
+  function counterpartLocations(item, side) {
+    if (item?.channel !== "graphics" || !pairedDifference(item) || !item.old || !item.new ||
+        item.graphics?.alignment?.accepted !== true || locations(item, side).length) return [];
+    return validLocations(item[side].counterpart_locations, side)
+      .filter((loc) => loc.evidence_role === "projected_counterpart" &&
+        loc.from_side === (side === "old" ? "new" : "old") &&
+        Number.isInteger(loc.source_location_index) && loc.source_location_index >= 0 &&
+        loc.source_location_index < locations(item, loc.from_side).length);
+  }
   function navigationLocations(item, side) {
     const evidence = locations(item, side);
+    const counterparts = counterpartLocations(item, side);
+    if (counterparts.length) return counterparts;
     // Context is only a navigation fallback for a paired graphical region, never a change box.
     if (evidence.length || item?.channel !== "graphics" || !item.old || !item.new) return evidence;
     return validLocations(item[side].context_locations, side);
@@ -390,15 +401,21 @@
     const items = visibleItems().slice().sort((a, b) => Number(a.id === state.selected) - Number(b.id === state.selected));
     for (const item of items) {
       let labelled = false;
-      for (const loc of locations(item, side).filter((l) => l.page === s.page)) {
+      const displayed = [
+        ...locations(item, side).map((loc) => ({ loc, counterpart: false })),
+        ...counterpartLocations(item, side).map((loc) => ({ loc, counterpart: true }))
+      ];
+      for (const { loc, counterpart } of displayed.filter(({ loc }) => loc.page === s.page)) {
         const box = bounds(loc);
+        const style = counterpart ? " counterpart-evidence" : evidenceStyle(item);
         const rect = svgNode("rect", {
           x: box.x * 1000, y: box.y * 1000, width: box.width * 1000, height: box.height * 1000,
-          class: `evidence-box${evidenceStyle(item)}${item.id === state.selected ? " selected" : ""}`,
+          class: `evidence-box${style}${item.id === state.selected ? " selected" : ""}`,
           "data-id": item.id, "vector-effect": "non-scaling-stroke", tabindex: 0, role: "button",
           "data-field": loc.field || "",
+          "data-evidence-role": counterpart ? "projected_counterpart" : transformation(item) ? "transformation_frame" : "observed",
           "data-channel": item.channel, "data-change": item.change,
-          "aria-label": `${item.id} ${loc.label || item.key || item.region || ""}，${changes[item.change] || item.change}，${sideName[side]}第 ${s.page} 页`
+          "aria-label": `${item.id} ${loc.label || item.key || item.region || ""}，${counterpart ? "对侧残差映射定位，非本侧修改证据" : changes[item.change] || item.change}，${sideName[side]}第 ${s.page} 页`
         });
         rect.addEventListener("click", () => selectItem(item.id));
         rect.addEventListener("keydown", (event) => {
@@ -408,10 +425,10 @@
         if (!labelled && (!state.selected || item.id === state.selected)) {
           const label = svgNode("text", {
             x: Math.min(box.x * 1000 + 2, 940), y: Math.max(18, box.y * 1000 - 5),
-            class: `evidence-label${evidenceStyle(item)}`, "font-size": Math.max(10, 11 * 1000 / (stage.clientHeight || 1000)),
+            class: `evidence-label${style}`, "font-size": Math.max(10, 11 * 1000 / (stage.clientHeight || 1000)),
             "aria-hidden": "true"
           });
-          label.textContent = `${item.id}${transformation(item) ? " 视图范围" : pairedDifference(item) ? "" : " 待核"}`;
+          label.textContent = `${item.id}${counterpart ? " 对应" : transformation(item) ? " 视图范围" : pairedDifference(item) ? "" : " 待核"}`;
           svg.append(label);
           labelled = true;
         }
@@ -422,8 +439,11 @@
     const item = state.result?.items.find((i) => i.id === state.selected);
     const node = $(`${side}-evidence-note`);
     if (!item) { node.textContent = state.result ? "点击证据框或索引查看证据；黄色虚框不是确认内容变更。" : "预览已就绪，等待开始对比。"; return; }
-    const source = item[side], located = locations(item, side);
+    const source = item[side], located = locations(item, side), counterparts = counterpartLocations(item, side);
     if (!source) node.textContent = `${item.id} · 未配对到证据，不代表本侧图纸没有该内容`;
+    else if (counterparts.length) {
+      node.textContent = `${item.id} · 本侧无残差框；红色虚框为${sideName[counterparts[0].from_side]}残差映射的对应位置（非本侧修改证据）${counterparts.some((loc) => loc.page === state[side].page) ? "" : `；位于第 ${[...new Set(counterparts.map((loc) => loc.page))].join("、")} 页`}`;
+    }
     else if (item.channel === "graphics" && !located.length) {
       const context = navigationLocations(item, side);
       node.textContent = context.length
@@ -519,7 +539,7 @@
     }
     section.append(list, el("p", "graphics-disclaimer", optional
       ? "黄色虚框只标出视图范围，不标为内容变化红框。取消对应复选框即可隐藏，文字、尺寸标注和其他内容差异不受影响。"
-      : "证据框仅来自实际局部残差像素。无残差框时可导航至已配对上下文，但不会将区域边界绘成变化框。未提供概率置信度，配准响应也不是准确率。"));
+      : "红色实框来自实际局部残差像素；红色虚框是对侧残差经已接受配准映射的对应位置，不是本侧实测变化。未提供可靠映射时仅导航上下文，不将整个区域边界冒充差异点。配准响应不是准确率。"));
     if (Array.isArray(graphics.limitations) && graphics.limitations.length) {
       const limits = el("ul", "graphics-limitations");
       graphics.limitations.forEach((limit) => limits.append(el("li", "", limit)));
@@ -571,6 +591,10 @@
       section.append(el("h3", "", `${sideName[side]} / ${graphical ? "本地渲染证据描述（非 OCR 原文）" : item.cell_comparison ? "整行原文（上下文，非整行变更）" : "原始文本"}`));
       section.append(el("p", "source-text", source ? (source.raw_text ?? (graphical ? "未提供本地渲染描述" : "未提供原文")) : "未配对到证据（不代表原图没有）"));
       if (source) {
+        if (graphical && !transformation(item)) {
+          section.append(el("p", "source-meta",
+            `实际残差框 ${locations(item, side).length} 处 · 对应定位框 ${counterpartLocations(item, side).length} 处（不计入残差像素或变化数量）${source.counterpart_location_error ? `；映射限制：${source.counterpart_location_error}` : ""}`));
+        }
         section.append(el("p", graphical ? "source-meta graphics-provenance" : "source-meta", graphical
           ? `本地渲染来源：${text(source.source) || "未提供"}\n置信度：未提供概率置信度${source.location_error ? `\n定位说明：${source.location_error}` : ""}`
           : `来源：${text(source.source) || "未提供"} · 置信度：${text(source.confidence) || "未提供"}${source.location_error ? ` · 无法定位：${source.location_error}` : ""}`));

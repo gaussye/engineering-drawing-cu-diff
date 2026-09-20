@@ -85,6 +85,8 @@ class GraphicsTests(unittest.TestCase):
         self.assertIn("1 → 3", feature["key"])
         self.assertEqual(feature["old"]["locations"], [])
         self.assertEqual(len(feature["new"]["locations"]), 2)
+        self.assertEqual(len(feature["old"]["counterpart_locations"]), 2)
+        self.assertTrue(all(loc["from_side"] == "new" for loc in feature["old"]["counterpart_locations"]))
         for box in feature["new"]["locations"]:
             self.assertGreater(box["x"], 100/600)
             self.assertLess(box["x"], 120/600)
@@ -105,6 +107,9 @@ class GraphicsTests(unittest.TestCase):
                     if i["graphics"]["method"] == "rectangular_interior_vertical_runs"]
         self.assertEqual(feature["old"]["locations"], [])
         self.assertEqual(len(feature["new"]["locations"]), 2)
+        for projected, actual in zip(feature["old"]["counterpart_locations"], feature["new"]["locations"]):
+            self.assertAlmostEqual(projected["x"], actual["x"] - 18/600, delta=.001)
+            self.assertAlmostEqual(projected["y"], actual["y"] - 12/400, delta=.001)
 
     def test_uniform_scale_is_not_default_design_content(self):
         drawing(self.new, scale_x=1.2)
