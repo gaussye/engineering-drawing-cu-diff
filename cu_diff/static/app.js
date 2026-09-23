@@ -18,6 +18,8 @@
     model_no_text_change: "局部复读未发现文字差异",
     model_text_modified: "CU局部原文不同（模型配对待核）",
     model_review: "模型对应待复核（非确认变更）",
+    model_visual_modified: "图纸填充／轮廓变化候选",
+    model_visual_review: "图纸填充／轮廓变化候选（定位未解决）",
     visual_uncertain: "图形对应不确定（待复核）"
   };
   const channels = { model: "模型引导复核", schema: "结构化字段", tables: "表格专项证据", graphics: "本地图形候选", ocr: "OCR 原文", unchanged: "一致项复核" };
@@ -316,6 +318,8 @@
   function navigationLocations(item, side) {
     const evidence = locations(item, side);
     if (!evidence.length && item?.channel === "model") {
+      const context = modelVisualItem(item) ? validLocations(item[side]?.context_locations, side) : [];
+      if (context.length) return context;
       return validLocations(item.model_context?.[side]?.locations, side);
     }
     if (!evidence.length && annotationReview(item)) {
@@ -342,6 +346,18 @@
       typeof item.new?.raw_text === "string" && Boolean(item.new.raw_text.trim()) &&
       item.old.raw_text !== item.new.raw_text;
   }
+  function modelVisualItem(item) {
+    return item?.channel === "model" && (item.model_comparison?.stage === "visual" ||
+      ["model_visual_modified", "model_visual_review"].includes(item.change));
+  }
+  function modelVisualDifference(item) {
+    return modelVisualItem(item) && item.change === "model_visual_modified" &&
+      item.model_comparison?.stage === "visual" && item.model_comparison?.status === "visual_grounded" &&
+      item.model_comparison?.highlight_scope === "nontext_residual_only" &&
+      item.visual_comparison?.status === "localized" &&
+      sides.every((side) => item[side]?.raw_text === "" &&
+        Array.isArray(item[side]?.source) && item[side].source.some((source) => source?.kind === "pdf_raster"));
+  }
   function pairedDifference(item) {
     return Boolean(item.old && item.new) &&
       ["modified", "relocated", "visual_modified", "visual_annotation"].includes(item.change);
@@ -362,7 +378,8 @@
       item.annotation_comparison?.status === "observed";
   }
   function contentDifference(item) {
-    return pairedDifference(item) || tableRowChange(item) || documentTableChange(item) || modelTextDifference(item);
+    return pairedDifference(item) || tableRowChange(item) || documentTableChange(item) ||
+      modelTextDifference(item) || modelVisualDifference(item);
   }
   function transformation(item) {
     return ["visual_moved", "visual_scaled"].includes(item.change);
@@ -400,7 +417,7 @@
     const modelItems = (state.result?.items || []).filter((item) => item.channel === "model" && item.change !== "model_no_text_change");
     $("model-count").hidden = !modelItems.length;
     $("model-count").textContent = modelItems.length
-      ? `模型通道：${modelItems.filter(modelTextDifference).length} 条局部原文不同候选 / ${modelItems.filter((item) => !modelTextDifference(item)).length} 条待复核。可能与其他通道重叠，不相加为独立变更数。` : "";
+      ? `模型通道：${modelItems.filter(modelTextDifference).length} 条局部原文不同候选 / ${modelItems.filter((item) => !modelTextDifference(item) && !modelVisualItem(item)).length} 条待复核；非文字：${modelItems.filter(modelVisualDifference).length} 条填充／轮廓变化候选 / ${modelItems.filter((item) => modelVisualItem(item) && !modelVisualDifference(item)).length} 条定位未解决。可能与其他通道重叠，不相加为独立变更数。` : "";
     renderResultStatus(items);
     $("result-count").textContent = state.result ? String(items.length) : "—";
     $("result-count").title = state.result ? `当前显示 ${items.length} / 总计 ${state.result.items.length}` : "";
@@ -501,6 +518,13 @@
     const source = item[side], located = locations(item, side), counterparts = counterpartLocations(item, side);
     if (item.channel === "model") {
       const context = navigationLocations(item, side);
+      if (modelVisualItem(item)) {
+        node.textContent = `${item.id} · ${located.length
+          ? `${sideName[side]}第 ${[...new Set(located.map((loc) => loc.page))].join("、")} 页 · ${modelVisualDifference(item) ? "本地PDF栅格非文字残差（候选，非CU词框）" : "定位未解决，黄色虚框仅供复核，非确认变更"}`
+          : context.length ? "本侧无局部残差框；仅导航搜索区域上下文，不绘制变化框"
+            : "本侧无局部残差框或可用上下文；不绘制推测框"}${source?.location_error ? `；${source.location_error}` : ""}`;
+        return;
+      }
       node.textContent = `${item.id} · ${located.length
         ? `${sideName[side]}第 ${[...new Set(located.map((loc) => loc.page))].join("、")} 页${modelTextDifference(item) ? "CU局部复读证据；对应关系由模型提出，仍需复核" : "复核来源（黄色虚框，非确认变更）"}`
         : source && context.length
@@ -634,7 +658,30 @@
     content.replaceChildren();
     $("detail-meta").textContent = item ? `${item.id} · ${changes[item.change] || item.change} · 匹配 ${text(item.match?.method) || "未提供"} / 确定性 ${text(item.match?.certainty) || "未提供"} / 启发式得分 ${text(item.match?.score) || "未提供"}（非准确率）` : "选择索引或证据框，联动定位两侧证据";
     if (!item) { content.append(el("p", "detail-placeholder", "保留原文 · 核对外观 · 不推测缺失证据")); return; }
-    if (item.channel === "model") {
+    const visualModel = modelVisualItem(item);
+    if (visualModel) {
+      const comparison = item.model_comparison || {}, visual = item.visual_comparison || {};
+      $("detail-meta").textContent = `${item.id} · ${changes[item.change] || item.change} · 模型观察 + 本地PDF栅格核验（非OCR，不确认实体部件增删）`;
+      const section = el("section", "model-detail model-visual-detail");
+      section.append(el("h3", "", "图纸填充／轮廓变化候选"),
+        el("p", "", "模型生成描述（非OCR）仅用于复核；定位依据是本地PDF栅格非文字残差，不是CU变化词框，不推断实体部件删除。"),
+        el("p", "", modelVisualDifference(item)
+          ? "已局部定位：红框仅表示实际测量的非文字残差；未变尺寸标注与搜索区域不高亮，仍需原图确认。"
+          : "定位未解决：模型观察尚无充分本地非文字定位支持；不显示确认变更红框。"),
+        el("p", "", `模型配对标签（非原文证据）：${text(comparison.pair_label) || "未提供"}`),
+        el("p", "", `模型理由（非原文证据）：${text(comparison.rationale) || "未提供"}`),
+        el("p", "visual-description", `模型观察（非OCR）：${text(visual.description) || "未提供"}`),
+        el("p", "", `类型：${text(visual.kind) || "未提供"} · 状态：${text(visual.status) || "未提供"}`),
+        el("p", "", `实际残差像素（旧 / 新）：${visual.changed_pixels?.old ?? "未提供"} / ${visual.changed_pixels?.new ?? "未提供"}`),
+        el("p", "review-reasons", `定位限制：${text(visual.limitations) || "未提供"}；来源 / 预算限制：${text(comparison.issues) || "未提供"}`));
+      const provenance = el("details", "visual-provenance");
+      provenance.append(el("summary", "", "本地定位依据、对齐与可追溯性（非CU词坐标）"),
+        el("pre", "", text(visual)),
+        el("p", "", "context_locations / model_context 仅供导航，不作为变化框；未观察到残差不代表已证明整个区域没有变化。"));
+      section.append(provenance);
+      content.append(section);
+    }
+    if (item.channel === "model" && !visualModel) {
       $("detail-meta").textContent = `${item.id} · ${changes[item.change] || item.change} · 模型语义配对 + CU局部复读证据 / 对应关系仅为模型提议（不是独立确认的工程事实）`;
       const comparison = item.model_comparison || {}, section = el("section", "model-detail");
       section.append(el("h3", "", "模型引导复核 · 对应关系尚需人工确认"),
@@ -754,6 +801,13 @@
     for (const side of sides) {
       const source = item[side], section = el("section", "source-detail");
       section.dataset.side = side;
+      if (visualModel) {
+        section.append(el("h3", "", `${sideName[side]} / PDF栅格来源 · 模型生成描述（非OCR）`),
+          el("p", "source-text", source?.visual_description || item.visual_comparison?.[`${side}_description`] || "未提供模型描述（不代表原图没有该特征）"),
+          el("p", "source-meta", `本地PDF栅格来源（非CU词证据）：${text(source?.source) || "未提供"}\n实际局部残差框 ${locations(item, side).length} 处；搜索区域仅供导航，不绘变化框。${source?.location_error ? `\n定位说明：${source.location_error}` : ""}`));
+        content.append(section);
+        continue;
+      }
       section.append(el("h3", "", `${sideName[side]} / ${item.channel === "model" ? (modelTextDifference(item) ? "CU局部复读原文" : "复核来源原文（非确认变更）") : item.change === "table_grid_changed" ? "本地网格测量（非 OCR 原文）" : graphical ? "本地渲染证据描述（非 OCR 原文）" : item.cell_comparison ? "整行原文（上下文，非整行变更）" : "原始文本"}`));
       section.append(el("p", "source-text", source ? (source.raw_text ?? (graphical ? "未提供本地渲染描述" : "未提供原文")) : "未配对到证据（不代表原图没有）"));
       if (source) {
@@ -782,7 +836,7 @@
       const reasons = (item.review_reasons || []).map(text).join("；");
       content.append(el("p", "review-reasons", item.change === "interpretation_only"
         ? `仅生成解释存在差异，不代表图纸发生变更。${reasons}`
-        : `需要人工复核：${reasons || (graphical ? "请核对两侧图形、配准可靠性及定位依据。" : "请核对两侧原文及位置。")}`));
+        : `需要人工复核：${reasons || (graphical || visualModel ? "请核对两侧图形、配准可靠性及定位依据。" : "请核对两侧原文及位置。")}`));
     }
   }
   function coverageFacts(value) {
@@ -804,7 +858,11 @@
       visual_moved: "平移提示", visual_scaled: "绘图缩放提示",
       coarse: "粗比对覆盖", fine: "局部复读覆盖", unprocessed: "未处理 / 预算及来源限制",
       usage: "用量（不是金额）", budget: "预算", max_pairs: "配对预算上限", max_crops: "裁切预算上限",
-      crops: "裁切数", processed: "已处理", issues: "来源与限制"
+      crops: "裁切数", processed: "已处理", issues: "来源与限制",
+      visual: "非文字视觉覆盖", label: "区域标签", features: "模型观察特征（非确认变更）",
+      localized: "已局部定位特征", no_visual_change_observed: "未观察到视觉变化（不保证无遗漏）",
+      reason: "未处理 / 延后原因", model: "直接视觉模型调用（含返回用量）",
+      input_tokens: "输入 token", output_tokens: "输出 token", total_tokens: "该来源返回的 token 合计"
     };
     if (Array.isArray(value)) {
       const list = el("ul");
@@ -826,9 +884,26 @@
       design_content_only: "仅设计内容", view_translation: "视图平移",
       view_order: "视图顺序", uniform_drawing_scale: "等比绘图缩放",
       completed: "已完成（不保证无遗漏）", completed_with_limits: "已完成，仍有预算或来源限制",
-      source_grounded: "已提供来源（仍需核验）", review_only: "仅供复核"
+      source_grounded: "已提供来源（仍需核验）", review_only: "仅供复核",
+      reviewed: "已执行视觉复核（非全部变化已确认）", unprocessed: "未处理 / 延后（不代表无变化）"
     };
     return el("span", "", value == null ? "未提供" : typeof value === "boolean" ? (value ? "是" : "否") : Object.hasOwn(descriptions, value) ? descriptions[value] : value);
+  }
+  function renderModelCoverage(coverage) {
+    const model = el("section", "model-coverage"), { visual, ...other } = coverage;
+    model.append(el("h4", "", "模型引导覆盖、预算与来源限制"), coverageFacts(other));
+    if (visual != null) {
+      const section = el("section", "model-visual-coverage");
+      section.append(el("h4", "", "非文字视觉覆盖 · 独立预算与延后项"),
+        el("p", "", `视觉复核启用：${visual.enabled === true ? "是" : visual.enabled === false ? "否" : "未提供"} · 视觉区域预算上限：${visual.max_regions ?? "未提供"}`),
+        el("p", "", "视觉区域预算与CU文字局部复读裁切数独立；逐区域列示模型观察特征、局部定位及未处理 / 延后原因。未处理、零特征或未观察到视觉变化均不证明无变化。"),
+        coverageFacts(visual),
+        el("p", "", "用量按来源列示，包含各区域直接视觉模型调用返回的 token；不计算跨通道总用量或费用，缺失用量不按零计。"));
+      model.append(section);
+    }
+    model.append(el("p", "", modelLimits),
+      el("p", "", "模型条目可能与字段、表格或图形候选重叠，不相加为独立变更数；没有候选不等于没有变更。"));
+    return model;
   }
   function renderCoverage(result) {
     const content = $("coverage-content");
@@ -837,11 +912,7 @@
       : `${graphicsUnavailable}对比仅覆盖成功提取的字段、OCR 原文与可定位的表格，不包含图形残差检测。未识别、未配对或无法定位不等于无变更。`));
     content.append(el("p", "", `覆盖信息：\n${text(result.coverage) || "未提供覆盖统计"}`));
     if (result.model_coverage != null) {
-      const model = el("section", "model-coverage");
-      model.append(el("h4", "", "模型引导覆盖、预算与来源限制"), coverageFacts(result.model_coverage),
-        el("p", "", modelLimits),
-        el("p", "", "模型条目可能与字段、表格或图形候选重叠，不相加为独立变更数；没有候选不等于没有变更。"));
-      content.append(model);
+      content.append(renderModelCoverage(result.model_coverage));
     } else if (state.modelEnabled) {
       content.append(el("p", "", "本轮未返回模型覆盖统计，不能认定模型已完成全部比较或没有遗漏。"));
     }

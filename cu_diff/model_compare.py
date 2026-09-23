@@ -103,6 +103,9 @@ def options(config):
     if not isinstance(raw, dict) or type(raw.get("enabled", False)) is not bool:
         raise ValueError("model_comparison must be an object with a boolean enabled flag")
     result = {"enabled": raw.get("enabled", False)}
+    if type(raw.get("visual_review", False)) is not bool:
+        raise ValueError("model_comparison.visual_review must be a boolean")
+    result["visual_review"] = raw.get("visual_review", False)
     deployment, version = raw.get("deployment"), raw.get("deployment_version")
     if (deployment is None) != (version is None) or (
             deployment is not None and
@@ -114,6 +117,7 @@ def options(config):
         ("max_regions", 4, 1, 8), ("max_pages_per_side", 2, 1, 4),
         ("max_catalog_entries", 800, 50, 1500), ("crop_dpi", 400, 200, 600),
         ("max_completion_tokens", 12000, 2000, 20000),
+        ("max_visual_regions", 2, 1, 4),
     ):
         value = raw.get(key, default)
         if type(value) is not int or not low <= value <= high:
@@ -228,7 +232,7 @@ def _image(path, page_number, *, clip=None, dpi=None, lock=None):
             return pix.tobytes("png"), round(scale*72, 3)
 
 
-def _body(client, opts, prompt, payload, images):
+def _body(client, opts, prompt, payload, images, *, schema=None):
     deployment = opts["deployment"] or client.config["model_deployments"][client.config["completion_model"]]
     content = [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]
     for label, image in images:
@@ -236,7 +240,7 @@ def _body(client, opts, prompt, payload, images):
                         {"type": "image_url", "image_url": {
                             "url": "data:image/png;base64," + base64.b64encode(image).decode("ascii"),
                             "detail": "high"}}])
-    schema = COARSE_SCHEMA if prompt == COARSE_PROMPT else FINE_SCHEMA
+    schema = schema or (COARSE_SCHEMA if prompt == COARSE_PROMPT else FINE_SCHEMA)
     return {"model": deployment, "messages": [
         {"role": "system", "content": prompt},
         {"role": "user", "content": content}],
@@ -386,13 +390,18 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
     responses = {"old": old_response, "new": new_response}
     cache = Path(cache)
     progress = progress or (lambda message: None)
-    catalogs, coverage, images = {}, {}, []
+    catalogs, coverage, images, full_words, mask_coverage = {}, {}, [], {}, {}
     progress("模型语义配对：准备全页图像与CU来源目录")
     for side in SIDES:
         with pdf_lock or nullcontext():
             pages = _pages(paths[side])
         catalogs[side], coverage[side] = _catalog(
             responses[side], pages, side, opts["max_catalog_entries"], opts["max_pages_per_side"])
+        if opts["visual_review"]:
+            word_count = sum(len(page.get("words", [])) for content in responses[side]["result"]["contents"]
+                             for page in content.get("pages", []))
+            full_words[side], mask_coverage[side] = _catalog(
+                responses[side], pages, side, word_count, opts["max_pages_per_side"], words=True)
         coverage[side]["pages_omitted"] = max(0, len(pages)-opts["max_pages_per_side"])
         if not catalogs[side]:
             raise CUError(f"{side}: no valid source catalogue; model comparison cannot continue")
@@ -418,6 +427,7 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
         pairs.append((pair, selected))
     coverage["unreferenced_ids"] = {side: sorted(set(catalogs[side])-seen[side]) for side in SIDES}
     items, fine_records, warnings, used = [], [], list(coarse["limitations"]), 0
+    visual_inputs = {}
     conflicts = {identifier: indices for identifier, indices in owners.items() if len(indices) > 1}
     conflict_pairs = {index for indices in conflicts.values() for index in indices}
     candidates = []
@@ -459,6 +469,7 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
             word_catalogs[side], word_coverage[side] = _catalog(
                 response, crop_pages, side, 1500, mapping["page"], words=True, mapping=mapping)
             crop_images.append((f"{side} crop of physical page {mapping['page']}", image))
+        visual_inputs[digest(canonical(pair))] = (crops, word_catalogs)
         if not all(word_catalogs.values()):
             items.append(_record(pair, selected, stage="fine", issues=["局部CU未提供两侧可定位词级证据，无法完成细粒度核验。"]))
             fine_records.append({"label": pair["label"], "status": "no_words", "cu": crop_meta,
@@ -525,6 +536,65 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
         fine_records.append({"label": pair["label"], "status": fine["assessment"], "cu": crop_meta,
                              "model": fine_meta, "word_coverage": word_coverage,
                              "unreferenced_word_ids": {s: sorted(set(word_catalogs[s])-word_seen[s]) for s in SIDES}})
+    visual_records = []
+    if opts["visual_review"]:
+        from . import model_visual
+
+        visual_candidates = [(pair, selected) for index, (pair, selected) in enumerate(pairs)
+                             if index not in conflict_pairs and any(
+                                 o["kind"] == "visual_change" for o in pair.get("observations", []))]
+        for number, (pair, selected) in enumerate(sorted(visual_candidates, key=lambda value: value[0]["priority"])):
+            reason = None
+            if number >= opts["max_visual_regions"]:
+                reason = "本轮非文字高清复核预算已用尽；图形疑点尚未定位。"
+            elif not all(selected.values()):
+                reason = "图形疑点缺少两侧来源搜索范围；未推测变化位置。"
+            else:
+                progress(f"非文字高清复核 {number+1}/{opts['max_visual_regions']}：子特征定位与本地残差核验")
+                cached = visual_inputs.get(digest(canonical(pair)))
+                if cached:
+                    crops, visual_words = cached
+                else:
+                    try:
+                        crops = {s: _crop(paths[s], selected[s], cache / "model-crops", opts["crop_dpi"], pdf_lock)
+                                 for s in SIDES}
+                        visual_words = {s: {} for s in SIDES}
+                    except ValueError as error:
+                        reason = str(error)
+            if reason:
+                record = _record(pair, selected, stage="coarse", issues=[reason], suppress_highlights=True)
+                record["change"] = "model_visual_review"
+                record["model_comparison"].update(stage="visual", highlight_scope="nontext_residual_only")
+                record["visual_comparison"] = {"status": "unresolved", "description": reason,
+                                               "limitations": [reason], "changed_pixels": {"old": 0, "new": 0}}
+                for s in SIDES:
+                    if record[s]:
+                        record[s].update(raw_text="", visual_description="未完成图形定位；来源仅用于上下文。")
+                items.append(record)
+                visual_records.append({"label": pair["label"], "status": "unprocessed", "reason": reason})
+                continue
+            visual_payload = {
+                "version": model_visual.VERSION, "proposed_region": pair,
+                "coordinate_system": "0..1000 in each complete supplied crop image; boxes are proposals only",
+                "crops": {s: crops[s][2] for s in SIDES},
+            }
+            visual, meta = complete_json(
+                client, cache, _body(client, opts, model_visual.PROMPT, visual_payload,
+                                     [(s+" original high-resolution crop", crops[s][1]) for s in SIDES],
+                                     schema=model_visual.SCHEMA), allow_submit=allow_submit)
+            _json_shape(visual, model_visual.SCHEMA)
+            words = {s: [*full_words[s].values(), *visual_words[s].values()] for s in SIDES}
+            localized = model_visual.localize(visual, crops, words, pair)
+            for record in localized:
+                record["model_context"] = {s: _combine(selected[s]) for s in SIDES}
+            items.extend(localized)
+            visual_records.append({"label": pair["label"], "status": "reviewed", "model": meta,
+                                   "features": len(localized),
+                                   "localized": sum(r["change"] == "model_visual_modified" for r in localized),
+                                   "limitations": visual["limitations"],
+                                   "no_visual_change_observed": not visual["views"]})
+            if not visual["views"]:
+                warnings.append(f"{pair['label']}：高清模型未提供可定位非文字变化，不代表已证明图形完全相同。")
     for index, item in enumerate(items, 1):
         item["id"] = f"M{index:03d}"
     limits = ("模型提出语义对应关系，局部CU原文提供证据；不是已验证的全部工程变更。",
@@ -537,6 +607,8 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                    "conflicting_source_ids": conflicts,
                    "unchanged_model_assessments": sum(p["assessment"] == "unchanged" for p, _ in pairs)},
         "fine": fine_records, "max_regions": opts["max_regions"], "reread_regions": used,
+        "visual": {"enabled": opts["visual_review"], "max_regions": opts["max_visual_regions"],
+                   "regions": visual_records, "text_mask_catalog": mask_coverage},
         "unprocessed": sum(item["model_comparison"]["stage"] == "coarse" for item in items),
         "document_sha256": {side: digest(path.read_bytes()) for side, path in paths.items()},
         "warnings": warnings + list(limits)}}

@@ -1,6 +1,7 @@
 """Chinese evidence tables without external services or active HTML."""
 
 import json
+from html import escape
 from pathlib import Path
 
 
@@ -65,21 +66,81 @@ def write_table_report(result: dict, path: Path) -> None:
 
 
 def write_model_report(result: dict, path: Path) -> None:
-    lines = ["# 模型配对与CU局部复读证据", "",
-             "模型仅提出语义对应关系，原文和位置取自CU来源。差异仍是候选，"
+    def report_cell(value: object) -> str:
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+        return cell(escape(value))
+
+    def visual_item(item: dict) -> bool:
+        return item.get("model_comparison", {}).get("stage") == "visual" or item.get("change") in (
+            "model_visual_modified", "model_visual_review")
+
+    visual_items = [item for item in result["items"] if visual_item(item)]
+    text_count = sum(item.get("change") == "model_text_modified" for item in result["items"])
+    lines = ["# 模型配对、CU局部复读与非文字栅格证据", "",
+             "模型仅提出语义对应关系。文字通道原文和词位置取自CU来源；"
+             "非文字通道使用本地PDF栅格残差，模型生成描述明确标记非OCR，不是提取原文。差异仍是候选，"
              "未引用、未复读或模型认为未变的区域不等于已证明无变化。", "",
-             "| 编号 | 项目 | 阶段 / 状态 | 旧侧CU原文 | 新侧CU原文 | 差异词来源坐标 |",
+             f"文字差异候选：{text_count}；非文字观察：{len(visual_items)}"
+             "（含定位未解决项，独立计数，不相加为已确认工程变更）。", "",
+             "| 编号 | 项目 | 阶段 / 状态 | 旧侧证据（CU原文或非OCR描述） | 新侧证据（CU原文或非OCR描述） | 定位依据与来源坐标 |",
              "|---|---|---|---|---|---|"]
     for item in result["items"]:
         meta = item["model_comparison"]
+        visual = visual_item(item)
+        descriptions = []
+        for side in ("old", "new"):
+            source = item.get(side)
+            descriptions.append(
+                "模型生成描述（非OCR）：" + ((source or {}).get("visual_description")
+                or item.get("visual_comparison", {}).get(f"{side}_description") or "未提供")
+                if visual else (source.get("raw_text", source.get("text", ""))
+                                if source is not None else "未配对（不等同于不存在）"))
         lines.append("| " + " | ".join([
-            cell(item["id"]), cell(item["key"]), cell(f"{meta['stage']} / {meta['status']}"),
-            evidence(item["old"]), evidence(item["new"]),
-            cell({side: (item[side] or {}).get("locations") for side in ("old", "new")}),
+            report_cell(item["id"]), report_cell(item["key"]), report_cell(f"{meta['stage']} / {meta['status']}"),
+            *(report_cell(description) for description in descriptions),
+            ("本地PDF栅格非文字残差（非CU词坐标）；" if visual else "CU变化词来源；") +
+            report_cell({side: (item.get(side) or {}).get("locations") for side in ("old", "new")}),
         ]) + " |")
+    if visual_items:
+        lines.extend(["", "## 图纸填充／轮廓变化候选 · 非OCR", "",
+                      "非文字描述是模型生成观察，不确认实体部件增删。仅 locations 中实际测量的局部残差可作变化框；"
+                      "context_locations 和 model_context 仅导航搜索区域，不作为变化证据。"
+                      "visual_grounded / localized 表示局部栅格支持，不是已确认工程结论；"
+                      "review_only / unresolved 表示定位未解决，不作确认变更红框。"])
+        for item in visual_items:
+            visual = item.get("visual_comparison", {})
+            lines.extend(["", f"### {report_cell(item['id'])} · {report_cell(item['key'])}", "",
+                          "模型观察（非OCR）：" + report_cell(visual.get("description", "未提供")), "",
+                          "定位限制：" + report_cell(visual.get("limitations", "未提供")), "",
+                          "本地定位、对齐、来源哈希与模型提议（非CU词坐标）：", "",
+                          report_cell({"model_comparison": item.get("model_comparison"),
+                                       "visual_comparison": visual,
+                                       "sources": {side: item.get(side) for side in ("old", "new")},
+                                       "model_context_navigation_only": item.get("model_context")})])
+    visual_coverage = result["coverage"].get("visual")
+    if visual_coverage is not None:
+        enabled = visual_coverage.get("enabled")
+        lines.extend(["", "## 非文字视觉覆盖 · 独立预算与延后项", "",
+                      f"视觉复核启用：{'是' if enabled is True else '否' if enabled is False else '未提供'}；"
+                      "视觉区域预算上限：" + report_cell(visual_coverage.get("max_regions", "未提供")), "",
+                      "视觉区域预算与CU文字局部复读裁切数独立；未处理、零特征或未观察到视觉变化不证明无变化。"
+                      "用量按来源列示，保留各区域直接视觉模型调用返回的 token，不计算跨通道总用量或费用；缺失用量不按零计。", "",
+                      "| 区域 | 视觉复核状态 | 模型观察特征 | 已局部定位特征 | 未观察到视觉变化（不保证无遗漏） | 限制 / 延后原因 | 直接视觉模型调用及用量 |",
+                      "|---|---|---|---|---|---|---|"])
+        statuses = {"reviewed": "已执行视觉复核（非全部变化已确认）",
+                    "unprocessed": "未处理 / 延后（不代表无变化）"}
+        for region in visual_coverage.get("regions", []):
+            lines.append("| " + " | ".join(report_cell(value) for value in (
+                region.get("label", "未提供"), statuses.get(region.get("status"), region.get("status", "未提供")),
+                region.get("features", "未提供"), region.get("localized", "未提供"),
+                region.get("no_visual_change_observed", "未提供"),
+                {"limitations": region.get("limitations"), "reason": region.get("reason")},
+                region.get("model", "未提供（不按零计）"),
+            )) + " |")
     lines.extend(["", "## 覆盖、用量与未解决项", "", "```json",
                   json.dumps(result["coverage"], ensure_ascii=False, indent=2), "```", ""])
-    lines.extend("- " + cell(warning) for warning in result["warnings"])
+    lines.extend("- " + report_cell(warning) for warning in result["warnings"])
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

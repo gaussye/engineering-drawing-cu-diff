@@ -145,6 +145,8 @@ summary { cursor: pointer; }
 .model-detail { padding: 12px; border: 1px solid var(--cp-warning); border-radius: 10px; font-size: 11px; overflow-wrap: anywhere; }
 .model-detail h3 { font-size: 12px; margin-bottom: 6px; }
 .model-detail p + p, .model-context { margin-top: 6px; }
+.visual-provenance { margin-top: 8px; }
+.visual-provenance pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .model-coverage { margin: 12px 0; border-block: 1px solid var(--cp-chrome-border); white-space: normal; }
 .model-coverage h4 { color: var(--cp-chrome-text); }
 .graphics-disclaimer { font-size: 11px; color: var(--cp-text-muted); overflow-wrap: anywhere; }

@@ -32,6 +32,32 @@ def model_item(identifier="M001", review=False):
     }
 
 
+def visual_item(identifier="V001", feature="左侧填充", x=.2, review=False):
+    row = model_item(identifier, review)
+    row.update(key=f"合成视图 / {feature}",
+               change="model_visual_review" if review else "model_visual_modified")
+    row["model_comparison"].update(
+        stage="visual", status="review_only" if review else "visual_grounded",
+        highlight_scope="nontext_residual_only")
+    row["visual_comparison"] = {
+        "status": "unresolved" if review else "localized", "kind": "fill",
+        "description": "合成填充笔画不同，不推断部件删除", "limitations": ["栅格抗锯齿需复核"],
+        "old_description": "旧图可见合成斜线", "new_description": "新图未见相同斜线",
+        "alignment": {"accepted": not review, "method": "synthetic_translation"},
+        "changed_pixels": {"old": 24, "new": 0},
+        "source_sha256": {"old": "a" * 64, "new": "b" * 64},
+    }
+    for side in ("old", "new"):
+        row[side] = graphics.source(
+            [graphics.location(2, x, .5, .025, .035)] if side == "old" and not review else [],
+            [graphics.location(2, x - .02, .48, .08, .1)], raw_text="")
+        row[side].update(visual_description=row["visual_comparison"][f"{side}_description"],
+                         confidence=None, source=[{"kind": "pdf_raster", "page": 2, "dpi": 144}])
+    row["model_context"] = {side: model_source("UNCHANGED DIMENSION", page=1, x=.1)
+                            for side in ("old", "new")}
+    return row
+
+
 class ModelBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -109,6 +135,180 @@ class ModelBrowserTests(unittest.TestCase):
         self.page.wait_for_load_state("networkidle")
         expect(self.page.locator("#model-tag")).to_contain_text("CU：synthetic-local")
         expect(self.page.locator("#model-tag")).to_contain_text("模型对比：synthetic-next")
+
+    def test_visual_coverage_distinguishes_budget_deferred_features_and_direct_usage(self):
+        attack = '<img src=x onerror="window.modelXss=1">'
+        self.result["model_coverage"]["visual"] = {
+            "enabled": True, "max_regions": 1, "regions": [
+                {"label": "合成区域甲", "status": "reviewed", "features": 2, "localized": 1,
+                 "model": {"usage": {"input_tokens": 17, "output_tokens": 13, "total_tokens": 30}},
+                 "limitations": ["另一特征仍需人工定位"], "no_visual_change_observed": False},
+                {"label": "合成区域乙", "status": "unprocessed", "features": 0, "localized": 0,
+                 "limitations": [attack], "no_visual_change_observed": False,
+                 "reason": "视觉区域预算已耗尽，特征延后"},
+                {"label": "合成区域丙", "status": "reviewed", "features": 0, "localized": 0,
+                 "limitations": [], "no_visual_change_observed": True},
+            ],
+        }
+        self.compare()
+        self.page.locator(".coverage-panel > summary").click()
+        visual = self.page.locator(".model-visual-coverage")
+        for phrase in ("视觉区域预算上限：1", "与CU文字局部复读裁切数独立",
+                       "合成区域甲", "合成区域乙", "合成区域丙", "已执行视觉复核",
+                       "模型观察特征", "已局部定位特征", "另一特征仍需人工定位",
+                       "未处理 / 延后（不代表无变化）", "视觉区域预算已耗尽，特征延后",
+                       "未观察到视觉变化（不保证无遗漏）", "直接视觉模型调用", "输入 token",
+                       "17", "输出 token", "13", "该来源返回的 token 合计", "30",
+                       "不计算跨通道总用量", "缺失用量不按零计", attack):
+            expect(visual).to_contain_text(phrase)
+        expect(self.page.locator(".model-coverage")).to_contain_text("局部复读覆盖")
+        expect(visual.locator("img, script")).to_have_count(0)
+        self.assertIsNone(self.page.evaluate("window.modelXss"))
+        self.result["model_coverage"]["visual"] = {"enabled": False, "max_regions": 0, "regions": []}
+        self.compare()
+        expect(visual).to_contain_text("视觉复核启用：否")
+        expect(visual).to_contain_text("视觉区域预算上限：0")
+        expect(visual).not_to_contain_text("该来源返回的 token 合计")
+
+    def test_minimal_deferred_visual_item_navigates_model_context_without_frames(self):
+        row = visual_item(review=True)
+        row["visual_comparison"] = {
+            "status": "unresolved", "description": "合成非文字特征延后复核",
+            "limitations": ["视觉预算限制"], "changed_pixels": {"old": 0, "new": 0},
+        }
+        for side in ("old", "new"):
+            row[side].pop("context_locations")
+            row[side].pop("visual_description")
+            row["model_context"][side] = model_source("UNCHANGED DIMENSION", page=2)
+        self.result["items"] = [row]
+        for missing_sources in (False, True):
+            if missing_sources:
+                row["old"] = row["new"] = None
+            self.compare()
+            self.select("V001")
+            expect(self.page.locator(".model-visual-detail")).to_contain_text("类型：未提供")
+            expect(self.page.locator(".model-visual-detail")).to_contain_text("合成非文字特征延后复核")
+            expect(self.page.locator(".model-visual-detail")).to_contain_text("视觉预算限制")
+            expect(self.page.locator("rect.evidence-box")).to_have_count(0)
+            for side in ("old", "new"):
+                expect(self.page.locator(f"#{side}-page")).to_have_value("2")
+                expect(self.page.locator(f"#{side}-evidence-note")).to_contain_text("不绘制变化框")
+                expect(self.page.locator(f'.source-detail[data-side="{side}"]')).to_contain_text(
+                    "未提供模型描述（不代表原图没有该特征）")
+            self.assert_source_columns()
+
+    def test_visual_subfeatures_have_independent_cards_precise_boxes_and_blank_side_navigation(self):
+        left, right = visual_item(), visual_item("V002", "右侧轮廓", .7)
+        self.result["items"] = [model_item(), left, right]
+        self.compare()
+        self.assertEqual(self.visible_ids(), ["M001", "V001", "V002"])
+        expect(self.page.locator("#model-count")).to_contain_text("1 条局部原文不同候选 / 0 条待复核")
+        expect(self.page.locator("#model-count")).to_contain_text("非文字：2 条填充／轮廓变化候选 / 0 条定位未解决")
+        for item in (left, right):
+            self.select(item["id"])
+            expect(self.page.locator(f'.result-button[data-id="{item["id"]}"]')).to_contain_text(item["key"])
+            expect(self.page.locator("#detail-meta")).to_contain_text("图纸填充／轮廓变化候选")
+            for width in (1600, 720):
+                self.page.set_viewport_size({"width": width, "height": 1050})
+                self.assert_source_columns()
+                for side in ("old", "new"):
+                    section = self.page.locator(f'.source-detail[data-side="{side}"]')
+                    expect(section).to_contain_text("模型生成描述（非OCR）")
+                    expect(section.locator(".source-text")).to_have_text(item[side]["visual_description"])
+                    expect(section).not_to_contain_text("原始文本")
+                    expect(section).not_to_contain_text("置信度")
+                    expect(self.page.locator(f"#{side}-page")).to_have_value("2")
+                self.assert_geometry("old", item["id"], item["old"]["locations"][0])
+            expect(self.page.locator(f'#old-stage rect[data-id="{item["id"]}"]')).to_have_class("evidence-box selected")
+            expect(self.page.locator(f'#new-stage rect[data-id="{item["id"]}"]')).to_have_count(0)
+            expect(self.page.locator("#new-evidence-note")).to_contain_text("仅导航搜索区域上下文，不绘制变化框")
+            expect(self.page.locator("#old-evidence-note")).to_contain_text("非CU词框")
+            expect(self.page.locator('#old-stage rect[data-channel="model"][data-change="model_visual_modified"]')).to_have_count(2)
+        # Neither the broad search region nor the unchanged dimension's page-1 anchor becomes a frame.
+        for side in ("old", "new"):
+            self.page.locator(f"#{side}-page").select_option("1")
+            expect(self.page.locator(f'#{side}-stage rect[data-change="model_visual_modified"]')).to_have_count(0)
+
+    def test_visual_unresolved_and_incomplete_grounding_never_use_confirmed_red_boxes(self):
+        row = visual_item(review=True)
+        self.result["items"] = [row]
+        self.compare()
+        self.select("V001")
+        expect(self.page.locator(".model-visual-detail")).to_contain_text("定位未解决")
+        expect(self.page.locator("rect.evidence-box")).to_have_count(0)
+        expect(self.page.locator("#model-count")).to_contain_text("非文字：0 条填充／轮廓变化候选 / 1 条定位未解决")
+        for mutation in ("stage", "status", "scope", "visual_status", "source"):
+            with self.subTest(mutation=mutation):
+                row = visual_item()
+                if mutation == "stage":
+                    row["model_comparison"]["stage"] = "fine"
+                elif mutation == "status":
+                    row["model_comparison"]["status"] = "review_only"
+                elif mutation == "scope":
+                    row["model_comparison"]["highlight_scope"] = "context"
+                elif mutation == "visual_status":
+                    row["visual_comparison"]["status"] = "unresolved"
+                else:
+                    row["old"]["source"] = [{"kind": "cu-fine-crop"}]
+                self.result["items"] = [row]
+                self.compare()
+                self.select("V001")
+                expect(self.page.locator('#old-stage rect[data-id="V001"]')).to_have_class(
+                    "evidence-box review-evidence selected")
+
+    def test_visual_both_side_residuals_are_precise_and_missing_old_is_navigation_only(self):
+        row = visual_item()
+        row["new"]["locations"] = [graphics.location(2, .6, .52, .03, .045)]
+        row["visual_comparison"]["changed_pixels"]["new"] = 32
+        self.result["items"] = [row]
+        self.compare()
+        self.select("V001")
+        for side in ("old", "new"):
+            self.assert_geometry(side, "V001", row[side]["locations"][0])
+            expect(self.page.locator(f'#{side}-stage rect[data-id="V001"]')).to_have_class(
+                "evidence-box selected")
+        row["old"]["locations"] = []
+        row["visual_comparison"]["changed_pixels"]["old"] = 0
+        self.compare()
+        self.select("V001")
+        expect(self.page.locator("#old-page")).to_have_value("2")
+        expect(self.page.locator('#old-stage rect[data-id="V001"]')).to_have_count(0)
+        expect(self.page.locator("#old-evidence-note")).to_contain_text("不绘制变化框")
+        self.assert_geometry("new", "V001", row["new"]["locations"][0])
+
+    def test_visual_navigation_uses_model_context_only_when_search_context_is_missing(self):
+        row = visual_item(review=True)
+        for side in ("old", "new"):
+            row[side]["context_locations"] = []
+            row["model_context"][side]["locations"] = [graphics.location(2, .6, .6, .2, .2)]
+        self.result["items"] = [row]
+        self.compare()
+        self.select("V001")
+        for side in ("old", "new"):
+            expect(self.page.locator(f"#{side}-page")).to_have_value("2")
+        expect(self.page.locator("rect.evidence-box")).to_have_count(0)
+
+    def test_visual_model_prose_and_provenance_are_text_not_html(self):
+        attack = '<img src=x onerror="window.modelXss=1"><script>window.modelXss=1</script>'
+        row = visual_item()
+        row["visual_comparison"].update(description=attack, limitations=[attack],
+                                        alignment={"method": attack})
+        row["model_comparison"].update(pair_label=attack, rationale=attack, issues=[attack])
+        row["old"]["visual_description"] = attack
+        row["new"]["visual_description"] = attack
+        row["visual_comparison"]["source_sha256"]["old"] = "synthetic-" * 250
+        self.result["items"] = [row]
+        self.compare()
+        self.select("V001")
+        self.page.locator(".visual-provenance summary").click()
+        expect(self.page.locator(".model-visual-detail")).to_contain_text(attack)
+        expect(self.page.locator(".source-detail").first).to_contain_text(attack)
+        expect(self.page.locator("#detail-content img, #detail-content script")).to_have_count(0)
+        self.assertIsNone(self.page.evaluate("window.modelXss"))
+        self.page.set_viewport_size({"width": 720, "height": 1050})
+        self.assert_source_columns()
+        self.assertTrue(self.page.locator(".visual-provenance pre").evaluate(
+            "n => n.scrollWidth <= n.clientWidth + 1"))
 
     def test_fine_evidence_geometry_and_source_columns_across_viewports(self):
         self.compare()

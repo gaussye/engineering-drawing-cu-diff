@@ -70,6 +70,7 @@ class ModelComparisonTests(unittest.TestCase):
             "label": "Synthetic rating", "old_ids": ["old:w1", "old:w2"],
             "new_ids": ["new:w1", "new:w2"], "rationale": "Same role, different rating.",
         }]}
+        self.visual = {"views": [], "limitations": ["No synthetic graphical change confirmed."]}
         self.patch = patch("cu_diff.model_compare.complete_json", side_effect=self.completion)
         self.chat = self.patch.start()
 
@@ -78,6 +79,8 @@ class ModelComparisonTests(unittest.TestCase):
         self.temp.cleanup()
 
     def completion(self, client, cache, body, **kwargs):
+        if "NON-TEXT" in body["messages"][0]["content"]:
+            return copy.deepcopy(self.visual), {"cache_hit": True, "usage": {"total_tokens": 15}}
         fine = "WORD IDs" in body["messages"][0]["content"]
         self.assertTrue(body["messages"][1]["content"][1]["type"], "text")
         return copy.deepcopy(self.fine if fine else self.coarse), {"cache_hit": True, "usage": {"total_tokens": 20}}
@@ -311,6 +314,43 @@ class ModelComparisonTests(unittest.TestCase):
         for call in self.chat.call_args_list:
             self.assertEqual(call.args[2]["model"], "synthetic-next")
         self.assertEqual(self.client.config["completion_model"], "test-model")
+
+    def test_optional_visual_stage_reuses_crops_without_additional_cu_calls(self):
+        self.client.config["model_comparison"].update(
+            visual_review=True, deployment="synthetic-next", deployment_version="next-v1")
+        self.coarse["pairs"][0]["observations"] = [{
+            "kind": "visual_change", "description": "A potential nontext fill change",
+            "old_ids": [], "new_ids": [], "check": "Inspect separate subfeatures",
+        }]
+        result = self.run_comparison()
+        self.assertEqual(len(self.client.calls), 2)
+        self.assertEqual(self.chat.call_count, 3)
+        self.assertEqual(self.chat.call_args_list[-1].args[2]["model"], "synthetic-next")
+        visual = result["coverage"]["visual"]["regions"][0]
+        self.assertTrue(visual["no_visual_change_observed"])
+        self.assertEqual(visual["features"], 0)
+        self.assertTrue(any("不代表已证明图形完全相同" in text for text in result["warnings"]))
+        self.assertTrue(all(item["channel"] == "model" for item in result["items"]))
+
+    def test_visual_budget_and_invalid_options_are_explicit(self):
+        for value in ({"visual_review": 1}, {"max_visual_regions": 0}, {"max_visual_regions": 5}):
+            with self.assertRaises(ValueError):
+                options({"model_comparison": value})
+        self.client.config["model_comparison"].update(visual_review=True, max_visual_regions=1)
+        self.coarse["pairs"].append(pair(2, label="Second synthetic view"))
+        for proposal in self.coarse["pairs"]:
+            proposal["observations"] = [{
+                "kind": "visual_change", "description": "Possible hatching difference",
+                "old_ids": [], "new_ids": [], "check": "Inspect pixels",
+            }]
+        result = self.run_comparison()
+        deferred = [r for r in result["coverage"]["visual"]["regions"] if r["status"] == "unprocessed"]
+        self.assertEqual(len(deferred), 1)
+        item, = [i for i in result["items"] if i["change"] == "model_visual_review"]
+        self.assertEqual(item["old"]["locations"], [])
+        self.assertEqual(item["new"]["locations"], [])
+        self.assertEqual(item["old"]["raw_text"], "")
+        self.assertEqual(len(self.client.calls), 2)
 
 
 
