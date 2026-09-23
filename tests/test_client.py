@@ -83,6 +83,12 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(request.call_count, 1)
                 self.assertFalse(first["cache_hit"])
                 self.assertTrue(second["cache_hit"])
+                client.config["model_comparison"] = {
+                    "enabled": True, "deployment": "synthetic-next", "deployment_version": "next-v1"}
+                _, separate = client.analyze(pdf, root / "cache", "test", {}, allow_submit=False)
+                self.assertTrue(separate["cache_hit"])
+                self.assertEqual(first["cache_key"], separate["cache_key"])
+                self.assertEqual(request.call_count, 1)
                 client.config["deployment_versions"] = {"synthetic": "test-v2"}
                 _, third = client.analyze(pdf, root / "cache", "test", {})
                 self.assertEqual(request.call_count, 2)

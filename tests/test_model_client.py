@@ -92,6 +92,31 @@ class ModelClientTests(unittest.TestCase):
         self.assertNotIn("synthetic prompt", json.dumps(first))
         self.assertFalse(list((self.cache / "model-comparison").glob("*.pending.json")))
 
+    def test_separate_comparison_deployment_is_pinned_without_mutating_cu_mapping(self):
+        before = copy.deepcopy(self.client.config)
+        self.client.config["model_comparison"] = {
+            "deployment": "synthetic-comparison", "deployment_version": "comparison-v1:TestSku",
+        }
+        self.body["model"] = "synthetic-comparison"
+        _, first = self.complete()
+        self.assertEqual(first["deployment_version"], "comparison-v1:TestSku")
+        self.assertEqual(self.client.config["model_deployments"], before["model_deployments"])
+        self.assertEqual(self.client.config["deployment_versions"], before["deployment_versions"])
+        self.client.config["model_comparison"]["deployment_version"] = "comparison-v2:TestSku"
+        _, second = self.complete()
+        self.assertNotEqual(first["cache_key"], second["cache_key"])
+        self.body["model"] = "synthetic"
+        with self.assertRaisesRegex(CUError, "comparison deployment"):
+            self.complete()
+        self.assertEqual(len(self.client.calls), 2)
+
+    def test_separate_comparison_requires_version(self):
+        self.client.config["model_comparison"] = {"deployment": "synthetic-comparison"}
+        self.body["model"] = "synthetic-comparison"
+        with self.assertRaises(CUError):
+            self.complete()
+        self.assertEqual(self.client.calls, [])
+
     def test_fingerprint_invalidates_all_request_dimensions(self):
         _, initial = self.complete()
         mutations = [

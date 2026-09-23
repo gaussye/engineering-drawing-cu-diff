@@ -68,6 +68,7 @@ class ModelBrowserTests(unittest.TestCase):
             payload = {
                 "csrf_token": "synthetic-csrf", "revision": self.revision,
                 "azure_enabled": False, "model": "synthetic-local",
+                "model_comparison_deployment": getattr(self, "comparison_deployment", None),
                 "documents": self.documents, "storage_notice": "合成测试会话",
                 "graphics_enabled": self.graphics_enabled,
                 "limits": {"max_bytes": 20971520, "max_pages": 20, "session_ttl_hours": 24},
@@ -101,6 +102,13 @@ class ModelBrowserTests(unittest.TestCase):
                        "预算上限，缺少可靠来源", "用量（不是金额）", "123", "不保证没有遗漏"):
             expect(self.page.locator(".model-coverage")).to_contain_text(phrase)
         self.assertEqual(self.compare_requests, 1)
+
+    def test_model_tag_distinguishes_cu_and_comparison_deployments(self):
+        self.comparison_deployment = "synthetic-next"
+        self.page.reload()
+        self.page.wait_for_load_state("networkidle")
+        expect(self.page.locator("#model-tag")).to_contain_text("CU：synthetic-local")
+        expect(self.page.locator("#model-tag")).to_contain_text("模型对比：synthetic-next")
 
     def test_fine_evidence_geometry_and_source_columns_across_viewports(self):
         self.compare()

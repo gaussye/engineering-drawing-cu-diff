@@ -138,7 +138,9 @@
       updateGraphicsAvailability();
       state.ready = true;
       $("connection-status").textContent = "会话已连接";
-      $("model-tag").textContent = `${data.model || "模型"} / ${state.azure ? "缓存优先 · 可提交 CU" : "只读缓存模式"}`;
+      const modelLabel = state.modelEnabled && data.model_comparison_deployment
+        ? `CU：${data.model || "未提供"} · 模型对比：${data.model_comparison_deployment}` : (data.model || "模型");
+      $("model-tag").textContent = `${modelLabel} / ${state.azure ? "缓存优先 · 可提交 CU" : "只读缓存模式"}`;
       $("storage-notice").textContent = data.storage_notice || `会话存储期限：${data.limits.session_ttl_hours} 小时。`;
       document.querySelectorAll(".upload-limit").forEach((node) => {
         node.textContent = `PDF · 单文件最大 ${Math.round(data.limits.max_bytes / 1048576)} MB · 最多 ${data.limits.max_pages} 页`;

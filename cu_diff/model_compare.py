@@ -103,6 +103,13 @@ def options(config):
     if not isinstance(raw, dict) or type(raw.get("enabled", False)) is not bool:
         raise ValueError("model_comparison must be an object with a boolean enabled flag")
     result = {"enabled": raw.get("enabled", False)}
+    deployment, version = raw.get("deployment"), raw.get("deployment_version")
+    if (deployment is None) != (version is None) or (
+            deployment is not None and
+            (not isinstance(deployment, str) or not deployment.strip()
+             or not isinstance(version, str) or not version.strip())):
+        raise ValueError("model_comparison requires both deployment and deployment_version, or neither")
+    result.update(deployment=deployment, deployment_version=version)
     for key, default, low, high in (
         ("max_regions", 4, 1, 8), ("max_pages_per_side", 2, 1, 4),
         ("max_catalog_entries", 800, 50, 1500), ("crop_dpi", 400, 200, 600),
@@ -222,7 +229,7 @@ def _image(path, page_number, *, clip=None, dpi=None, lock=None):
 
 
 def _body(client, opts, prompt, payload, images):
-    deployment = client.config["model_deployments"][client.config["completion_model"]]
+    deployment = opts["deployment"] or client.config["model_deployments"][client.config["completion_model"]]
     content = [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]
     for label, image in images:
         content.extend([{"type": "text", "text": label},
@@ -463,7 +470,9 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
         fine, fine_meta = complete_json(
             client, cache, _body(client, opts, FINE_PROMPT, fine_payload, crop_images), allow_submit=allow_submit)
         _json_shape(fine, FINE_SCHEMA)
-        if len(fine["changes"]) > 30 or bool(fine["changes"]) != (fine["assessment"] == "changes"):
+        if (len(fine["changes"]) > 30
+                or (fine["assessment"] == "unchanged" and fine["changes"])
+                or (fine["assessment"] == "changes" and not fine["changes"])):
             raise CUError("Fine model assessment/changes are inconsistent or excessive")
         word_seen = {side: set() for side in SIDES}
         for change in fine["changes"]:
@@ -481,12 +490,16 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
             if all(combined.values()) and normalize_text(combined["old"]["raw_text"]) == normalize_text(combined["new"]["raw_text"]):
                 warnings.append("模型提出的一个变化引用了相同CU文字；未作为文字差异展示。")
                 continue
-            grounded = all(v and v["confidence"] is not None and v["confidence"] >= .8 for v in combined.values())
+            source_grounded = all(v and v["confidence"] is not None and v["confidence"] >= .8 for v in combined.values())
+            grounded = source_grounded and fine["assessment"] == "changes"
             issues = list(fine["limitations"])
-            if not grounded:
+            if not source_grounded:
                 issues.append("局部词级证据缺失或提取置信度不足，仅供复核。")
+            if fine["assessment"] == "uncertain":
+                issues.append("模型整体判断仍不确定；这些引用仅是待核疑点，不确认文字变更或增删。")
             record = _record(change, evidence, stage="fine", issues=issues, changed=grounded)
             record["model_comparison"]["observations"] = pair.get("observations", [])
+            record["model_comparison"]["fine_assessment"] = fine["assessment"]
             if all(combined.values()):
                 changed = _changed_words(evidence)
                 for side in SIDES:

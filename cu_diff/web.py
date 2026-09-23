@@ -438,6 +438,9 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
                         "session_ttl_hours": SESSION_TTL},
                 azure_enabled=allow_azure, model=config.get("completion_model"), graphics_enabled=True,
                 model_comparison_enabled=store.model_options["enabled"],
+                model_comparison_deployment=(
+                    store.model_options["deployment"] or
+                    config.get("model_deployments", {}).get(config.get("completion_model"))),
                 documents={role: session.documents[role].public() if role in session.documents else None
                            for role in ("old", "new")},
                 storage_notice="文件仅存本地；会话闲置24小时后于后续请求/启动时清理。CU缓存单独保留，清理说明见README。",

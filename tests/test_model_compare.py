@@ -123,6 +123,28 @@ class ModelComparisonTests(unittest.TestCase):
         self.assertEqual(record["change"], "model_review")
         self.assertEqual(record["model_comparison"]["status"], "review_only")
 
+    def test_uncertain_assessment_with_referenced_hypotheses_stays_review_only(self):
+        self.fine["assessment"] = "uncertain"
+        for absent in (False, True):
+            with self.subTest(missing_counterpart=absent):
+                if absent:
+                    self.fine["changes"][0]["new_ids"] = []
+                item, = self.run_comparison()["items"]
+                self.assertEqual(item["change"], "model_review")
+                self.assertEqual(item["model_comparison"]["status"], "review_only")
+                self.assertEqual(item["model_comparison"]["fine_assessment"], "uncertain")
+                self.assertTrue(any("整体判断仍不确定" in reason for reason in item["review_reasons"]))
+                if absent:
+                    self.assertIsNone(item["new"])
+
+    def test_truly_contradictory_fine_assessments_still_fail(self):
+        self.fine["assessment"] = "unchanged"
+        with self.assertRaisesRegex(CUError, "inconsistent"):
+            self.run_comparison()
+        self.fine.update(assessment="changes", changes=[])
+        with self.assertRaisesRegex(CUError, "inconsistent"):
+            self.run_comparison()
+
     def test_budget_keeps_unprocessed_candidates_visible(self):
         self.coarse["pairs"].append(pair(2))
         result = self.run_comparison()
@@ -277,6 +299,19 @@ class ModelComparisonTests(unittest.TestCase):
                 options({"model_comparison": {"max_regions": value}})
         with self.assertRaises(ValueError):
             options({"model_comparison": {"enabled": "true"}})
+        for value in ({"deployment": "synthetic-next"}, {"deployment_version": "v2"},
+                      {"deployment": "", "deployment_version": "v2"}):
+            with self.assertRaises(ValueError):
+                options({"model_comparison": value})
+
+    def test_comparison_model_is_selected_independently_from_cu(self):
+        self.client.config["model_comparison"].update(
+            deployment="synthetic-next", deployment_version="next-v1:TestSku")
+        self.run_comparison()
+        for call in self.chat.call_args_list:
+            self.assertEqual(call.args[2]["model"], "synthetic-next")
+        self.assertEqual(self.client.config["completion_model"], "test-model")
+
 
 
 if __name__ == "__main__":

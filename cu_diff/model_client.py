@@ -120,10 +120,23 @@ def complete_json(client: Client, cache: Path, body: dict, *,
     model = body.get("model")
     deployments = client.config.get("model_deployments")
     versions = client.config.get("deployment_versions")
-    if (not isinstance(model, str) or not model
+    comparison = client.config.get("model_comparison", {})
+    if not isinstance(comparison, dict):
+        raise CUError("Invalid comparison model configuration")
+    selected = comparison.get("deployment")
+    if selected is not None:
+        version = comparison.get("deployment_version")
+        if (not isinstance(selected, str) or not selected.strip() or model != selected
+                or not isinstance(version, str) or not version.strip()):
+            raise CUError("Requested model must match the explicitly versioned comparison deployment")
+    elif (not isinstance(model, str) or not model
             or not isinstance(deployments, dict) or model not in deployments.values()
             or not isinstance(versions, dict) or not versions.get(model)):
         raise CUError("Requested model is not an explicitly configured versioned deployment")
+    else:
+        if comparison.get("deployment_version") is not None:
+            raise CUError("Comparison deployment version requires an explicit deployment")
+        version = versions[model]
     response_format = body.get("response_format")
     if not isinstance(response_format, dict):
         raise CUError("Model completion requires strict json_schema response_format")
@@ -139,7 +152,7 @@ def complete_json(client: Client, cache: Path, body: dict, *,
             "protocol_version": PROTOCOL_VERSION,
             "endpoint": client.endpoint,
             "model": model, "deployment": model,
-            "deployment_version": versions[model],
+            "deployment_version": version,
             "request_sha256": digest(canonical(request_body)),
         }
         provenance = _load_json(json.dumps(provenance, allow_nan=False))
