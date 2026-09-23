@@ -137,6 +137,34 @@ class WebTests(unittest.TestCase):
     def test_bootstrap_reports_actual_graphical_pipeline(self):
         self.assertIs(self.boot["graphics_enabled"], True)
 
+    def test_table_pipeline_preserves_items_diagnostics_and_coverage(self):
+        self.upload("old", pdf_bytes("SYNTHETIC A"))
+        revision = self.upload("new", pdf_bytes("SYNTHETIC B")).get_json()["revision"]
+        item = {"id": "T001", "channel": "tables", "change": "table_column_added",
+                "old": None, "new": {"raw_text": "SYNTHETIC", "locations": []}}
+        table_result = {"items": [item], "coverage": {"status": "completed", "matched_tables": 1},
+                        "warnings": ["Synthetic table requires source review."]}
+        with patch("cu_diff.document_tables.compare_document_tables", return_value=table_result) as compare:
+            job_id = self.compare(revision).get_json()["job_id"]
+            result = self.wait_job(job_id)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertIn(item, result["result"]["items"])
+        self.assertEqual(result["result"]["table_coverage"], table_result["coverage"])
+        self.assertIn(table_result["warnings"][0], result["result"]["warnings"])
+        self.assertTrue(result["result"]["graphics_coverage"])
+        compare.assert_called_once()
+        self.assertEqual(len(compare.call_args.args), 4)
+
+    def test_table_stage_failure_cannot_silently_return_no_table_differences(self):
+        self.upload("old", pdf_bytes("SYNTHETIC A"))
+        revision = self.upload("new", pdf_bytes("SYNTHETIC B")).get_json()["revision"]
+        with patch("cu_diff.document_tables.compare_document_tables", side_effect=ValueError("Synthetic table failure")):
+            job_id = self.compare(revision).get_json()["job_id"]
+            result = self.wait_job(job_id)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Synthetic table failure", result["error"])
+        self.assertNotIn("result", result)
+
     def test_graphics_stage_failure_is_explicit_not_a_success_result(self):
         from cu_diff.graphics import GraphicsError
         self.upload("old", pdf_bytes("SYNTHETIC A"))

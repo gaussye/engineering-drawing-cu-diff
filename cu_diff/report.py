@@ -13,6 +13,11 @@ CHANGE_LABELS = {
     "unpaired_new": "仅新侧未配对（不确认新增）",
     "table_row_added": "对应CU表格的新增行候选（需原图确认）",
     "table_row_removed": "对应CU表格的删除行候选（需原图确认）",
+    "table_cell_modified": "表格单元格文字不同",
+    "table_column_added": "表格新增列候选",
+    "table_column_removed": "表格删除列候选",
+    "table_grid_changed": "表格网格结构不同（不等于记录增删）",
+    "annotation_occurrence_changed": "图外标注提取次数不同（不确认增删）",
     "unchanged": "提取原文相同",
     "split_merge": "OCR拆分/合并候选",
 }
@@ -30,6 +35,33 @@ def evidence(item: dict | None) -> str:
     if item is None:
         return "未配对（不等同于不存在）"
     return cell(item.get("raw_text", item.get("text", "")))
+
+
+def write_table_report(result: dict, path: Path) -> None:
+    lines = [
+        "# 非BOM表格专项证据", "",
+        "使用原PDF的本地几何证据及已有CU提取，不调用Azure。"
+        "文字、列结构和网格行数分别报告；网格行数包含表头与空白行，不等于业务记录数。"
+        "未识别或未配对不代表无变化，OCR文字仍需复核。"
+        "本通道可能与结构化字段/OCR重复，不相加为独立变更数量。", "",
+        "| 编号 | 项目 | 分类 | 旧侧证据 | 新侧证据 | 旧 / 新坐标 |",
+        "|---|---|---|---|---|---|",
+    ]
+    for item in result.get("items", []):
+        old, new = item.get("old"), item.get("new")
+        lines.append("| " + " | ".join([
+            cell(item.get("id")), cell(item.get("key")),
+            cell(CHANGE_LABELS.get(item.get("change"), item.get("change"))),
+            evidence(old), evidence(new),
+            cell({"old": (old or {}).get("locations"), "new": (new or {}).get("locations")}),
+        ]) + " |")
+    lines.extend(["", "## 覆盖与限制", "", "```json",
+                  json.dumps(result.get("coverage", {}), ensure_ascii=False, indent=2), "```", ""])
+    lines.extend("- " + cell(warning) for warning in result.get("warnings", []))
+    lines.extend(["", "## 可追溯性", "", "```json",
+                  json.dumps(result.get("provenance", {}), ensure_ascii=False, indent=2), "```", "",
+                  "JSON保留每项的表格对应依据、实际来源以及独立的对侧表格导航上下文。"])
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write_report(result: dict, path: Path) -> None:

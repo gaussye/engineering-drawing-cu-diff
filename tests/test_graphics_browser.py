@@ -347,6 +347,128 @@ class GraphicsBrowserTests(unittest.TestCase):
                 self.assertEqual(self.visible_ids(), [])
                 expect(self.page.locator("#job-status")).not_to_contain_text("表格行增删候选")
 
+    def test_non_bom_cells_columns_and_grid_changes_are_default_visible(self):
+        items = []
+        for number, change in enumerate(
+                ("table_cell_modified", "table_column_added", "table_column_removed", "table_grid_changed"), 1):
+            row = {
+                "id": f"T{number:03d}", "channel": "tables", "region": "合成规格表",
+                "key": "合成表格项目", "change": change, "review_required": True,
+                "review_reasons": ["完整网格不保证OCR内容无遗漏"],
+                "match": {"method": "verified_grid_headers", "certainty": "high", "score": 1},
+                "old": source([location(2, .2, .4, .2, .03)], raw_text="SYN-OLD"),
+                "new": source([location(2, .5, .6, .2, .03)], raw_text="SYN-NEW"),
+                "table_comparison": {"status": "complete", "old_rows": 2, "new_rows": 3},
+                "table_context": {side: source([location(2, .1, .2, .7, .6)]) for side in ("old", "new")},
+            }
+            if change == "table_column_added":
+                row["old"] = None
+            if change == "table_column_removed":
+                row["new"] = None
+            items.append(row)
+        self.result["items"] = items
+        self.result["table_coverage"] = {"status": "completed", "old_tables": 1, "new_tables": 1}
+        self.compare()
+        self.assertEqual(self.visible_ids(), [row["id"] for row in items])
+        expect(self.page.locator("#job-status")).to_contain_text("4 条表格专项候选")
+        self.page.locator("#channel-filter").select_option("tables")
+        self.assertEqual(self.visible_ids(), [row["id"] for row in items])
+        for row in items:
+            self.select(row["id"])
+            for side in ("old", "new"):
+                expect(self.page.locator(f"#{side}-page")).to_have_value("2")
+                boxes = self.page.locator(f'#{side}-stage rect[data-id="{row["id"]}"]')
+                if row[side]:
+                    expect(boxes).to_have_count(1)
+                    expect(boxes).to_have_class("evidence-box selected")
+                    for zoom in ("fit", "150", "200"):
+                        self.page.locator(f"#{side}-zoom").select_option(zoom)
+                        self.assert_geometry(side, row["id"], row[side]["locations"][0])
+                else:
+                    expect(boxes).to_have_count(0)
+                    expect(self.page.locator(f"#{side}-evidence-note")).to_contain_text("不伪造缺失列红框")
+            expect(self.page.locator(".table-detail")).to_contain_text("与字段/OCR可能重叠")
+        expect(self.page.locator(".table-detail")).to_contain_text("行数包含表头和空白行")
+        expect(self.page.locator("#old-evidence-note")).to_contain_text("非文字记录增删")
+        self.page.locator(".coverage-panel > summary").click()
+        expect(self.page.locator(".table-coverage")).to_contain_text("不代表所有表格均已识别")
+        items[0]["table_comparison"]["status"] = "unavailable"
+        self.compare()
+        self.assertNotIn("T001", self.visible_ids())
+        self.page.locator("#review-filter").select_option("review")
+        self.assertIn("T001", self.visible_ids())
+
+    def test_low_extraction_confidence_rating_change_remains_visible(self):
+        row = copy.deepcopy(self.result["items"][0])
+        row.pop("cell_comparison")
+        row.update(key="plug rated current and voltage", region="plug markings",
+                   review_reasons=["old: low extraction confidence"])
+        for side, value in (("old", "3A 125V~"), ("new", "8A 125V~")):
+            row[side] = source([location(1, .08, .15, .008, .05)], raw_text=value)
+            row[side]["confidence"] = .34
+        self.result["items"] = [row]
+        self.compare()
+        self.assertEqual(self.visible_ids(), ["D001"])
+        self.select("D001")
+        for side in ("old", "new"):
+            self.assert_geometry(side, "D001", row[side]["locations"][0])
+            expect(self.page.locator(f'#{side}-stage rect[data-id="D001"]')).to_have_class(
+                "evidence-box selected")
+        expect(self.page.locator("#detail-content")).to_contain_text("3A 125V~")
+        expect(self.page.locator("#detail-content")).to_contain_text("8A 125V~")
+        expect(self.page.locator("#detail-content")).to_contain_text("low extraction confidence")
+
+    def test_panel_line_counts_do_not_claim_grid_rows_or_complete_text(self):
+        row = {
+            "id": "T001", "channel": "tables", "region": "document_table",
+            "key": "SYNTHETIC INSCRIPTION", "change": "table_cell_modified",
+            "old": source(raw_text="CABLE A"), "new": source(raw_text="CABLE A STANDARD X"),
+            "review_required": True, "review_reasons": ["Other symbols remain unreadable."],
+            "match": {"method": "anchored_span"},
+            "table_comparison": {
+                "status": "complete", "scope": "observed_panel_text",
+                "old_ocr_line_count": 2, "new_ocr_line_count": 3,
+                "old_grid": {"rows_including_header": 2}, "new_grid": {"rows_including_header": 2},
+                "panel_text_complete": False,
+                "old_ocr_lines": [{"raw_text": "UNRESOLVED SYMBOL"}, {"raw_text": "CABLE A"}],
+                "new_ocr_lines": [{"raw_text": "UNRESOLVED SYMBOL"},
+                                 {"raw_text": "CABLE A STANDARD X"}, {"raw_text": "OTHER TEXT"}],
+            },
+        }
+        self.result["items"] = [row]
+        self.compare()
+        self.assertEqual(self.visible_ids(), ["T001"])
+        self.select("T001")
+        expect(self.page.locator(".panel-line-counts")).to_contain_text("2 → 3")
+        expect(self.page.locator(".panel-line-counts")).to_contain_text("2 → 2")
+        expect(self.page.locator(".table-detail")).to_contain_text("不代表整段文字已完整比较")
+        self.page.locator(".panel-ocr-context summary").click()
+        expect(self.page.locator(".panel-ocr-context")).to_contain_text("UNRESOLVED SYMBOL")
+        expect(self.page.locator(".panel-ocr-context")).to_contain_text("OTHER TEXT")
+
+    def test_annotation_occurrence_review_visible_but_never_false_deletion_frame(self):
+        row = {
+            "id": "D039", "channel": "schema", "region": "cable", "key": "label",
+            "change": "annotation_occurrence_changed", "review_required": True,
+            "review_reasons": ["Not confirmed absence."],
+            "match": {"certainty": "uncertain", "method": "occurrence_review", "score": None},
+            "old": source([location(2)], raw_text="LABEL 8A"), "new": None,
+            "annotation_comparison": {"status": "observed", "counts_outside_bom": {"old": 1, "new": 0}},
+            "annotation_context": {side: source([location(2, .5, .1)]) for side in ("old", "new")},
+        }
+        self.result["items"] = [row]
+        self.compare()
+        self.assertEqual(self.visible_ids(), ["D039"])
+        expect(self.page.locator("#job-status")).to_contain_text("1 条图外标注次数待核")
+        self.select("D039")
+        expect(self.page.locator('#old-stage rect[data-id="D039"]')).to_have_class(
+            "evidence-box review-evidence selected")
+        expect(self.page.locator('#new-stage rect[data-id="D039"]')).to_have_count(0)
+        expect(self.page.locator("#new-page")).to_have_value("2")
+        expect(self.page.locator("#new-evidence-note")).to_contain_text("不将BOM当作图外标注")
+        expect(self.page.locator(".annotation-review")).to_contain_text("1 → 0")
+        expect(self.page.locator(".annotation-review")).to_contain_text("不确认删除标签或部件")
+
     def test_title_value_boxes_preserve_original_extraction_groups(self):
         row = copy.deepcopy(self.result["items"][0])
         row.pop("cell_comparison")
@@ -738,7 +860,7 @@ class GraphicsBrowserTests(unittest.TestCase):
                 expect(self.page.locator('#channel-filter option[value="graphics"]')).to_be_disabled()
                 for name in ("translation", "scaling"):
                     expect(self.page.locator(f"#show-{name}")).to_be_disabled()
-                expect(self.page.locator('#channel-filter option[value="primary"]')).to_have_text("结构化字段（默认）")
+                expect(self.page.locator('#channel-filter option[value="primary"]')).to_have_text("字段 + 表格（默认）")
                 expect(self.page.locator("#graphics-status")).to_contain_text("图形检测未接入/未启用")
                 expect(self.page.locator("#coverage-content")).to_contain_text("图形检测未接入/未启用")
                 expect(self.page.locator("#filter-note")).not_to_contain_text("图形候选")
@@ -751,7 +873,7 @@ class GraphicsBrowserTests(unittest.TestCase):
                     expect(self.page.locator(f'#{side}-stage rect[data-id="D001"][data-field="part_number"]')).to_have_count(1)
                 expect(self.page.locator("#job-status")).to_contain_text("图形检测未接入/未启用")
                 expect(self.page.locator("#job-status")).not_to_contain_text("位移")
-                expect(self.page.locator("#coverage-content")).to_contain_text("不包含图形检测")
+                expect(self.page.locator("#coverage-content")).to_contain_text("不包含图形残差检测")
                 expect(self.page.locator(".graphics-coverage")).to_have_count(0)
                 self.page.locator("#channel-filter").select_option("all")
                 self.page.locator("#review-filter").select_option("all")

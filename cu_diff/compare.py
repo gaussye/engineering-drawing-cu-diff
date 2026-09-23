@@ -518,6 +518,85 @@ def _line_group(entries):
     return result
 
 
+def _annotation_occurrences(records, old_lines, new_lines):
+    """Surface unmatched labels supported by an unchanged BOM, not asserted deletions."""
+    def envelope(entry):
+        contexts, polygons = entry["page_context"], entry["polygons"]
+        if not contexts or any(context != contexts[0] for context in contexts):
+            return None
+        if not polygons or any(p["page_number"] != contexts[0]["page_number"] for p in polygons):
+            return None
+        points = [point for polygon in polygons for point in polygon["points"]]
+        value = deepcopy(entry)
+        xs, ys = [p[0] for p in points], [p[1] for p in points]
+        value["polygons"] = [{"page_number": contexts[0]["page_number"],
+                              "points": [[min(xs), min(ys)], [max(xs), min(ys)],
+                                         [max(xs), max(ys)], [min(xs), max(ys)]]}]
+        value["page_context"] = [contexts[0]]
+        return value if _box(value) else None
+
+    def within(line, outer):
+        a, b = _box(line), _box(outer)
+        if a is None or b is None or line["page_context"] != outer["page_context"]:
+            return False
+        intersection = max(0, min(a[2], b[2])-max(a[0], b[0])) * max(
+            0, min(a[3], b[3])-max(a[1], b[1]))
+        return intersection >= .9*(a[2]-a[0])*(a[3]-a[1])
+
+    anchors = defaultdict(list)
+    for record in records:
+        a, b = record["old"], record["new"]
+        if not a or not b or a["category"] != "BOM" or b["category"] != "BOM":
+            continue
+        role = _bom_parts(a)[0]
+        if role and role == _bom_parts(b)[0] and _text(a) == _text(b):
+            anchors[role].append(record)
+    for record in records:
+        if record["change"] not in ("unpaired_old", "unpaired_new"):
+            continue
+        present = "old" if record["old"] else "new"
+        entry = record[present]
+        if entry["category"] != "label" or len(anchors.get(_text(entry), [])) != 1:
+            continue
+        anchor = anchors[_text(entry)][0]
+        bounds = {side: envelope(anchor[side]) for side in ("old", "new")}
+        if not all(bounds.values()):
+            continue
+        observed, outside, valid = {}, {}, True
+        for side, lines in (("old", old_lines), ("new", new_lines)):
+            matches = [line for line in lines if _text(line) == _text(entry)
+                       and line["content_index"] == anchor[side]["content_index"]
+                       and line.get("page_number") == bounds[side]["page_context"][0]["page_number"]]
+            if any(_box(line) is None for line in matches):
+                valid = False
+                break
+            inside = [line for line in matches if within(line, bounds[side])]
+            if len(inside) != 1:
+                valid = False
+                break
+            observed[side] = matches
+            outside[side] = [line for line in matches if line not in inside]
+        absent = "new" if present == "old" else "old"
+        if (not valid or len(outside[present]) != 1 or outside[absent]
+                or _overlap(entry, outside[present][0]) < .65):
+            continue
+        record["change"] = "annotation_occurrence_changed"
+        record["match"] = {"method": "unchanged_bom_and_source_located_ocr_occurrences",
+                           "certainty": "uncertain", "score": None}
+        record["review_required"] = True
+        record["review_reasons"].append(
+            "Unchanged BOM text has different observed drawing-label occurrences; OCR omission is possible, "
+            "so this is not a confirmed label or component addition/deletion.")
+        record["annotation_comparison"] = {
+            "status": "observed", "text": entry["raw_text"], "bom_text_unchanged": True,
+            "counts_including_bom": {side: len(observed[side]) for side in observed},
+            "counts_outside_bom": {side: len(outside[side]) for side in outside},
+            "sources": {side: [deepcopy(line["source"]) for line in observed[side]] for side in observed},
+            "meaning": "Counts of extracted OCR occurrences only, not certified physical absence.",
+        }
+        record["annotation_context"] = {side: deepcopy(anchor[side]) for side in ("old", "new")}
+
+
 def _contiguous(entries):
     if not entries or not all(_same_page(entries[0], entry) for entry in entries):
         return False
@@ -677,6 +756,8 @@ def compare_documents(old, new, *, confidence_threshold=0.8):
                         for left, right in title_pairs)
     table_warnings = reconcile_bom(item_records, old, new)
     refine_bom(item_records, old, new)
+    if old.get("status") == new.get("status") == "Succeeded":
+        _annotation_occurrences(item_records, old_lines, new_lines)
     ocr_records = _compare_lines(old_lines, new_lines)
     warnings = (old_warnings + new_warnings + pairing_warnings + title_warnings + table_warnings
                 + old_diagnostics + new_diagnostics)

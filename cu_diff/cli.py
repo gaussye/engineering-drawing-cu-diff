@@ -164,6 +164,33 @@ def graphics(args: argparse.Namespace) -> None:
     print(f"Local graphical comparison saved: {args.output.resolve()}")
 
 
+def tables(args: argparse.Namespace) -> None:
+    from .client import digest
+    from .document_tables import compare_document_tables
+    from .report import write_table_report
+    responses, hashes = {}, {}
+    for role in ("old", "new"):
+        path = getattr(args, role)
+        hashes[role] = digest(path.read_bytes())
+        metadata = read_json(getattr(args, f"{role}_metadata"))
+        if metadata.get("document_sha256") != hashes[role]:
+            raise ValueError(f"{role} cached CU document hash does not match the PDF")
+        response = read_json(getattr(args, f"{role}_response"))
+        if response.get("status") != "Succeeded" or not response.get("result", {}).get("contents"):
+            raise ValueError(f"{role} CU response did not succeed or has no content")
+        responses[role] = response
+    result = compare_document_tables(args.old, args.new, responses["old"], responses["new"])
+    result["provenance"] = {
+        "document_sha256": hashes, "azure_calls": 0,
+        "chronology": "User-supplied old/new direction",
+        "coordinate_basis": "Displayed PDF page with matching CU source geometry",
+    }
+    args.output.mkdir(parents=True, exist_ok=True)
+    save_json(args.output / "tables.json", result)
+    write_table_report(result, args.output / "tables.zh.md")
+    print(f"Local table comparison saved: {args.output.resolve()}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -204,6 +231,13 @@ def main() -> None:
                            help="Include verified uniform drawing scale, not physical part dimensions")
     graphical.add_argument("--output", type=Path, default=Path("output") / "graphics")
     graphical.set_defaults(action=graphics)
+    tabular = commands.add_parser("tables", help="Offline non-BOM table evidence; never calls Azure")
+    for role in ("old", "new"):
+        tabular.add_argument(f"--{role}", type=Path, required=True)
+        tabular.add_argument(f"--{role}-response", type=Path, required=True)
+        tabular.add_argument(f"--{role}-metadata", type=Path, required=True)
+    tabular.add_argument("--output", type=Path, default=Path("output") / "tables")
+    tabular.set_defaults(action=tables)
     args = parser.parse_args()
     try:
         args.action(args)

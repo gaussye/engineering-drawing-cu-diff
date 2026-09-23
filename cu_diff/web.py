@@ -275,6 +275,15 @@ class Store:
             comparison = compare_responses(responses["old"], responses["new"])
             public_docs = {role: doc.public() for role, doc in documents.items()}
             result = web_result(comparison, public_docs, metadata)
+            phase("核对非BOM表格的列内容与实际网格")
+            from .document_tables import compare_document_tables
+            with PDF_LOCK:
+                tabular = compare_document_tables(
+                    documents["old"].analysis_path, documents["new"].analysis_path,
+                    responses["old"], responses["new"])
+            result["items"].extend(tabular["items"])
+            result["table_coverage"] = tabular["coverage"]
+            result["warnings"].extend(tabular["warnings"])
             from .graphics import compare_graphics
             graphical = compare_graphics(
                 documents["old"].analysis_path, documents["new"].analysis_path,

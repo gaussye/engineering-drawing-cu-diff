@@ -107,6 +107,11 @@ def web_result(comparison: dict, documents: dict, metadata: dict) -> dict:
                 "new": side(record.get("new"), "new"),
             }
             cells = record.get("cell_comparison")
+            if record.get("annotation_comparison"):
+                item["annotation_comparison"] = record["annotation_comparison"]
+                item["annotation_context"] = {
+                    role: side(record["annotation_context"][role], role) for role in ("old", "new")
+                }
             if record.get("table_comparison"):
                 item["table_comparison"] = record["table_comparison"]
                 item["table_context"] = {
