@@ -410,6 +410,7 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                            _image(paths[side], page["number"], lock=pdf_lock)[0]))
     payload = {"version": VERSION, "chronology": "old -> new, user supplied",
                **{side: _public_catalog(catalogs[side]) for side in SIDES}}
+    client.usage_context = {"stage": "model_coarse"}
     coarse, coarse_meta = complete_json(
         client, cache, _body(client, opts, COARSE_PROMPT, payload, images), allow_submit=allow_submit)
     _json_shape(coarse, COARSE_SCHEMA)
@@ -461,6 +462,7 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
         progress(f"模型候选局部复读 {used}/{opts['max_regions']}：CU高清提取与来源核验")
         for side in SIDES:
             progress(f"局部复读 {used}/{opts['max_regions']}：{side} CU来源提取")
+            client.usage_context = {"stage": f"cu_crop_{side}", "region_index": used}
             path, image, mapping = crops[side]
             response, crop_meta[side] = client.analyze(
                 path, cache, analyzer_id, analyzer, allow_submit=allow_submit)
@@ -478,6 +480,7 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
         fine_payload = {"version": VERSION, "proposed_region": pair,
                         **{side: _public_catalog(word_catalogs[side]) for side in SIDES}}
         progress(f"局部复读 {used}/{opts['max_regions']}：模型核对词级来源")
+        client.usage_context = {"stage": "model_fine", "region_index": used}
         fine, fine_meta = complete_json(
             client, cache, _body(client, opts, FINE_PROMPT, fine_payload, crop_images), allow_submit=allow_submit)
         _json_shape(fine, FINE_SCHEMA)
@@ -579,6 +582,7 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                 "coordinate_system": "0..1000 in each complete supplied crop image; boxes are proposals only",
                 "crops": {s: crops[s][2] for s in SIDES},
             }
+            client.usage_context = {"stage": "model_visual", "region_index": number+1}
             visual, meta = complete_json(
                 client, cache, _body(client, opts, model_visual.PROMPT, visual_payload,
                                      [(s+" original high-resolution crop", crops[s][1]) for s in SIDES],

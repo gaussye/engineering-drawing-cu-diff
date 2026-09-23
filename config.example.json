@@ -12,6 +12,13 @@
   },
   "processing_location": "geography",
   "timeout_seconds": 1800,
+  "pricing": {
+    "currency": "USD",
+    "region": null,
+    "snapshot": null,
+    "cu_input_includes_cached": null,
+    "rates": []
+  },
   "model_comparison": {
     "enabled": false,
     "deployment": null,

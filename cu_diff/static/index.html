@@ -121,7 +121,17 @@
           <input id="new-upload" class="file-input" type="file" accept=".pdf,application/pdf" aria-label="上传新版 PDF" disabled>
         </section>
       </div>
-      <section class="detail-panel" aria-labelledby="detail-heading"><header><h2 id="detail-heading">证据详情</h2><span id="detail-meta">选择索引或证据框，联动定位两侧证据</span></header><div id="detail-content" class="detail-content"><p class="detail-placeholder">保留原文 · 核对外观 · 不推测缺失证据</p></div></section>
+      <section class="detail-panel" aria-label="证据与用量">
+        <header>
+          <div class="detail-tabs" role="tablist" aria-label="复核详情">
+            <button id="evidence-tab" role="tab" aria-selected="true" aria-controls="evidence-panel" tabindex="0"><span id="detail-heading">证据详情</span></button>
+            <button id="usage-tab" role="tab" aria-selected="false" aria-controls="usage-panel" tabindex="-1">用量与费用</button>
+          </div>
+          <span id="detail-meta">选择索引或证据框，联动定位两侧证据</span>
+        </header>
+        <div id="evidence-panel" role="tabpanel" aria-labelledby="evidence-tab" tabindex="0"><div id="detail-content" class="detail-content"><p class="detail-placeholder">保留原文 · 核对外观 · 不推测缺失证据</p></div></div>
+        <div id="usage-panel" role="tabpanel" aria-labelledby="usage-tab" tabindex="0" hidden><div id="usage-content" class="usage-content"><p class="usage-empty">暂无用量数据。开始对比后显示本轮记录；旧结果未提供用量时，不推算为零。</p></div></div>
+      </section>
     </section>
   </main>
 </body>

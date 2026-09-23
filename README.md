@@ -624,6 +624,54 @@ CLI 默认不输出可选变换条目；追加 `--include-translation`、`--incl
 调试图形规则优先用离线 `graphics`；验证真实 Web 缓存路径时省略 `--allow-azure-upload`，
 防止缓存未命中变成未经计划的付费重跑。运行模式和审计结果应与本次报告一起保存。
 
+### 每轮用量与费用
+
+图片下方的“证据详情 / 用量与费用”标签页按**当前作业**统计，不是订阅账单。
+全页CU、局部CU、全页模型配对、词级核对、图形复核逐次列出，运行中更新；
+后续步骤失败也保留此前用量。更换文件会清空界面中的旧统计，本地作业审计仍保留记录。
+
+费用分为CU文档提取、CU上下文处理、CU内部Foundry模型token、直接模型调用四部分。
+本次新增与本地缓存中的历史参考用量分开；同一缓存引用不重复计入历史合计。
+历史参考费用按当前配置的价格快照重新估算，不代表原执行日期的实际账单。
+服务端缓存输入不是本地缓存命中：前者仍按相应token单价计费，后者不产生新的分析提交。
+续查以前提交的异步操作归历史参考；未知或失败请求可能已经计费，不能显示为免费。
+模型推理token已包括在输出token中，不再相加；缓存写入token单列，计费口径未核实时不猜。
+
+`pricing` 配置不参与CU/模型缓存指纹，更新单价不需要重跑收费请求。默认不配置单价时，
+仍展示实际返回的用量，未知费用不会填零。可以在本地配置中启用已公开核对的价格快照：
+
+```json
+"pricing": {
+  "currency": "USD",
+  "region": "westus",
+  "snapshot": "azure-retail-westus-2026-09-23",
+  "cu_input_includes_cached": null,
+  "rates": []
+}
+```
+
+快照位于 `cu_diff/pricing/`，记录Azure Retail Prices API来源、meter ID、单价单位和核对日期；
+是公开零售价格，不是实时账单，也不会自动刷新。仅在地区、部署SKU、模型版本和已知上下文范围
+匹配时使用，不能把West US/GlobalStandard价格套到别的地区或部署类型。
+GPT-5.4按官方 `<272k` / `>272k` 分档，恰好272000尚未核实；
+CU聚合token不能证明每次内部请求都落在长上下文档位。
+Astra短/长上下文边界未取得可靠依据，因此展示两档价格形成的**场景估算区间**，不擅自选短档。
+CU的`input`是否包含`cached-input`也尚未核实：保留原始计数，显示两种口径的区间。
+只有取得适用依据后才设置`cu_input_includes_cached`为`true`或`false`；
+没有依据时保留`null`。区间不是账单保证或完整费用上限，缺少适用单价时仍为未知。
+
+`rates` 可提供其他已核实价格，每项需要 `key`、`price`、`unit_quantity`、`unit`、
+`currency`、HTTPS `source` 和 `as_of`，可限定 `region`、`sku`、`model_version`、
+`min_input_tokens`、`max_input_tokens`。计量键示例：`cu.documentPagesStandard`、
+`cu.contextualizationTokens`、`model.gpt-5.4.input`、`model.gpt-5.4.cached_input`、
+`model.gpt-5.4.output`。单位为`pages`或`tokens`，金额=`数量×单价÷unit_quantity`；
+相同适用条件的自定义条目覆盖快照对应项。缺失/冲突/无法判定的价格不伪装成零。
+税、汇率、协议折扣和其他资源费用不包含在估算中，实际金额以Azure账单为准。
+
+Web作业审计保存`usage_records`和`usage_cost`，终态结果也带`usage_cost`。
+CLI `extract`输出本轮`usage-cost.json`，`model-compare`输出`model-usage-cost.json`；
+后者不重复计入作为输入读取的全页CU历史用量。上述本地文件也必须按客户敏感产物管理，不提交Git。
+
 ### 本地隔离与生命周期
 
 每个浏览器会话使用 HttpOnly/SameSite cookie、CSRF令牌和独立随机文件标识，不能访问

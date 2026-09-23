@@ -22,4 +22,4 @@ cu-diff-web = "cu_diff.web:main"
 include = ["cu_diff*"]
 
 [tool.setuptools.package-data]
-cu_diff = ["static/*.html", "static/*.css", "static/*.js"]
+cu_diff = ["static/*.html", "static/*.css", "static/*.js", "pricing/*.json"]

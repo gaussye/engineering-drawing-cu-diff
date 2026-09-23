@@ -37,6 +37,217 @@
     if (content != null) node.textContent = text(content);
     return node;
   };
+  function selectDetailTab(name, focus = false) {
+    for (const key of ["evidence", "usage"]) {
+      const selected = key === name, tab = $(`${key}-tab`);
+      tab.setAttribute("aria-selected", String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+      $(`${key}-panel`).hidden = !selected;
+      if (selected && focus) tab.focus();
+    }
+    $("detail-meta").hidden = name !== "evidence";
+  }
+  for (const [index, name] of ["evidence", "usage"].entries()) {
+    $(`${name}-tab`).addEventListener("click", () => selectDetailTab(name));
+    $(`${name}-tab`).addEventListener("keydown", (event) => {
+      const targets = { ArrowLeft: 1 - index, ArrowRight: 1 - index, Home: 0, End: 1 };
+      if (!(event.key in targets)) return;
+      event.preventDefault();
+      selectDetailTab(["evidence", "usage"][targets[event.key]], true);
+    });
+  }
+  const usageNumber = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+  const usageCount = (value) => usageNumber(value) ? value.toLocaleString("zh-CN", { maximumFractionDigits: 8 }) : "未提供";
+  const usageMoney = (value) => !usageNumber(value) ? "未知" : value > 0 && value < 1e-10
+    ? "< US$0.0000000001"
+    : `US$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 10 })}`;
+  const usageRange = (min, max) => usageNumber(min) && usageNumber(max) && min <= max;
+  const usageCost = (value, range, missing = "未知") => usageNumber(value) ? usageMoney(value)
+    : usageRange(range?.min, range?.max) ? `${usageMoney(range.min)} – ${usageMoney(range.max)}（场景估算）` : missing;
+  const usageText = (value) => value == null || value === "" ? "未提供" : text(value);
+  const cacheLabels = { new: "本轮新提交", cached: "本地缓存复用", resumed: "恢复历史操作", unknown: "来源未知", not_submitted: "未提交" };
+  const usageLabels = { reported: "已报告", missing: "用量缺失", invalid: "用量无效", unknown: "用量未知" };
+  const meterLabels = { cu_extraction: "CU 页面提取", cu_contextualization: "CU 上下文 token", cu_model: "CU 内部模型 token", direct_model: "直接对比模型 token" };
+  const unitLabels = { pages: "页", tokens: "token" };
+  const tierLabels = { short: "短上下文（short）", long: "长上下文（long）" };
+  const reasonLabels = {
+    ambiguous_rate: "短 / 长上下文适用档位未确认（ambiguous_rate）",
+    uncertain_usage_semantics: "CU 输入与缓存输入是否重叠尚未确认（uncertain_usage_semantics）"
+  };
+  const rateAvailable = (rate) => rate && usageNumber(rate.price) && usageNumber(rate.unit_quantity) && rate.unit_quantity > 0;
+  const ratePrice = (rate, unit) => rateAvailable(rate)
+    ? `${rate.currency === "USD" ? usageMoney(rate.price) : `${usageCount(rate.price)} ${usageText(rate.currency)}`} / ${usageCount(rate.unit_quantity)} ${unit}` : "待配置";
+  const cacheWriteNote = (metrics) => metrics && Object.prototype.hasOwnProperty.call(metrics, "cache_write_tokens")
+    ? ` · 缓存写入 ${usageCount(metrics.cache_write_tokens)} token（单列，不叠加模型总量）` : "";
+  function usageSource(value) {
+    const label = usageText(value);
+    try {
+      if (typeof value !== "string" || !/^https:\/\//i.test(value) || /[\s\\]/.test(value)) throw new Error();
+      const url = new URL(value);
+      if (url.protocol !== "https:" || !url.hostname || url.username || url.password) throw new Error();
+      const link = el("a", "", label);
+      link.href = url.href;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.referrerPolicy = "no-referrer";
+      return link;
+    } catch (_) {
+      return el("span", "", `${label}${value ? "（非安全 HTTPS 链接，仅显示文本）" : ""}`);
+    }
+  }
+  function usageMetrics(metrics = {}, modelLabel = "模型") {
+    return `CU 页数 ${usageCount(metrics?.cu_pages)} · CU 上下文 token ${usageCount(metrics?.contextualization_tokens)} · ${modelLabel} token ${usageCount(metrics?.model_tokens)}（输入 ${usageCount(metrics?.input_tokens)} / 其中服务端缓存输入 ${usageCount(metrics?.cached_input_tokens)} / 输出 ${usageCount(metrics?.output_tokens)}）${cacheWriteNote(metrics)}`;
+  }
+  function usageRateDetails(rate, label) {
+    const section = el("section", "usage-rate-detail"), sourceLine = el("p", "", "价格来源：");
+    sourceLine.append(usageSource(rate?.source));
+    section.append(el("h4", "", label), sourceLine,
+      el("p", "", `上下文档位：${tierLabels[rate?.context_tier] || usageText(rate?.context_tier)}`),
+      el("p", "", `价格日期：${usageText(rate?.as_of)} · 区域：${usageText(rate?.region)}`),
+      el("p", "", `模型版本：${usageText(rate?.model_version)} · SKU：${usageText(rate?.sku)} · 币种：${usageText(rate?.currency)}`),
+      el("p", "", `计量 ID：${usageText(rate?.meter_id)} · 计量名称：${usageText(rate?.meter_name)}`));
+    return section;
+  }
+  let usageSnapshot;
+  function renderUsage(usage) {
+    const snapshot = JSON.stringify(usage);
+    if (usageSnapshot === snapshot) return;
+    usageSnapshot = snapshot;
+    const content = $("usage-content");
+    const opened = new Set([...content.querySelectorAll("details[open]")].map((node) => node.id));
+    const focused = content.contains(document.activeElement) ? document.activeElement.id : null;
+    const scrollTop = $("usage-panel").scrollTop;
+    content.replaceChildren();
+    if (!usage || typeof usage !== "object") {
+      content.append(el("p", "usage-empty", "暂无用量数据。开始对比后显示本轮记录；旧结果未提供用量时，不推算为零。"));
+      return;
+    }
+    const summary = usage.summary || {}, current = summary.current || {}, reused = summary.reused || {}, requests = summary.requests || {};
+    const heading = el("div", "usage-heading");
+    heading.append(el("h3", "", "本轮新增用量 / USD 估算"),
+      el("span", "usage-note", `记录状态：${({ complete: "完整", partial: "部分数据 / 估算不完整", unavailable: "不可用" })[usage.status] || "未提供"} · 价格日期：${usageText(usage.price_as_of)}`));
+    const cards = el("div", "usage-cards");
+    function card(id, title, value, note) {
+      const node = el("section", "usage-card");
+      node.id = id;
+      node.append(el("h4", "", title), el("p", "usage-value", value), el("p", "usage-note", note));
+      cards.append(node);
+      return node;
+    }
+    card("usage-current-cost", "本轮新增估算费用",
+      usageCost(current.estimated_cost, current.estimated_cost_range, "费用未完整估算"),
+      `已知费用小计（不等于完整总额）：${usageNumber(current.known_cost) ? usageMoney(current.known_cost) : "未提供"} · 价格待核计量项 ${usageCount(current.unpriced_meters)} · 用量待核调用 ${usageCount(current.unknown_usage_calls)}`);
+    card("usage-current-cu", "CU 页面与上下文",
+      `${usageCount(current.cu_pages)} 页`,
+      `CU 上下文：${usageCount(current.contextualization_tokens)} token`);
+    card("usage-current-model", "模型 token（CU 内部 + 直接对比）",
+      usageCount(current.model_tokens),
+      `输入 ${usageCount(current.input_tokens)} · 其中服务端缓存输入 ${usageCount(current.cached_input_tokens)} · 输出 ${usageCount(current.output_tokens)}${cacheWriteNote(current)}`);
+    card("usage-requests", "调用来源（不是 token 缓存）",
+      `新提交 ${usageCount(requests.new)}`,
+      `本地缓存 ${usageCount(requests.cached)} · 恢复 ${usageCount(requests.resumed)} · 未知 ${usageCount(requests.unknown)}`);
+    content.append(heading, cards,
+      el("p", "usage-note", "仅为估算，不是账单。使用公开零售价，不代表合同价；未计税费或汇率换算。未知用量或价格意味着总额不完整，已知小计不是总额。"),
+      el("p", "usage-note", "规范化输入 token 包含服务端缓存输入，不重复相加；模型 token = 输入 + 输出，推理 token 已包含在输出内。缓存写入单列，不叠加模型总量。CU 原始输入与缓存输入是否重叠未确认时，规范化总量保持未知，不直接相加原始计数。本地缓存与恢复仅引用历史操作，不计入本轮新增用量或费用。"),
+      el("p", "usage-note", "场景估算区间来自后端假设，不是确定费用或账单上下限；短 / 长上下文适用门槛或 CU 用量语义未确认时，不擅自选择档位，不将候选价格或场景端点相加。价格待核包含已核实单价但适用档位未确认的情况；用量待核包含已返回 API 计数但缓存重叠语义未确认的情况。"));
+    const history = el("section", "usage-history");
+    history.id = "usage-history";
+    history.append(el("h4", "", "历史缓存 / 恢复参考 · 非本轮新增计费"),
+      el("p", "", `历史参考费用：${usageCost(reused.estimated_cost, reused.estimated_cost_range)} · 已知参考小计（非总额）：${usageNumber(reused.known_cost) ? usageMoney(reused.known_cost) : "未提供"}`),
+      el("p", "", "参考费用按当前配置的价格快照重估历史用量，不是原始日期的账单或当时实际支付费用。"),
+      el("p", "", usageMetrics(reused)),
+      el("p", "", `历史价格待核计量项 ${usageCount(reused.unpriced_meters)} · 历史用量待核调用 ${usageCount(reused.unknown_usage_calls)}`));
+    content.append(history);
+    if (Array.isArray(usage.warnings)) usage.warnings.forEach((warning) => content.append(el("p", "usage-warning", warning)));
+    const entries = Array.isArray(usage.entries) ? usage.entries : [];
+    if (!entries.length) content.append(el("p", "usage-note", "逐阶段调用明细：未提供。"));
+    entries.forEach((entry, index) => {
+      if (!entry || typeof entry !== "object") return;
+      const call = el("details", "usage-call");
+      call.id = `usage-call-${index}`;
+      const service = entry.service === "cu" ? "CU 分析" : entry.service === "model" ? "直接对比模型" : usageText(entry.service);
+      const metricScope = entry.cache_state === "new" ? "本轮新提交用量"
+        : ["cached", "resumed"].includes(entry.cache_state) ? "历史 / 非新提交参考用量，不计入本轮新增"
+          : entry.cache_state === "not_submitted" ? "未提交用量，不视为本轮新增"
+            : "来源未确认用量，不据此认定本轮新增";
+      const title = el("summary", "", `${service} · ${usageText(entry.stage)} · ${cacheLabels[entry.cache_state] || "来源未提供"} · 新增估算 ${usageCost(entry.current_cost, entry.current_cost_range)}`);
+      title.id = `${call.id}-toggle`;
+      call.append(title, el("p", "usage-call-meta",
+        `调用 ${usageText(entry.id)} · 区域索引 ${usageText(entry.region_index)} · ${usageLabels[entry.usage_status] || "用量状态未提供"}\n模型 ${usageText(entry.model)} · 部署 ${usageText(entry.deployment)}\n参考费用 ${usageCost(entry.reference_cost, entry.reference_cost_range)}（引用用量按当前配置价格快照重估，非历史账单，非本轮新增） · 已知计量小计 ${usageNumber(entry.known_cost) ? usageMoney(entry.known_cost) : "未提供"}（非完整总额）`),
+      el("p", "usage-note", `${metricScope}：${usageMetrics(entry.metrics, entry.service === "cu" ? "CU 内部模型" : "直接对比模型")}`));
+      const raw = el("details", "usage-raw");
+      raw.id = `${call.id}-raw`;
+      const rawToggle = el("summary", "", "原始提供方用量（不直接求和）");
+      rawToggle.id = `${raw.id}-toggle`;
+      raw.append(rawToggle, el("p", "usage-note", "保留 API 原始计数以便核对；字段可能重叠，不等于规范化总量或本轮新增计费。"),
+        el("pre", "", usageText(entry.raw_usage)));
+      call.append(raw);
+      const meters = Array.isArray(entry.meters) ? entry.meters : [];
+      if (!meters.length) call.append(el("p", "usage-note", "计量与价格明细：未提供。"));
+      else {
+        const scroll = el("div", "usage-table-scroll");
+        scroll.tabIndex = 0;
+        scroll.setAttribute("role", "region");
+        scroll.setAttribute("aria-label", `${service} ${usageText(entry.stage)} 计量价格表，可横向滚动`);
+        const table = el("table", "usage-table"), head = el("thead"), row = el("tr"), body = el("tbody");
+        table.append(el("caption", "", "计量项估算 = 用量 ÷ 计价单位数量 × 单价。引用历史操作的计量金额仅供参考；各项与总额由服务端核算，不在页面相加。"));
+        for (const label of ["计量类别 / 项目", "用量", "单价 / 单位", "公式 / 估算 USD", "价格来源 / 限制"]) {
+          const cell = el("th", "", label);
+          cell.scope = "col";
+          row.append(cell);
+        }
+        head.append(row);
+        meters.forEach((meter, meterIndex) => {
+          if (!meter || typeof meter !== "object") return;
+          const rate = meter.rate, unit = unitLabels[meter.unit] || usageText(meter.unit);
+          const candidates = Array.isArray(meter.rate_candidates) ? meter.rate_candidates.filter((candidate) => candidate && typeof candidate === "object") : [];
+          const quantityRange = Array.isArray(meter.quantity_range) && meter.quantity_range.length === 2 &&
+            usageRange(meter.quantity_range[0], meter.quantity_range[1]);
+          const quantity = usageNumber(meter.quantity) ? usageCount(meter.quantity) : quantityRange
+            ? `${usageCount(meter.quantity_range[0])} – ${usageCount(meter.quantity_range[1])}（场景用量）` : "未提供";
+          const formula = (price) => !usageNumber(meter.quantity) && !quantityRange ? "用量未提供，无法估算"
+            : !rateAvailable(price) ? "单价待配置，无法估算"
+              : price.currency !== "USD" ? "币种未确认为 USD，不进行换算"
+                : `${quantity} ÷ ${usageCount(price.unit_quantity)} × ${usageMoney(price.price)}`;
+          const tr = el("tr"), sourceCell = el("td"), detail = el("details");
+          detail.id = `${call.id}-meter-${meterIndex}`;
+          const toggle = el("summary", "", "来源与计价依据");
+          toggle.id = `${detail.id}-toggle`;
+          detail.append(toggle);
+          if (rate || !candidates.length) detail.append(usageRateDetails(rate, "单价依据"));
+          candidates.forEach((candidate, candidateIndex) => detail.append(usageRateDetails(candidate,
+            `候选价格 ${candidateIndex + 1} · ${tierLabels[candidate.context_tier] || usageText(candidate.context_tier)}（适用性未确认）`)));
+          detail.append(el("p", "", `计量键：${usageText(meter.key)} · 说明：${reasonLabels[meter.reason] || usageText(meter.reason)}`));
+          sourceCell.append(detail);
+          const fee = el("td"), rateCell = el("td", "usage-rate");
+          if (rateAvailable(rate) || !candidates.length) {
+            rateCell.append(el("p", "", ratePrice(rate, unit)));
+            if (rate?.context_tier) rateCell.append(el("p", "", tierLabels[rate.context_tier] || usageText(rate.context_tier)));
+            fee.append(el("p", "", formula(rate)));
+          } else {
+            candidates.forEach((candidate) => {
+              const tier = tierLabels[candidate.context_tier] || usageText(candidate.context_tier);
+              rateCell.append(el("p", "", `${tier}：${ratePrice(candidate, unit)}`));
+              fee.append(el("p", "", `${tier}场景：${formula(candidate)}`));
+            });
+            rateCell.append(el("p", "usage-note", "候选档位，未选择；不相加"));
+          }
+          fee.append(el("p", "", `计量估算：${usageCost(meter.estimated_cost, meter.estimated_cost_range)}`));
+          tr.append(el("td", "", `${meterLabels[meter.category] || usageText(meter.category)} · ${usageText(meter.label)}`),
+            el("td", "usage-number", `${quantity} ${unit}`), rateCell, fee, sourceCell);
+          body.append(tr);
+        });
+        table.append(head, body);
+        scroll.append(table);
+        call.append(scroll);
+      }
+      if (Array.isArray(entry.warnings)) entry.warnings.forEach((warning) => call.append(el("p", "usage-warning", warning)));
+      content.append(call);
+    });
+    for (const id of opened) if ($(id)) $(id).open = true;
+    if (focused && $(focused)) $(focused).focus({ preventScroll: true });
+    $("usage-panel").scrollTop = scrollTop;
+  }
   function status(message) { $("job-status").textContent = message; }
   function error(message, retry = null) {
     $("error-message").textContent = message;
@@ -119,6 +330,7 @@
     state.comparing = false;
     state.result = null;
     state.selected = null;
+    renderUsage(null);
     sides.forEach((side) => $(`${side}-stage`).querySelector("svg").replaceChildren());
     renderResults();
     renderDetails(null);
@@ -560,6 +772,7 @@
   function selectItem(id) {
     const item = state.result?.items.find((i) => i.id === id);
     if (!item) return;
+    selectDetailTab("evidence");
     state.selected = id;
     document.querySelectorAll(".result-button").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.id === id)));
     renderDetails(item);
@@ -975,6 +1188,7 @@
       while (generation === state.generation) {
         const data = await request(`/api/jobs/${encodeURIComponent(job.job_id)}`, { signal: controller.signal });
         if (generation !== state.generation) return;
+        renderUsage(data.usage_cost ?? data.result?.usage_cost ?? null);
         if (data.status === "stale") { status("文件版本已变化，本次结果已作废。请重新上传或刷新后再对比。"); return; }
         if (data.status === "failed") throw new Error(data.error || "对比失败，请重试。");
         if (data.status === "succeeded") {

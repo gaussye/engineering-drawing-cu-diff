@@ -63,6 +63,9 @@ class Client:
         if not config.get("deployment_versions"):
             raise ValueError("Record actual deployment model versions/SKUs for cache provenance")
         self.events: list[dict] = []
+        self.usage_records: list[dict] = []
+        self.usage_context: dict = {}
+        self.usage_observer = None
         self._token = ""
         self._token_at = 0.0
 
@@ -118,10 +121,13 @@ class Client:
         except urllib.error.URLError as error:
             raise CUError(f"Azure CU transport failure: {error.reason}") from error
 
-    def poll(self, url: str) -> dict:
+    def poll(self, url: str, *, usage_entry=None) -> dict:
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             response, headers = self.request("GET", url)
+            if usage_entry is not None and "usage" in response:
+                from .usage import finish_usage
+                finish_usage(self, usage_entry, response, outcome="poll_response")
             status = response.get("status", "").lower()
             if status in ("succeeded", "ready"):
                 return response
@@ -171,6 +177,8 @@ class Client:
 
     def analyze(self, path: Path, cache: Path, analyzer_id: str,
                 analyzer: dict, *, allow_submit: bool = True) -> tuple[dict, dict]:
+        from .usage import begin_usage, finish_usage
+
         binary = path.read_bytes()
         deployments = dict(self.config["model_deployments"])
         deployments["prebuilt-analyzer-completion"] = deployments[self.config["completion_model"]]
@@ -187,8 +195,12 @@ class Client:
         raw_path = cache / f"{key}.response.json"
         meta_path = cache / f"{key}.metadata.json"
         pending_path = cache / f"{key}.operation.json"
+        usage_metadata = {k: provenance[k] for k in (
+            "model_deployments", "selected_completion_model", "deployment_versions")}
         if raw_path.exists() and meta_path.exists():
+            usage_entry = begin_usage(self, "cu", key, "cached", usage_metadata)
             raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            finish_usage(self, usage_entry, raw)
             if raw.get("status", "").lower() != "succeeded":
                 raise CUError("Cache contains an unsuccessful operation")
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -198,6 +210,7 @@ class Client:
             pending = json.loads(pending_path.read_text(encoding="utf-8"))
             location = pending["operation_location"]
             started_at = pending["started_at"]
+            usage_entry = begin_usage(self, "cu", key, "resumed", usage_metadata)
         else:
             if not allow_submit:
                 raise CacheMiss(
@@ -212,12 +225,26 @@ class Client:
             }
             url = self.url(f"analyzers/{analyzer_id}:analyze")
             url += "&processingLocation=" + urllib.parse.quote(self.config["processing_location"])
-            _, headers = self.request("POST", url, body)
+            usage_entry = begin_usage(self, "cu", key, "new", usage_metadata)
+            received = False
+            try:
+                _, headers = self.request("POST", url, body)
+                received = True
+            finally:
+                if not received:
+                    finish_usage(self, usage_entry, outcome="request_failed_or_unknown", cache_state="unknown")
             location = next((v for k, v in headers.items() if k.lower() == "operation-location"), None)
             if not location:
                 raise CUError("Accepted operation did not provide Operation-Location")
             save_json(pending_path, {"operation_location": location, "started_at": started_at})
-        raw = self.poll(location)
+        completed = False
+        try:
+            raw = self.poll(location, usage_entry=usage_entry)
+            completed = True
+        finally:
+            if not completed:
+                finish_usage(self, usage_entry, outcome="operation_incomplete")
+        finish_usage(self, usage_entry, raw)
         if not raw.get("result", {}).get("contents"):
             raise CUError("Succeeded operation has no contents; cannot report no changes")
         meta = dict(provenance, started_at=started_at, operation_location=location,

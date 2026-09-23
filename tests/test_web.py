@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import threading
@@ -137,6 +138,56 @@ class WebTests(unittest.TestCase):
     def test_bootstrap_reports_actual_graphical_pipeline(self):
         self.assertIs(self.boot["graphics_enabled"], True)
         self.assertIs(self.boot["model_comparison_enabled"], False)
+
+    def test_usage_cost_is_returned_and_saved_in_local_audit(self):
+        from cu_diff.usage import begin_usage, finish_usage
+        original = FakeClient.analyze
+
+        def counted(client, *args, **kwargs):
+            entry = begin_usage(client, "cu", str(len(getattr(client, "usage_records", []))), "new", {})
+            response, metadata = original(client, *args, **kwargs)
+            finish_usage(client, entry, {"usage": metadata["usage"]})
+            return response, metadata
+
+        self.upload("old")
+        revision = self.upload("new").get_json()["revision"]
+        with patch.object(FakeClient, "analyze", counted):
+            identifier = self.compare(revision).get_json()["job_id"]
+            job = self.wait_job(identifier)
+        self.assertEqual(job["status"], "succeeded")
+        self.assertEqual(job["usage_cost"], job["result"]["usage_cost"])
+        self.assertEqual(job["usage_cost"]["summary"]["requests"]["new"], 2)
+        self.assertEqual(job["usage_cost"]["summary"]["current"]["cu_pages"], 2)
+        self.assertIsNone(job["usage_cost"]["summary"]["current"]["estimated_cost"])
+        self.app.extensions["review_store"].executor.shutdown(wait=True)
+        audit = json.loads(next(self.root.rglob(identifier+".json")).read_text(encoding="utf-8"))
+        self.assertEqual(audit["usage_cost"], job["usage_cost"])
+        self.assertEqual(len(audit["usage_records"]), 2)
+
+    def test_failed_job_retains_prior_consumption_and_unknown_request(self):
+        from cu_diff.usage import begin_usage, finish_usage
+        original = FakeClient.analyze
+
+        def counted(client, *args, **kwargs):
+            index = len(getattr(client, "usage_records", []))
+            entry = begin_usage(client, "cu", str(index), "new", {})
+            if index:
+                finish_usage(client, entry, outcome="request_failed_or_unknown", cache_state="unknown")
+                raise CUError("Synthetic later request failure")
+            response, metadata = original(client, *args, **kwargs)
+            finish_usage(client, entry, {"usage": metadata["usage"]})
+            return response, metadata
+
+        self.upload("old")
+        revision = self.upload("new").get_json()["revision"]
+        with patch.object(FakeClient, "analyze", counted):
+            job = self.wait_job(self.compare(revision).get_json()["job_id"])
+        self.assertEqual(job["status"], "failed")
+        usage = job["usage_cost"]
+        self.assertEqual(usage["entries"][0]["metrics"]["cu_pages"], 1)
+        self.assertEqual(usage["summary"]["requests"]["new"], 1)
+        self.assertEqual(usage["summary"]["requests"]["unknown"], 1)
+        self.assertIsNone(usage["summary"]["current"]["estimated_cost"])
 
     def test_model_stage_is_additive_and_passes_explicit_upload_permission(self):
         store = self.app.extensions["review_store"]

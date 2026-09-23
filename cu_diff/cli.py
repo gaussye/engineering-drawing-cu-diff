@@ -28,15 +28,18 @@ def inspect_pdf(path: Path) -> dict:
 
 
 def extract(args: argparse.Namespace) -> None:
+    from .usage import usage_report, validate_pricing
     if not args.allow_azure_upload:
         raise ValueError("Upload requires --allow-azure-upload after resource/data-boundary approval")
     config = read_json(args.config)
+    pricing = validate_pricing(config.get("pricing"))
     client = Client(config)
     args.output.mkdir(parents=True, exist_ok=True)
     try:
         analyzer_id, analyzer = client.ensure_analyzer()
         save_json(args.output / "analyzer.json", analyzer)
         for role in ("old", "new"):
+            client.usage_context = {"stage": f"cu_full_{role}"}
             path = getattr(args, role)
             inspection = inspect_pdf(path)
             save_json(args.output / f"{role}.inspection.json", inspection)
@@ -48,6 +51,7 @@ def extract(args: argparse.Namespace) -> None:
         events_path = args.output / "api-events.json"
         previous = read_json(events_path).get("events", []) if events_path.exists() else []
         save_json(events_path, {"events": previous + client.events})
+        save_json(args.output / "usage-cost.json", usage_report(client.usage_records, pricing))
 
 
 def diagnose(args: argparse.Namespace) -> None:
@@ -195,7 +199,9 @@ def model_compare(args: argparse.Namespace) -> None:
     from .client import digest
     from .model_compare import compare_with_model, options
     from .report import write_model_report
+    from .usage import usage_report, validate_pricing
     config = read_json(args.config)
+    pricing = validate_pricing(config.get("pricing"))
     if not options(config)["enabled"]:
         raise ValueError("Enable model_comparison only after approving the existing deployment boundary")
     responses = {}
@@ -213,6 +219,7 @@ def model_compare(args: argparse.Namespace) -> None:
             cache=args.cache_dir, analyzer_id=analyzer_id, analyzer=analyzer,
             allow_submit=args.allow_azure_upload,
             progress=lambda message: print(message, flush=True))
+        result["usage_cost"] = usage_report(client.usage_records, pricing)
         save_json(args.output / "model-comparison.json", result)
         write_model_report(result, args.output / "model-comparison.zh.md")
         print(f"Model comparison saved locally: {args.output.resolve()}")
@@ -220,6 +227,7 @@ def model_compare(args: argparse.Namespace) -> None:
         events = args.output / "model-api-events.json"
         previous = read_json(events).get("events", []) if events.exists() else []
         save_json(events, {"events": previous + client.events})
+        save_json(args.output / "model-usage-cost.json", usage_report(client.usage_records, pricing))
 
 
 def main() -> None:

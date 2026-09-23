@@ -69,7 +69,9 @@ class Store:
     def __init__(self, config: dict, root: Path, cache: Path, allow_azure: bool,
                  client_factory=Client):
         from .model_compare import options
+        from .usage import validate_pricing
         self.model_options = options(config)
+        self.pricing = validate_pricing(config.get("pricing"))
         self.config, self.root, self.cache = config, root.resolve(), cache.resolve()
         self.allow_azure, self.client_factory = allow_azure, client_factory
         self.lock = threading.RLock()
@@ -252,8 +254,15 @@ class Store:
             return {"job_id": identifier, "status": "queued", "revision": revision}
 
     def run_job(self, session: Session, identifier: str, documents: dict[str, Document]):
+        from .usage import usage_report
+
         job = self.jobs[identifier]
         client = None
+
+        def usage_changed(records):
+            report = usage_report(records, self.pricing)
+            with self.lock:
+                job["usage_cost"] = report
 
         def phase(message):
             with self.lock:
@@ -264,11 +273,14 @@ class Store:
         try:
             phase("核对现有CU分析器与缓存")
             client = self.client_factory(self.config)
+            client.usage_observer = usage_changed
+            usage_changed(getattr(client, "usage_records", None))
             # Web requests may use only an existing analyzer; never create one.
             analyzer_id, analyzer = client.ensure_analyzer(allow_create=False)
             responses, metadata = {}, {}
             for role, label in (("old", "原图"), ("new", "调整图")):
                 phase(f"正在提取{label}（优先复用缓存，请勿关闭服务）")
+                client.usage_context = {"stage": f"cu_full_{role}"}
                 response, meta = self.analyze_document(client, documents[role], analyzer_id, analyzer)
                 if response.get("status", "").lower() != "succeeded":
                     raise CUError("CU未成功，不能生成无差异结果。")
@@ -305,6 +317,8 @@ class Store:
                 include_transformations=True)
             result["items"].extend(graphical["items"])
             result["graphics_coverage"] = graphical["coverage"]
+            usage_changed(getattr(client, "usage_records", None))
+            result["usage_cost"] = job["usage_cost"]
             with self.lock:
                 if job["invalidated"]:
                     job.update(status="stale", phase="文件已更换，旧结果已作废")
@@ -324,10 +338,13 @@ class Store:
         finally:
             with self.lock:
                 try:
+                    usage_changed(getattr(client, "usage_records", None) if client else [])
                     save_json(session.directory / f"{identifier}.json", {
                         "status": job["status"], "error": job.get("error"),
                         "revision": job["revision"],
                         "events": client.events if client else [],
+                        "usage_records": getattr(client, "usage_records", []) if client else [],
+                        "usage_cost": job["usage_cost"],
                     })
                 except OSError as error:
                     LOGGER.error("Job %s audit write failed (%s)", identifier, type(error).__name__)

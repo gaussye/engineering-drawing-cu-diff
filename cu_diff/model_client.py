@@ -70,7 +70,7 @@ def _response_content(raw) -> tuple[dict, dict]:
     }
 
 
-def _read_response(path: Path, provenance: dict) -> tuple[dict, dict]:
+def _read_response(path: Path, provenance: dict, observer=None) -> tuple[dict, dict]:
     try:
         saved = _load_json(path.read_text(encoding="utf-8"))
         if not isinstance(saved, dict) or saved.get("state") != "response_received":
@@ -91,6 +91,8 @@ def _read_response(path: Path, provenance: dict) -> tuple[dict, dict]:
             raise ValueError()
     except (OSError, ValueError, KeyError, TypeError, RecursionError):
         raise CUError("Corrupt model comparison cache; review it before retrying") from None
+    if observer:
+        observer(raw)
     parsed, response_metadata = _response_content(raw)
     return parsed, dict(metadata, **response_metadata)
 
@@ -115,6 +117,8 @@ def complete_json(client: Client, cache: Path, body: dict, *,
     request metadata and the completion envelope are validated here. Cache-only
     calls perform no requests. No POST is retried, including explicit HTTP errors.
     """
+    from .usage import begin_usage, finish_usage
+
     if not isinstance(body, dict):
         raise CUError("Model completion request must be an object")
     model = body.get("model")
@@ -163,9 +167,13 @@ def complete_json(client: Client, cache: Path, body: dict, *,
     response_path = directory / f"{key}.response.json"
     pending_path = directory / f"{key}.pending.json"
     if response_path.exists():
-        parsed, metadata = _read_response(response_path, provenance)
+        usage_entry = begin_usage(client, "model", key, "cached", provenance)
+        parsed, metadata = _read_response(response_path, provenance,
+                                         lambda raw: finish_usage(client, usage_entry, raw))
         return parsed, dict(metadata, cache_hit=True, cache_key=key)
     if pending_path.exists():
+        usage_entry = begin_usage(client, "model", key, "resumed", provenance)
+        finish_usage(client, usage_entry, outcome="previous_pending")
         raise CUError(
             f"Model request pending or outcome unknown; review and explicitly clear "
             f"only {pending_path.name} before resubmitting"
@@ -181,6 +189,8 @@ def complete_json(client: Client, cache: Path, body: dict, *,
             marker.flush()
             os.fsync(marker.fileno())
     except FileExistsError:
+        usage_entry = begin_usage(client, "model", key, "resumed", provenance)
+        finish_usage(client, usage_entry, outcome="previous_pending")
         raise CUError(
             f"Model request pending; review {pending_path.name} before resubmitting"
         ) from None
@@ -188,7 +198,9 @@ def complete_json(client: Client, cache: Path, body: dict, *,
         raise CUError("Cannot persist model request marker; no request submitted") from None
     # Another caller may have finished between our first read and marker creation.
     if response_path.exists():
-        parsed, metadata = _read_response(response_path, provenance)
+        usage_entry = begin_usage(client, "model", key, "cached", provenance)
+        parsed, metadata = _read_response(response_path, provenance,
+                                         lambda raw: finish_usage(client, usage_entry, raw))
         try:
             pending_path.unlink()
         except OSError:
@@ -196,11 +208,13 @@ def complete_json(client: Client, cache: Path, body: dict, *,
         return parsed, dict(metadata, cache_hit=True, cache_key=key)
     first_event = len(client.events)
     start = time.monotonic()
+    usage_entry = begin_usage(client, "model", key, "new", provenance)
     try:
         raw, _ = client.request(
             "POST", client.endpoint + "/openai/v1/chat/completions", request_body
         )
     except Exception as error:
+        finish_usage(client, usage_entry, outcome="request_failed_or_unknown", cache_state="unknown")
         status = getattr(error, "status", None)
         raise CUError(
             f"Model request failed; outcome may be unknown. Review and explicitly clear "
@@ -210,6 +224,7 @@ def complete_json(client: Client, cache: Path, body: dict, *,
     finally:
         _sanitize_events(client, first_event)
     metadata = dict(provenance, elapsed_seconds=round(time.monotonic() - start, 6))
+    finish_usage(client, usage_entry, raw)
     try:
         save_json(response_path, {
             "state": "response_received", "metadata": metadata,
