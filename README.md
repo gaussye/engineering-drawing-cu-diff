@@ -4,6 +4,8 @@ Python CLI 与本地 Web 审阅台，使用 **Azure Content Understanding GA `20
 分别进行全页 OCR/layout 与领域结构化提取，再在本地保守配对。不是仅凭 LLM 看图总结。
 支持 BOM、插头认证印字、线材印字、包装/标签、尺寸公差、备注及图框字段。
 本地 Web 另有独立图形候选通道：基于原始PDF渲染和CU布局来源，不额外调用生成模型。
+可选**模型语义配对＋CU局部复读**通道：让现有模型先提出跨版本区域对应关系，再高清裁剪复读，
+最后只用CU词级原文和坐标生成文字差异候选；原有全页通道仍保留为独立覆盖检查。
 文件名/料号不用于推断新旧顺序，必须由调用者指定。
 
 **默认比较设计内容；“显示平移”“显示绘图缩放”两个复选框默认不勾选。**
@@ -20,7 +22,8 @@ Python CLI 与本地 Web 审阅台，使用 **Azure Content Understanding GA `20
 
 ## 隐私与前提
 
-- 只向明确授权的现有 Azure CU 资源上传输入，不使用第三方解析服务。
+- 只向明确授权的现有 Azure 资源上传输入，不使用第三方解析服务。
+  默认仅CU；启用模型比较后还会调用**同一资源、同一已配置完成模型部署**的Azure OpenAI v1接口。
 - **客户 PDF、原文、图片、报告、原始响应、凭据不得提交到 GitHub，包括私有仓库。**
   默认 `output\` 和 `local\` 被忽略。建议将实际结果写在仓库外的持久本地目录。
   `.gitignore` 不是安全边界，提交前必须检查暂存内容。
@@ -72,6 +75,53 @@ CU 在创建 analyzer 阶段会验证模型默认映射，早于请求级 overri
 `diagnose` 只读检查 CU 实际 supportedModels 和默认映射，不上传文件。
 存在 Azure OpenAI 部署并不等于 CU 支持该模型。`extract` 遇到不支持的模型会在
 创建 analyzer/上传文件之前停止；不会偷偷换成其它模型。
+
+## 模型语义配对与局部复读（可选）
+
+这不是针对某个客户标题、料号或标签的特例。模型读两边全页图像和CU来源目录，按语义提出
+规格表、图框、标注、印字等区域的对应关系；字段名不同、移动、换行不要求用固定字符串配对。
+模型只能引用已给出的证据ID，不能提供最终原文、猜测坐标或执行工具。
+
+流程为：**全页CU提取 → 模型提出区域配对/疑点 → 原PDF高清裁剪 → CU重新提取词级证据 →
+模型核对局部对应 → 本地检查引用/置信度并比较原文 → 原有全页字段、表格、图形覆盖检查**。
+局部红框只框CU文字中真正不同的词；纯插入/移除的另一侧仅导航已有上下文，
+不把未变的锚点画成变化红框。缺少对应侧、低置信度、裁剪范围不可靠或超预算均是黄色待核项。
+模型提出的对应关系仍可能错误，`source_grounded` 只代表有CU来源支撑，不代表工程语义已签核。
+
+在实际配置中设置 `model_comparison.enabled: true` 才会启用（示例默认关闭，旧配置行为不变）。
+它复用 `completion_model` 指向的现有部署，不创建或修改资源、分析器或模型。
+**直接模型请求遵循该部署的地域/SKU处理边界，不继承CU的 `processing_location` 限制。**
+启用前必须确认两者都获批准；GlobalStandard不能当作区域内处理保证。
+
+预算默认：每侧前2页、最多800条可定位来源、每轮最多4个区域对（至多8次局部CU分析、
+1次全页模型配对和4次局部模型核对）。裁剪目标400 DPI，单图上限800万像素；
+实际DPI记在映射中。支持配置 `max_regions`、`max_pages_per_side`、`max_catalog_entries`、
+`crop_dpi`、`max_completion_tokens`，越界配置直接报错。
+未覆盖页、未引用来源、模型认为未变的区域和预算外候选均保留覆盖记录，
+**不会因模型第一轮没选中就声称没变化**。原有全页通道不按模型建议过滤；
+多个通道可能重复，不能相加为独立变更总数。多页截断和区域预算是明确局限，不是完整性保证。
+
+Web启用配置后，`--allow-azure-upload` 同时授权未缓存的全页CU、局部CU及同资源模型请求；
+未加该参数仍是只读缓存模式，任一阶段未命中会明确失败，不偷偷跳过。
+CLI支持以已有全页CU响应进行同样的模型流程，输入PDF必须已归一化旋转并与metadata哈希一致：
+
+```powershell
+.\.venv\Scripts\python -m cu_diff.cli model-compare `
+  --config local\config.json --cache-dir C:\local-results\drawing-diff\cache `
+  --old C:\approved-input\old.normalized.pdf --new C:\approved-input\new.normalized.pdf `
+  --old-response C:\local-results\drawing-diff\old.response.json `
+  --old-metadata C:\local-results\drawing-diff\old.metadata.json `
+  --new-response C:\local-results\drawing-diff\new.response.json `
+  --new-metadata C:\local-results\drawing-diff\new.metadata.json `
+  --output C:\local-results\drawing-diff\model --allow-azure-upload
+```
+
+`model-comparison.json`/`.zh.md`保留分阶段证据与覆盖，`model-api-events.json`保留真实HTTP记录；
+usage来自实际模型/CU响应，不估算金额。缓存新增 `model-comparison\`（模型请求哈希、响应和元数据）
+及 `model-crops\`（局部PDF与原页坐标映射），均属于客户敏感数据，仅本地保存。
+模型缓存键包含请求、图像、schema、提示词、现有部署版本及endpoint；原PDF与裁剪映射也有哈希。
+模型失败、拒答、无效引用或截断不能变成“比较成功/无差异”。不自动重发可能已经计费的模型请求；
+遇到未决请求记录时先核查，再决定是否移除该条记录并重试。
 
 ## 输出与证据
 

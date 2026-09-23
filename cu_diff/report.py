@@ -64,6 +64,25 @@ def write_table_report(result: dict, path: Path) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_model_report(result: dict, path: Path) -> None:
+    lines = ["# 模型配对与CU局部复读证据", "",
+             "模型仅提出语义对应关系，原文和位置取自CU来源。差异仍是候选，"
+             "未引用、未复读或模型认为未变的区域不等于已证明无变化。", "",
+             "| 编号 | 项目 | 阶段 / 状态 | 旧侧CU原文 | 新侧CU原文 | 差异词来源坐标 |",
+             "|---|---|---|---|---|---|"]
+    for item in result["items"]:
+        meta = item["model_comparison"]
+        lines.append("| " + " | ".join([
+            cell(item["id"]), cell(item["key"]), cell(f"{meta['stage']} / {meta['status']}"),
+            evidence(item["old"]), evidence(item["new"]),
+            cell({side: (item[side] or {}).get("locations") for side in ("old", "new")}),
+        ]) + " |")
+    lines.extend(["", "## 覆盖、用量与未解决项", "", "```json",
+                  json.dumps(result["coverage"], ensure_ascii=False, indent=2), "```", ""])
+    lines.extend("- " + cell(warning) for warning in result["warnings"])
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def write_report(result: dict, path: Path) -> None:
     lines = [
         "# 工程图 CU 证据差异报告",

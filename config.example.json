@@ -11,5 +11,13 @@
     "YOUR-EXISTING-EMBEDDING-DEPLOYMENT": "RECORD-ACTUAL-MODEL-VERSION-AND-SKU"
   },
   "processing_location": "geography",
-  "timeout_seconds": 1800
+  "timeout_seconds": 1800,
+  "model_comparison": {
+    "enabled": false,
+    "max_regions": 4,
+    "max_pages_per_side": 2,
+    "max_catalog_entries": 800,
+    "crop_dpi": 400,
+    "max_completion_tokens": 12000
+  }
 }

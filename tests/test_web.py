@@ -136,6 +136,35 @@ class WebTests(unittest.TestCase):
 
     def test_bootstrap_reports_actual_graphical_pipeline(self):
         self.assertIs(self.boot["graphics_enabled"], True)
+        self.assertIs(self.boot["model_comparison_enabled"], False)
+
+    def test_model_stage_is_additive_and_passes_explicit_upload_permission(self):
+        store = self.app.extensions["review_store"]
+        store.model_options["enabled"] = True
+        self.upload("old", pdf_bytes("SYNTHETIC A"))
+        revision = self.upload("new", pdf_bytes("SYNTHETIC B")).get_json()["revision"]
+        candidate = {"id": "M001", "channel": "model", "change": "model_review"}
+        semantic = {"items": [candidate], "coverage": {"enabled": True, "unprocessed": 1},
+                    "warnings": ["Synthetic model coverage remains partial."]}
+        with patch("cu_diff.model_compare.compare_with_model", return_value=semantic) as call:
+            result = self.wait_job(self.compare(revision).get_json()["job_id"])
+        self.assertEqual(result["status"], "succeeded")
+        self.assertIn(candidate, result["result"]["items"])
+        self.assertTrue(any(i["channel"] == "schema" for i in result["result"]["items"]))
+        self.assertTrue(result["result"]["graphics_coverage"])
+        self.assertEqual(result["result"]["model_coverage"], semantic["coverage"])
+        self.assertIn(semantic["warnings"][0], result["result"]["warnings"])
+        self.assertFalse(call.call_args.kwargs["allow_submit"])
+
+    def test_model_stage_failure_never_silently_falls_back_to_rules(self):
+        self.app.extensions["review_store"].model_options["enabled"] = True
+        self.upload("old", pdf_bytes("SYNTHETIC A"))
+        revision = self.upload("new", pdf_bytes("SYNTHETIC B")).get_json()["revision"]
+        with patch("cu_diff.model_compare.compare_with_model", side_effect=CUError("Synthetic model failure")):
+            result = self.wait_job(self.compare(revision).get_json()["job_id"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Synthetic model failure", result["error"])
+        self.assertNotIn("result", result)
 
     def test_table_pipeline_preserves_items_diagnostics_and_coverage(self):
         self.upload("old", pdf_bytes("SYNTHETIC A"))

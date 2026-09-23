@@ -68,6 +68,8 @@ class Session:
 class Store:
     def __init__(self, config: dict, root: Path, cache: Path, allow_azure: bool,
                  client_factory=Client):
+        from .model_compare import options
+        self.model_options = options(config)
         self.config, self.root, self.cache = config, root.resolve(), cache.resolve()
         self.allow_azure, self.client_factory = allow_azure, client_factory
         self.lock = threading.RLock()
@@ -271,10 +273,22 @@ class Store:
                 if response.get("status", "").lower() != "succeeded":
                     raise CUError("CU未成功，不能生成无差异结果。")
                 responses[role], metadata[role] = response, meta
+            semantic = None
+            if self.model_options["enabled"]:
+                from .model_compare import compare_with_model
+                semantic = compare_with_model(
+                    documents["old"].analysis_path, documents["new"].analysis_path,
+                    responses["old"], responses["new"], client=client, cache=self.cache,
+                    analyzer_id=analyzer_id, analyzer=analyzer, allow_submit=self.allow_azure,
+                    pdf_lock=PDF_LOCK, progress=phase)
             phase("配对BOM、字段和OCR证据")
             comparison = compare_responses(responses["old"], responses["new"])
             public_docs = {role: doc.public() for role, doc in documents.items()}
             result = web_result(comparison, public_docs, metadata)
+            if semantic is not None:
+                result["items"].extend(semantic["items"])
+                result["model_coverage"] = semantic["coverage"]
+                result["warnings"].extend(semantic["warnings"])
             phase("核对非BOM表格的列内容与实际网格")
             from .document_tables import compare_document_tables
             with PDF_LOCK:
@@ -423,6 +437,7 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
                 limits={"max_bytes": MAX_BYTES, "max_pages": MAX_PAGES,
                         "session_ttl_hours": SESSION_TTL},
                 azure_enabled=allow_azure, model=config.get("completion_model"), graphics_enabled=True,
+                model_comparison_enabled=store.model_options["enabled"],
                 documents={role: session.documents[role].public() if role in session.documents else None
                            for role in ("old", "new")},
                 storage_notice="文件仅存本地；会话闲置24小时后于后续请求/启动时清理。CU缓存单独保留，清理说明见README。",

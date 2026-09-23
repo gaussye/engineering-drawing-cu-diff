@@ -15,11 +15,13 @@
     table_column_added: "表格新增列候选", table_column_removed: "表格删除列候选",
     table_grid_changed: "表格网格结构不同",
     annotation_occurrence_changed: "图外标注次数不同（待核）",
+    model_text_modified: "CU局部原文不同（模型配对待核）",
+    model_review: "模型对应待复核（非确认变更）",
     visual_uncertain: "图形对应不确定（待复核）"
   };
-  const channels = { schema: "结构化字段", tables: "表格专项证据", graphics: "本地图形候选", ocr: "OCR 原文", unchanged: "一致项复核" };
+  const channels = { model: "模型引导复核", schema: "结构化字段", tables: "表格专项证据", graphics: "本地图形候选", ocr: "OCR 原文", unchanged: "一致项复核" };
   const state = {
-    ready: false, csrf: "", revision: 0, azure: false, graphicsEnabled: false, generation: 0,
+    ready: false, csrf: "", revision: 0, azure: false, graphicsEnabled: false, modelEnabled: false, generation: 0,
     limits: { max_bytes: 20971520, max_pages: 20 }, result: null, selected: null,
     comparing: false, jobController: null, mutationQueue: Promise.resolve(),
     old: { document: null, page: 1, zoom: "fit", epoch: 0, pending: false, loaded: false, imageEpoch: 0 },
@@ -64,9 +66,15 @@
       state.old.document.sha256 === state.new.document?.sha256;
   }
   const graphicsUnavailable = "图形检测未接入/未启用：当前仅展示文字与表格证据。";
+  const modelDisclaimer = "模型提出对应关系，CU局部复读提供原文；不是模型文字直接作为证据";
+  const modelLimits = "粗比对后按预算裁切并用CU局部复读，可能产生模型及CU费用；预算、来源或定位限制可能留下未处理区域，不保证没有遗漏。";
   function updateGraphicsAvailability() {
     const menu = $("channel-filter");
     menu.querySelector('[value="primary"]').textContent = state.graphicsEnabled ? "字段 + 表格 + 图形候选" : "字段 + 表格（默认）";
+    if (state.modelEnabled) menu.querySelector('[value="primary"]').textContent = state.graphicsEnabled
+      ? "模型 + 字段 + 表格 + 图形" : "模型 + 字段 + 表格";
+    $("model-status").hidden = !state.modelEnabled;
+    $("model-status").textContent = state.modelEnabled ? `模型引导对比已启用（服务配置）。${modelLimits}` : "";
     const option = menu.querySelector('[value="graphics"]');
     option.disabled = !state.graphicsEnabled;
     option.textContent = state.graphicsEnabled ? "本地图形候选" : "本地图形候选（未启用）";
@@ -125,6 +133,7 @@
       state.limits = data.limits;
       state.azure = Boolean(data.azure_enabled);
       state.graphicsEnabled = data.graphics_enabled === true;
+      state.modelEnabled = data.model_comparison_enabled === true;
       updateGraphicsAvailability();
       state.ready = true;
       $("connection-status").textContent = "会话已连接";
@@ -303,6 +312,9 @@
   }
   function navigationLocations(item, side) {
     const evidence = locations(item, side);
+    if (!evidence.length && item?.channel === "model") {
+      return validLocations(item.model_context?.[side]?.locations, side);
+    }
     if (!evidence.length && annotationReview(item)) {
       return validLocations(item.annotation_context?.[side]?.locations, side);
     }
@@ -318,7 +330,14 @@
   function uncertain(item) {
     const certainty = item.match?.certainty;
     return (typeof certainty === "number" && certainty < 0.8) ||
-      ["low", "uncertain", "ambiguous", "低", "低确定性"].includes(String(certainty).toLowerCase());
+      ["low", "uncertain", "ambiguous", "model_proposed", "低", "低确定性"].includes(String(certainty).toLowerCase());
+  }
+  function modelTextDifference(item) {
+    return item?.channel === "model" && item.change === "model_text_modified" &&
+      item.model_comparison?.status === "source_grounded" && item.model_comparison?.stage === "fine" &&
+      typeof item.old?.raw_text === "string" && Boolean(item.old.raw_text.trim()) &&
+      typeof item.new?.raw_text === "string" && Boolean(item.new.raw_text.trim()) &&
+      item.old.raw_text !== item.new.raw_text;
   }
   function pairedDifference(item) {
     return Boolean(item.old && item.new) &&
@@ -340,7 +359,7 @@
       item.annotation_comparison?.status === "observed";
   }
   function contentDifference(item) {
-    return pairedDifference(item) || tableRowChange(item) || documentTableChange(item);
+    return pairedDifference(item) || tableRowChange(item) || documentTableChange(item) || modelTextDifference(item);
   }
   function transformation(item) {
     return ["visual_moved", "visual_scaled"].includes(item.change);
@@ -359,10 +378,10 @@
       if (!$("show-interpretation").checked && item.change === "interpretation_only") return false;
       const channel = $("channel-filter").value;
       if (channel === "primary") {
-        if (!["schema", "tables", "graphics"].includes(item.channel)) return false;
+        if (!["model", "schema", "tables", "graphics"].includes(item.channel)) return false;
       } else if (channel !== "all" && item.channel !== channel) return false;
       switch ($("review-filter").value) {
-        case "paired": return contentDifference(item) || annotationReview(item) || Boolean(item.old && item.new && transformation(item));
+        case "paired": return item.channel === "model" || contentDifference(item) || annotationReview(item) || Boolean(item.old && item.new && transformation(item));
         case "formatting": return item.change === "formatting_only";
         case "review": return Boolean(item.review_required);
         case "uncertain": return uncertain(item);
@@ -375,6 +394,10 @@
     const list = $("results-list");
     list.replaceChildren();
     const items = visibleItems();
+    const modelItems = (state.result?.items || []).filter((item) => item.channel === "model");
+    $("model-count").hidden = !modelItems.length;
+    $("model-count").textContent = modelItems.length
+      ? `模型通道：${modelItems.filter(modelTextDifference).length} 条局部原文不同候选 / ${modelItems.filter((item) => !modelTextDifference(item)).length} 条待复核。可能与其他通道重叠，不相加为独立变更数。` : "";
     renderResultStatus(items);
     $("result-count").textContent = state.result ? String(items.length) : "—";
     $("result-count").title = state.result ? `当前显示 ${items.length} / 总计 ${state.result.items.length}` : "";
@@ -386,6 +409,7 @@
       return;
     }
     const groups = [...new Set(items.map((item) => item.channel))];
+    if (groups.includes("model")) groups.splice(0, 0, ...groups.splice(groups.indexOf("model"), 1));
     for (const channel of groups) {
       const grouped = items.filter((item) => item.channel === channel);
       list.append(el("h3", "channel-heading", `${channels[channel] || channel} / ${grouped.length}`));
@@ -472,6 +496,15 @@
     const node = $(`${side}-evidence-note`);
     if (!item) { node.textContent = state.result ? "点击证据框或索引查看证据；黄色虚框不是确认内容变更。" : "预览已就绪，等待开始对比。"; return; }
     const source = item[side], located = locations(item, side), counterparts = counterpartLocations(item, side);
+    if (item.channel === "model") {
+      const context = navigationLocations(item, side);
+      node.textContent = `${item.id} · ${located.length
+        ? `${sideName[side]}第 ${[...new Set(located.map((loc) => loc.page))].join("、")} 页${modelTextDifference(item) ? "CU局部复读证据；对应关系由模型提出，仍需复核" : "复核来源（黄色虚框，非确认变更）"}`
+        : source && context.length
+          ? "本侧无变化词框，仅导航已提取上下文，非本侧变化证据"
+          : `${source ? "缺少可定位原文" : "未配对到证据，不代表原图没有"}${context.length ? "；仅导航模型上下文，不绘制变化框" : "；不绘制推测框"}`}${source?.location_error ? `；${source.location_error}` : ""}`;
+      return;
+    }
     if (!source && annotationReview(item)) {
       node.textContent = `${item.id} · 本侧未提取到对应图外标注；仅定位到文字未变的BOM行作为上下文，不将BOM当作图外标注，也不伪造删除位置`;
     }
@@ -598,6 +631,30 @@
     content.replaceChildren();
     $("detail-meta").textContent = item ? `${item.id} · ${changes[item.change] || item.change} · 匹配 ${text(item.match?.method) || "未提供"} / 确定性 ${text(item.match?.certainty) || "未提供"} / 启发式得分 ${text(item.match?.score) || "未提供"}（非准确率）` : "选择索引或证据框，联动定位两侧证据";
     if (!item) { content.append(el("p", "detail-placeholder", "保留原文 · 核对外观 · 不推测缺失证据")); return; }
+    if (item.channel === "model") {
+      $("detail-meta").textContent = `${item.id} · ${changes[item.change] || item.change} · 模型语义配对 + CU局部复读证据 / 对应关系仅为模型提议（不是独立确认的工程事实）`;
+      const comparison = item.model_comparison || {}, section = el("section", "model-detail");
+      section.append(el("h3", "", "模型引导复核 · 对应关系尚需人工确认"),
+        el("p", "", modelDisclaimer),
+        el("p", "", modelTextDifference(item)
+          ? "两侧CU局部复读原文不同；原文保留完整短语作为上下文，红框仅指CU提取的变化词，不将整句或定位锚点标红，不确认语义对应或工程变更。"
+          : "来源或对应关系不确定，或预算/定位限制下未完成局部复读；黄色虚框只供复核，不确认变更。"),
+        el("p", "", `阶段：${comparison.stage === "fine" ? "局部复读" : "粗比对"} · 来源状态：${comparison.status === "source_grounded" ? "已提供来源（仍需核验）" : "仅供复核"}`),
+        el("p", "", `模型配对标签（非原文证据）：${text(comparison.pair_label) || "未提供"}`),
+        el("p", "", `模型理由（非原文证据）：${text(comparison.rationale) || "未提供"}`));
+      if (Array.isArray(comparison.issues) && comparison.issues.length) {
+        section.append(el("p", "review-reasons", `来源 / 预算限制：${comparison.issues.map(text).join("；")}`));
+      }
+      if (item.model_context) {
+        const context = el("details", "model-context");
+        context.append(el("summary", "", "模型上下文（仅导航，不是局部变化证据）"));
+        for (const side of sides) {
+          context.append(el("h4", "", sideName[side]), el("p", "source-text", item.model_context[side]?.raw_text ?? "未提供上下文"));
+        }
+        section.append(context);
+      }
+      content.append(section);
+    }
     const graphical = item.channel === "graphics";
     if (graphical) content.append(renderGraphicsDetails(item));
     if (annotationReview(item)) {
@@ -671,7 +728,7 @@
     for (const side of sides) {
       const source = item[side], section = el("section", "source-detail");
       section.dataset.side = side;
-      section.append(el("h3", "", `${sideName[side]} / ${item.change === "table_grid_changed" ? "本地网格测量（非 OCR 原文）" : graphical ? "本地渲染证据描述（非 OCR 原文）" : item.cell_comparison ? "整行原文（上下文，非整行变更）" : "原始文本"}`));
+      section.append(el("h3", "", `${sideName[side]} / ${item.channel === "model" ? (modelTextDifference(item) ? "CU局部复读原文" : "复核来源原文（非确认变更）") : item.change === "table_grid_changed" ? "本地网格测量（非 OCR 原文）" : graphical ? "本地渲染证据描述（非 OCR 原文）" : item.cell_comparison ? "整行原文（上下文，非整行变更）" : "原始文本"}`));
       section.append(el("p", "source-text", source ? (source.raw_text ?? (graphical ? "未提供本地渲染描述" : "未提供原文")) : "未配对到证据（不代表原图没有）"));
       if (source) {
         if (Array.isArray(source.schema_sources) && source.schema_sources.length) {
@@ -718,7 +775,10 @@
       comparison_policy: "比较策略", ignored_changes: "不作为差异的项目",
       transformations_included: "已提供可选平移/缩放提示", transformation_candidates: "可选视图提示数量",
       design_content_items: "设计内容候选数量",
-      visual_moved: "平移提示", visual_scaled: "绘图缩放提示"
+      visual_moved: "平移提示", visual_scaled: "绘图缩放提示",
+      coarse: "粗比对覆盖", fine: "局部复读覆盖", unprocessed: "未处理 / 预算及来源限制",
+      usage: "用量（不是金额）", budget: "预算", max_pairs: "配对预算上限", max_crops: "裁切预算上限",
+      crops: "裁切数", processed: "已处理", issues: "来源与限制"
     };
     if (Array.isArray(value)) {
       const list = el("ul");
@@ -738,7 +798,9 @@
     }
     const descriptions = {
       design_content_only: "仅设计内容", view_translation: "视图平移",
-      view_order: "视图顺序", uniform_drawing_scale: "等比绘图缩放"
+      view_order: "视图顺序", uniform_drawing_scale: "等比绘图缩放",
+      completed: "已完成（不保证无遗漏）", completed_with_limits: "已完成，仍有预算或来源限制",
+      source_grounded: "已提供来源（仍需核验）", review_only: "仅供复核"
     };
     return el("span", "", value == null ? "未提供" : typeof value === "boolean" ? (value ? "是" : "否") : Object.hasOwn(descriptions, value) ? descriptions[value] : value);
   }
@@ -748,6 +810,15 @@
       ? "对比仅覆盖成功提取的字段、OCR 原文、可定位的表格及已处理的本地图形区域；未识别、未配对或无法定位不等于无变更。证据框不是工程结论。"
       : `${graphicsUnavailable}对比仅覆盖成功提取的字段、OCR 原文与可定位的表格，不包含图形残差检测。未识别、未配对或无法定位不等于无变更。`));
     content.append(el("p", "", `覆盖信息：\n${text(result.coverage) || "未提供覆盖统计"}`));
+    if (result.model_coverage != null) {
+      const model = el("section", "model-coverage");
+      model.append(el("h4", "", "模型引导覆盖、预算与来源限制"), coverageFacts(result.model_coverage),
+        el("p", "", modelLimits),
+        el("p", "", "模型条目可能与字段、表格或图形候选重叠，不相加为独立变更数；没有候选不等于没有变更。"));
+      content.append(model);
+    } else if (state.modelEnabled) {
+      content.append(el("p", "", "本轮未返回模型覆盖统计，不能认定模型已完成全部比较或没有遗漏。"));
+    }
     if (result.table_coverage != null) {
       const tables = el("section", "table-coverage");
       tables.append(el("h4", "", "表格专项覆盖与限制"), coverageFacts(result.table_coverage),

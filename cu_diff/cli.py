@@ -191,6 +191,37 @@ def tables(args: argparse.Namespace) -> None:
     print(f"Local table comparison saved: {args.output.resolve()}")
 
 
+def model_compare(args: argparse.Namespace) -> None:
+    from .client import digest
+    from .model_compare import compare_with_model, options
+    from .report import write_model_report
+    config = read_json(args.config)
+    if not options(config)["enabled"]:
+        raise ValueError("Enable model_comparison only after approving the existing deployment boundary")
+    responses = {}
+    for role in ("old", "new"):
+        path = getattr(args, role)
+        if read_json(getattr(args, f"{role}_metadata")).get("document_sha256") != digest(path.read_bytes()):
+            raise ValueError(f"{role} cached CU document hash does not match the PDF")
+        responses[role] = read_json(getattr(args, f"{role}_response"))
+    client = Client(config)
+    args.output.mkdir(parents=True, exist_ok=True)
+    try:
+        analyzer_id, analyzer = client.ensure_analyzer(allow_create=False)
+        result = compare_with_model(
+            args.old, args.new, responses["old"], responses["new"], client=client,
+            cache=args.cache_dir, analyzer_id=analyzer_id, analyzer=analyzer,
+            allow_submit=args.allow_azure_upload,
+            progress=lambda message: print(message, flush=True))
+        save_json(args.output / "model-comparison.json", result)
+        write_model_report(result, args.output / "model-comparison.zh.md")
+        print(f"Model comparison saved locally: {args.output.resolve()}")
+    finally:
+        events = args.output / "model-api-events.json"
+        previous = read_json(events).get("events", []) if events.exists() else []
+        save_json(events, {"events": previous + client.events})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -238,6 +269,16 @@ def main() -> None:
         tabular.add_argument(f"--{role}-metadata", type=Path, required=True)
     tabular.add_argument("--output", type=Path, default=Path("output") / "tables")
     tabular.set_defaults(action=tables)
+    model = commands.add_parser("model-compare", help="Model region pairing and source-grounded CU crop rereading")
+    for role in ("old", "new"):
+        model.add_argument(f"--{role}", type=Path, required=True)
+        model.add_argument(f"--{role}-response", type=Path, required=True)
+        model.add_argument(f"--{role}-metadata", type=Path, required=True)
+    model.add_argument("--config", type=Path, required=True)
+    model.add_argument("--cache-dir", type=Path, required=True)
+    model.add_argument("--output", type=Path, default=Path("output") / "model")
+    model.add_argument("--allow-azure-upload", action="store_true")
+    model.set_defaults(action=model_compare)
     args = parser.parse_args()
     try:
         args.action(args)

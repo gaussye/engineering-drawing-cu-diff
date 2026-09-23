@@ -64,6 +64,8 @@ input[type="checkbox"] { accent-color: var(--cp-evidence); width: 15px; height: 
 .result-change { color: var(--cp-chrome-muted); font-size: 10px; white-space: nowrap; }
 .result-subtitle { grid-column: 2 / -1; color: var(--cp-chrome-muted); font-size: 11px; overflow-wrap: anywhere; }
 .result-item[data-channel="graphics"] .result-change { grid-column: 2 / -1; white-space: normal; }
+.result-item[data-channel="model"] .result-change { grid-column: 2 / -1; white-space: normal; }
+.result-item[data-change="model_review"] .result-change { color: var(--cp-warning); }
 .result-item[data-change="visual_uncertain"] .result-change,
 .result-item[data-change="visual_moved"] .result-change,
 .result-item[data-change="visual_scaled"] .result-change { color: var(--cp-warning); }
@@ -136,6 +138,11 @@ summary { cursor: pointer; }
 .review-reasons { grid-column: 1 / -1; border-top: 1px solid var(--cp-border); padding-top: 8px; font-size: 11px; color: var(--cp-text-muted); }
 .graphics-detail { grid-column: 1 / -1; padding: 12px; border: 1px solid var(--cp-border); border-radius: 10px; background: var(--cp-surface); }
 .graphics-detail h3 { font-size: 12px; margin-bottom: 6px; }
+.model-detail { padding: 12px; border: 1px solid var(--cp-warning); border-radius: 10px; font-size: 11px; overflow-wrap: anywhere; }
+.model-detail h3 { font-size: 12px; margin-bottom: 6px; }
+.model-detail p + p, .model-context { margin-top: 6px; }
+.model-coverage { margin: 12px 0; border-block: 1px solid var(--cp-chrome-border); white-space: normal; }
+.model-coverage h4 { color: var(--cp-chrome-text); }
 .graphics-disclaimer { font-size: 11px; color: var(--cp-text-muted); overflow-wrap: anywhere; }
 .graphics-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 20px; margin: 12px 0; font-size: 11px; }
 .graphics-metrics dt { color: var(--cp-text-soft); }
@@ -171,7 +178,7 @@ summary { cursor: pointer; }
   .sidebar-heading { padding: 12px 16px; }
   .filters { padding: 0 16px 12px; grid-template-columns: auto 1fr auto 1fr; }
   .filter-note { display: none; }
-  #graphics-status { display: block; }
+  #graphics-status, #model-status, #model-count { display: block; }
   .results-list { min-height: 100px; }
   .list-empty { padding: 12px; }
   .list-empty > span, .list-empty p { display: none; }

@@ -82,13 +82,15 @@
       <div class="sidebar-heading"><div><span class="eyebrow">REVIEW INDEX</span><h2>证据索引</h2></div><span id="result-count" class="count">—</span></div>
       <div class="filters">
         <label for="channel-filter">证据通道</label>
-        <select id="channel-filter"><option value="primary" selected>字段 + 表格（默认）</option><option value="all">全部通道</option><option value="schema">结构化字段</option><option value="tables">表格专项证据</option><option value="graphics" disabled>本地图形候选（未启用）</option><option value="ocr">OCR 原文</option><option value="unchanged">一致项复核</option></select>
+        <select id="channel-filter"><option value="primary" selected>字段 + 表格（默认）</option><option value="all">全部通道</option><option value="model">模型引导复核</option><option value="schema">结构化字段</option><option value="tables">表格专项证据</option><option value="graphics" disabled>本地图形候选（未启用）</option><option value="ocr">OCR 原文</option><option value="unchanged">一致项复核</option></select>
         <label for="review-filter">复核范围</label>
         <select id="review-filter"><option value="paired" selected>设计差异候选</option><option value="unpaired">未配对待复核（非确认增删）</option><option value="formatting">仅格式差异（不计变更）</option><option value="all">全部证据</option><option value="review">需要人工复核</option><option value="uncertain">低确定性匹配</option></select>
         <label class="check-label"><input id="show-interpretation" type="checkbox">显示仅解释差异</label>
         <label class="check-label"><input id="show-translation" type="checkbox" disabled>显示平移（含视图交换）</label>
         <label class="check-label"><input id="show-scaling" type="checkbox" disabled>显示绘图缩放（非实物尺寸）</label>
         <p id="graphics-status" class="filter-note" role="status">图形检测未接入/未启用；等待服务能力确认。</p>
+        <p id="model-status" class="filter-note" role="status" hidden></p>
+        <p id="model-count" class="filter-note" hidden></p>
         <p id="filter-note" class="filter-note">默认显示结构化字段，不重复展示 OCR。红色实框为原文差异候选；黄色虚框仅供复核，不是确认变更。</p>
       </div>
       <div id="results-list" class="results-list" aria-label="差异条目"><div class="list-empty"><span aria-hidden="true">⌕</span><h3>等待两份图纸</h3><p>固定按旧版 → 新版比较。<br>上传后可先检查页面，再开始对比。</p></div></div>
