@@ -670,6 +670,7 @@
     }
     for (const side of sides) {
       const source = item[side], section = el("section", "source-detail");
+      section.dataset.side = side;
       section.append(el("h3", "", `${sideName[side]} / ${item.change === "table_grid_changed" ? "本地网格测量（非 OCR 原文）" : graphical ? "本地渲染证据描述（非 OCR 原文）" : item.cell_comparison ? "整行原文（上下文，非整行变更）" : "原始文本"}`));
       section.append(el("p", "source-text", source ? (source.raw_text ?? (graphical ? "未提供本地渲染描述" : "未提供原文")) : "未配对到证据（不代表原图没有）"));
       if (source) {

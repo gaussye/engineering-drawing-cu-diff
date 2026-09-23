@@ -261,6 +261,20 @@ class GraphicsBrowserTests(unittest.TestCase):
         expect(self.page.locator("#job-status")).to_contain_text("对比完成")
         self.page.wait_for_load_state("networkidle")
 
+    def assert_source_columns(self):
+        sections = self.page.locator("#detail-content > .source-detail")
+        expect(sections).to_have_count(2)
+        expect(sections.nth(0).locator("h3")).to_contain_text("旧版")
+        expect(sections.nth(1).locator("h3")).to_contain_text("新版")
+        old, new = [section.bounding_box() for section in sections.all()]
+        self.assertAlmostEqual(old["y"], new["y"], delta=1)
+        self.assertLess(old["x"] + old["width"], new["x"])
+        self.assertAlmostEqual(old["width"], new["width"], delta=1)
+        for explanation in self.page.locator("#detail-content > :not(.source-detail)").all():
+            box = explanation.bounding_box()
+            self.assertAlmostEqual(box["x"], old["x"], delta=1)
+            self.assertAlmostEqual(box["x"] + box["width"], new["x"] + new["width"], delta=1)
+
     def visible_ids(self):
         return self.page.locator("#results-list .result-item").evaluate_all(
             "nodes => nodes.map(node => node.dataset.id)")
@@ -375,6 +389,7 @@ class GraphicsBrowserTests(unittest.TestCase):
         self.assertEqual(self.visible_ids(), [row["id"] for row in items])
         for row in items:
             self.select(row["id"])
+            self.assert_source_columns()
             for side in ("old", "new"):
                 expect(self.page.locator(f"#{side}-page")).to_have_value("2")
                 boxes = self.page.locator(f'#{side}-stage rect[data-id="{row["id"]}"]')
@@ -445,6 +460,9 @@ class GraphicsBrowserTests(unittest.TestCase):
         self.page.locator(".panel-ocr-context summary").click()
         expect(self.page.locator(".panel-ocr-context")).to_contain_text("UNRESOLVED SYMBOL")
         expect(self.page.locator(".panel-ocr-context")).to_contain_text("OTHER TEXT")
+        for width in (1600, 1024, 720):
+            self.page.set_viewport_size({"width": width, "height": 1050})
+            self.assert_source_columns()
 
     def test_annotation_occurrence_review_visible_but_never_false_deletion_frame(self):
         row = {
@@ -468,6 +486,7 @@ class GraphicsBrowserTests(unittest.TestCase):
         expect(self.page.locator("#new-evidence-note")).to_contain_text("不将BOM当作图外标注")
         expect(self.page.locator(".annotation-review")).to_contain_text("1 → 0")
         expect(self.page.locator(".annotation-review")).to_contain_text("不确认删除标签或部件")
+        self.assert_source_columns()
 
     def test_title_value_boxes_preserve_original_extraction_groups(self):
         row = copy.deepcopy(self.result["items"][0])

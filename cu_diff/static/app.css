@@ -116,8 +116,12 @@ summary { cursor: pointer; }
 .detail-panel h2 { font-size: 13px; font-weight: 600; white-space: nowrap; }
 #detail-meta { color: var(--cp-text-muted); font-size: 11px; overflow-wrap: anywhere; }
 .detail-content { overflow: auto; flex: 1; padding: 14px 20px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px 24px; }
+.detail-content > :not(.source-detail) { grid-column: 1 / -1; min-width: 0; }
 .detail-placeholder { grid-column: 1 / -1; align-self: center; text-align: center; color: var(--cp-text-soft); font-size: 12px; letter-spacing: 1px; }
 .source-detail { min-width: 0; }
+.source-detail[data-side="old"] { grid-column: 1; }
+.source-detail[data-side="new"] { grid-column: 2; }
+.table-detail pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .cell-diff { grid-column: 1 / -1; font-size: 12px; }
 .cell-diff h3 { font-size: 12px; margin-bottom: 8px; }
 .cell-diff table { width: 100%; border-collapse: collapse; text-align: left; }
