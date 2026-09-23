@@ -544,6 +544,7 @@ class GraphicsBrowserTests(unittest.TestCase):
 
     def test_transform_checkboxes_independent_local_and_reversible(self):
         self.compare()
+        self.page.locator("#display-options > summary").click()
         base = {"D001", "G001", "G002", "G007"}
         self.page.locator("#show-translation").check()
         self.assertEqual(set(self.visible_ids()), base | {"G003"})
@@ -588,6 +589,7 @@ class GraphicsBrowserTests(unittest.TestCase):
         item["graphics"]["subview"] = {"drawing_size_changed": True}
         item["graphics"]["alignment"].update(method="verified_uniform_scale", scale_ratio=1.1)
         self.compare()
+        self.page.locator("#display-options > summary").click()
         for enabled in (True, False):
             self.page.locator("#show-scaling").set_checked(enabled)
             self.assertIn("G001", self.visible_ids())
@@ -768,6 +770,7 @@ class GraphicsBrowserTests(unittest.TestCase):
 
     def test_schema_cells_dates_and_interpretation_semantics_preserved(self):
         self.compare()
+        self.page.locator("#display-options > summary").click()
         self.select("D001")
         expect(self.page.locator(".cell-diff tbody tr")).to_have_count(1)
         expect(self.page.locator(".cell-diff")).to_contain_text("OLD-PART")
@@ -792,6 +795,7 @@ class GraphicsBrowserTests(unittest.TestCase):
 
     def test_replacement_immediately_clears_graphics_context_and_coverage(self):
         self.compare()
+        self.page.locator("#display-options > summary").click()
         self.page.locator("#show-scaling").check()
         self.select("G007")
         self.hold_uploads = True
@@ -900,7 +904,36 @@ class GraphicsBrowserTests(unittest.TestCase):
                 expect(self.page.locator('rect[data-channel="graphics"]')).to_have_count(0)
                 expect(self.page.locator(".graphics-detail")).to_have_count(0)
                 self.page.set_viewport_size({"width": 700, "height": 900})
+                expect(self.page.locator("#graphics-status")).to_be_hidden()
+                self.page.locator("#display-options > summary").click()
                 expect(self.page.locator("#graphics-status")).to_be_visible()
+
+    def test_display_options_default_collapsed_and_keyboard_toggle_preserves_filters(self):
+        for width in (1500, 700):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({"width": width, "height": 900})
+                self.page.reload()
+                self.page.wait_for_load_state("networkidle")
+                disclosure = self.page.locator("#display-options")
+                summary = disclosure.locator("summary")
+                expect(disclosure).not_to_have_attribute("open", "")
+                self.assertLess(disclosure.bounding_box()["height"], 40)
+                expect(self.page.locator("#channel-filter")).to_be_visible()
+                expect(self.page.locator("#review-filter")).to_be_visible()
+                expect(self.page.locator("#graphics-status")).to_be_hidden()
+                expect(self.page.locator("#show-scaling")).to_be_hidden()
+                summary.focus()
+                summary.press("Enter")
+                expect(disclosure).to_have_attribute("open", "")
+                expect(self.page.locator("#graphics-status")).to_be_visible()
+                expect(self.page.locator("#filter-note")).to_be_visible()
+                self.page.locator("#show-scaling").check()
+                before = self.compare_requests
+                summary.press("Space")
+                expect(self.page.locator("#show-scaling")).to_be_hidden()
+                summary.press("Enter")
+                expect(self.page.locator("#show-scaling")).to_be_checked()
+                self.assertEqual(self.compare_requests, before)
 
 
 if __name__ == "__main__":
