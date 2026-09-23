@@ -73,7 +73,10 @@
   <header class="topbar">
     <div class="brand"><span class="brand-mark" aria-hidden="true">▥</span><div><h1>图纸校核</h1><span class="eyebrow">ENGINEERING / REVISION CHECK</span></div></div>
     <div class="workflow"><span>01 上传图纸</span><span aria-hidden="true">→</span><span>02 逐项比对</span><span aria-hidden="true">→</span><span>03 证据复核</span></div>
-    <button id="compare-button" class="primary" disabled>开始对比 <span aria-hidden="true">↗</span></button>
+    <div class="header-actions">
+      <button id="export-button" class="export-button" disabled title="导出当前两侧整页、当前显示的差异框及筛选结果详情；不重新分析">导出 PDF</button>
+      <button id="compare-button" class="primary" disabled>开始对比 <span aria-hidden="true">↗</span></button>
+    </div>
   </header>
   <div class="statusbar"><span id="connection-status">正在连接本地会话</span><span id="job-status" role="status" aria-live="polite">正在初始化…</span><span class="model-tag" id="model-tag">PDF / 双源校核</span></div>
   <div id="error-banner" class="error-banner" role="alert" hidden><span id="error-message"></span><button id="retry-bootstrap" hidden>重新连接</button><button id="retry-operation" hidden>重试操作</button><button id="dismiss-error" aria-label="关闭错误提示">×</button></div>

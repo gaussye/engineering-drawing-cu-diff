@@ -524,6 +524,41 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
                 public.pop("result", None)
             return jsonify(public)
 
+    @app.post("/api/export/pdf")
+    def export_pdf():
+        from .pdf_export import PdfExportError, render_comparison_pdf
+
+        if len(request.get_data()) > 8 * 1024 * 1024:
+            raise WebError("导出详情超过8MB，请缩小筛选范围；没有截断内容。", 413)
+        body = request.get_json()
+        if (not isinstance(body, dict) or type(body.get("revision")) is not int
+                or not isinstance(body.get("job_id"), str)):
+            raise WebError("导出请求缺少有效的作业与文件版本。")
+        session = g.review_session
+        with store.lock, PDF_LOCK:
+            job = store.jobs.get(body["job_id"])
+            if not job or job["session_id"] != session.id:
+                raise WebError("作业不存在或不属于当前会话。", 404)
+            if (session.uploading or session.job_id != body["job_id"] or job["invalidated"]
+                    or job["status"] != "succeeded" or not job.get("result")
+                    or body["revision"] != session.revision or job["revision"] != session.revision):
+                raise WebError("文件或对比结果已变化，请完成当前版本对比后再导出。", 409)
+            result = job["result"]
+            documents = {}
+            for side in ("old", "new"):
+                document = session.documents.get(side)
+                previous = result.get("documents", {}).get(side, {})
+                if (document is None or previous.get("id") != document.id
+                        or previous.get("sha256") != document.sha256):
+                    raise WebError("结果与当前图纸不一致，拒绝导出旧证据。", 409)
+                documents[side] = {**document.public(), "path": document.analysis_path}
+            try:
+                data = render_comparison_pdf(body, documents, result)
+            except PdfExportError as error:
+                raise WebError(str(error)) from error
+        return send_file(BytesIO(data), mimetype="application/pdf", as_attachment=True,
+                         download_name="engineering-comparison.pdf")
+
     return app
 
 

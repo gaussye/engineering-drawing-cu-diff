@@ -26,7 +26,7 @@
   const state = {
     ready: false, csrf: "", revision: 0, azure: false, graphicsEnabled: false, modelEnabled: false, generation: 0,
     limits: { max_bytes: 20971520, max_pages: 20 }, result: null, selected: null,
-    comparing: false, jobController: null, mutationQueue: Promise.resolve(),
+    comparing: false, jobController: null, jobId: null, exporting: false, exportController: null, mutationQueue: Promise.resolve(),
     old: { document: null, page: 1, zoom: "fit", epoch: 0, pending: false, loaded: false, imageEpoch: 0 },
     new: { document: null, page: 1, zoom: "fit", epoch: 0, pending: false, loaded: false, imageEpoch: 0 }
   };
@@ -261,14 +261,23 @@
     $("retry-operation").onclick = null;
   }
   async function request(url, options = {}) {
+    const { responseType, ...fetchOptions } = options;
     const headers = new Headers(options.headers);
     if (options.method && options.method !== "GET") headers.set("X-CSRF-Token", state.csrf);
     let response;
     try {
-      response = await fetch(url, { ...options, headers, credentials: "same-origin", cache: "no-store" });
+      response = await fetch(url, { ...fetchOptions, headers, credentials: "same-origin", cache: "no-store" });
     } catch (err) {
       if (err.name === "AbortError") throw err;
       throw new Error("连接中断，请检查网络后重试。");
+    }
+    if (response.ok && responseType === "pdf") {
+      if (!(response.headers.get("Content-Type") || "").toLowerCase().startsWith("application/pdf")) {
+        throw new Error("导出响应不是PDF，未下载文件。");
+      }
+      const blob = await response.blob();
+      if (await blob.slice(0, 5).text() !== "%PDF-") throw new Error("导出PDF内容无效，未下载文件。");
+      return blob;
     }
     let data;
     try { data = await response.json(); } catch (_) { throw new Error("服务器响应异常，请稍后重试。"); }
@@ -304,8 +313,11 @@
   }
   function updateControls() {
     const busy = sides.some((side) => state[side].pending);
-    $("compare-button").disabled = !state.ready || busy || state.comparing ||
+    $("compare-button").disabled = !state.ready || busy || state.comparing || state.exporting ||
       !sides.every((side) => state[side].document) || identicalFiles();
+    $("export-button").disabled = !state.ready || busy || state.comparing || state.exporting ||
+      !state.result || !state.jobId || !sides.every((side) => state[side].document && state[side].loaded);
+    $("export-button").textContent = state.exporting ? "正在导出…" : "导出 PDF";
     $("file-identity-status").classList.toggle("identical", identicalFiles());
     $("file-identity-status").textContent = identicalFiles()
       ? "两侧 SHA256 完全相同：是同一份文件字节，已阻止重复对比，请更换其中一份。"
@@ -326,6 +338,10 @@
   function invalidateResults() {
     state.generation++;
     if (state.jobController) state.jobController.abort();
+    if (state.exportController) state.exportController.abort();
+    state.exportController = null;
+    state.exporting = false;
+    state.jobId = null;
     state.jobController = null;
     state.comparing = false;
     state.result = null;
@@ -469,6 +485,7 @@
     const stage = $(`${side}-stage`);
     const image = stage.querySelector("img");
     s.loaded = false;
+    updateControls();
     stage.hidden = true;
     stage.querySelector("svg").replaceChildren();
     $(`${side}-page`).value = String(s.page);
@@ -480,12 +497,14 @@
       resizeStage(side);
       evidenceNote(side);
       if (scrollSelection || state.selected) scrollToEvidence(side);
+      updateControls();
     };
     image.onerror = () => {
       if (token !== s.imageEpoch) return;
       s.loaded = false;
       stage.hidden = true;
       $(`${side}-evidence-note`).replaceChildren(el("span", "", "页面预览加载失败。 "), retryButton(() => showPage(side, scrollSelection)));
+      updateControls();
     };
     image.src = `/api/documents/${encodeURIComponent(s.document.id)}/pages/${s.page}?width=1600`;
     $(`${side}-viewport`).scrollTo({ top: 0, left: 0 });
@@ -867,10 +886,9 @@
     }
     return section;
   }
-  function renderDetails(item) {
-    const content = $("detail-content");
+  function renderDetails(item, content = $("detail-content"), meta = $("detail-meta")) {
     content.replaceChildren();
-    $("detail-meta").textContent = item ? `${item.id} · ${changes[item.change] || item.change} · 匹配 ${text(item.match?.method) || "未提供"} / 确定性 ${text(item.match?.certainty) || "未提供"} / 启发式得分 ${text(item.match?.score) || "未提供"}（非准确率）` : "选择索引或证据框，联动定位两侧证据";
+    meta.textContent = item ? `${item.id} · ${changes[item.change] || item.change} · 匹配 ${text(item.match?.method) || "未提供"} / 确定性 ${text(item.match?.certainty) || "未提供"} / 启发式得分 ${text(item.match?.score) || "未提供"}（非准确率）` : "选择索引或证据框，联动定位两侧证据";
     if (!item) { content.append(el("p", "detail-placeholder", "保留原文 · 核对外观 · 不推测缺失证据")); return; }
     const visualModel = modelVisualItem(item);
     if (visualModel) {
@@ -878,7 +896,7 @@
       const unmeasured = visual.measurement_status === "unmeasured" ||
         visual.alignment?.accepted === false ||
         (visual.status === "unresolved" && visual.alignment?.accepted !== true && visual.measurement_status !== "measured");
-      $("detail-meta").textContent = `${item.id} · ${changes[item.change] || item.change} · 模型观察 + 本地PDF栅格核验（非OCR，不确认实体部件增删）`;
+      meta.textContent = `${item.id} · ${changes[item.change] || item.change} · 模型观察 + 本地PDF栅格核验（非OCR，不确认实体部件增删）`;
       const section = el("section", "model-detail model-visual-detail");
       section.append(el("h3", "", "图纸填充／轮廓变化候选"),
         el("p", "", "模型生成描述（非OCR）仅用于复核；定位依据是本地PDF栅格非文字残差，不是CU变化词框，不推断实体部件删除。"),
@@ -904,7 +922,7 @@
       content.append(section);
     }
     if (item.channel === "model" && !visualModel) {
-      $("detail-meta").textContent = `${item.id} · ${changes[item.change] || item.change} · 模型语义配对 + CU局部复读证据 / 对应关系仅为模型提议（不是独立确认的工程事实）`;
+      meta.textContent = `${item.id} · ${changes[item.change] || item.change} · 模型语义配对 + CU局部复读证据 / 对应关系仅为模型提议（不是独立确认的工程事实）`;
       const comparison = item.model_comparison || {}, section = el("section", "model-detail");
       section.append(el("h3", "", "模型引导复核 · 对应关系尚需人工确认"),
         el("p", "", modelDisclaimer),
@@ -1161,6 +1179,127 @@
       if (meta) content.append(el("p", "", `${sideName[side]}：${meta.cache_hit ? "缓存命中" : "本轮提取"}\n上传原件 SHA256：${result.documents?.[side]?.sha256 || "未提供"}\nCU 分析文件 SHA256：${meta.document_sha256 || "未提供"}\n坐标依据：${meta.coordinate_basis || "未提供"}\n${meta.cache_hit ? "历史分析用量（非本次新增计费）" : "分析用量"}：${text(meta.usage) || "未提供"}`));
     }
   }
+  function exportDetailBlocks(root) {
+    const blocks = [];
+    const walk = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (node.textContent.trim()) blocks.push({ kind: "paragraph", text: node.textContent });
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      if (node.tagName === "TABLE") {
+        blocks.push({ kind: "table", rows: Array.from(node.rows, (row) => Array.from(row.cells, (cell) => cell.textContent)) });
+      } else if (node.tagName === "DL") {
+        blocks.push({ kind: "table", rows: Array.from(node.children, (row) => [
+          row.querySelector("dt")?.textContent || "", row.querySelector("dd")?.textContent || ""
+        ]) });
+      } else if (["H1", "H2", "H3", "H4", "SUMMARY", "P", "PRE", "LI"].includes(node.tagName)) {
+        blocks.push({ kind: ["H1", "H2", "H3", "H4", "SUMMARY"].includes(node.tagName) ? "heading"
+          : node.tagName === "PRE" ? "code" : "paragraph", text: node.textContent });
+      } else {
+        node.childNodes.forEach(walk);
+      }
+    };
+    root.childNodes.forEach(walk);
+    return blocks;
+  }
+  function exportSnapshot() {
+    const itemsById = new Map(visibleItems().map((item) => [item.id, item]));
+    const items = Array.from(document.querySelectorAll("#results-list .result-item"), (row) => {
+      const item = itemsById.get(row.dataset.id);
+      if (!item) throw new Error("显示结果已变化，请重新导出。");
+      const content = el("div"), meta = el("span");
+      renderDetails(item, content, meta);
+      const blocks = exportDetailBlocks(content);
+      const rows = [["侧别", "页码", "定位类型（归一化0–1，非工程尺寸）", "x", "y", "宽", "高"]];
+      for (const side of sides) {
+        const observed = locations(item, side), projected = counterpartLocations(item, side);
+        for (const [kind, positions] of [["显示证据框", observed], ["对侧映射位置，非本侧残差", projected]]) {
+          for (const loc of positions) {
+            const box = bounds(loc);
+            rows.push([sideName[side], String(loc.page), kind,
+              ...["x", "y", "width", "height"].map((key) => box[key].toFixed(6))]);
+          }
+        }
+        if (!observed.length && !projected.length) {
+          const pages = [...new Set(navigationLocations(item, side).map((loc) => loc.page))];
+          blocks.push({ kind: "paragraph", text: `${sideName[side]}没有可显示的证据框；${pages.length
+            ? `仅有第 ${pages.join("、")} 页导航上下文，不作为变化框。` : "没有可靠定位，不推测缺失位置。"}` });
+        }
+      }
+      if (rows.length > 1) blocks.push({ kind: "heading", text: "来源页与定位（其它页位置不在当前整页总览中绘制）" }, { kind: "table", rows });
+      return { id: item.id, title: item.key || item.region || "未命名条目", meta: meta.textContent, blocks };
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 1;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("浏览器无法读取标记颜色，未生成不完整的导出。");
+    const rgba = (value) => {
+      context.clearRect(0, 0, 1, 1);
+      context.fillStyle = "rgba(0,0,0,0)";
+      if (value !== "none") context.fillStyle = value;
+      context.fillRect(0, 0, 1, 1);
+      return Array.from(context.getImageData(0, 0, 1, 1).data, (v) => v / 255);
+    };
+    const panes = Object.fromEntries(sides.map((side) => {
+      const stage = $(`${side}-stage`), svg = stage.querySelector("svg"), image = stage.querySelector("img").getBoundingClientRect();
+      const rects = Array.from(svg.querySelectorAll("rect.evidence-box"), (node) => {
+        const style = getComputedStyle(node), stroke = rgba(style.stroke), fill = rgba(style.fill);
+        return {
+          id: node.dataset.id,
+          ...Object.fromEntries(["x", "y", "width", "height"].map((key) => [key, Number(node.getAttribute(key))])),
+          kind: node.classList.contains("counterpart-evidence") ? "counterpart" : node.classList.contains("review-evidence") ? "review" : "change",
+          stroke: { color: stroke.slice(0, 3), opacity: stroke[3] * Number(style.opacity) * Number(style.strokeOpacity),
+            width: parseFloat(style.strokeWidth), dash: style.strokeDasharray === "none" ? [] : style.strokeDasharray.split(/[,\s]+/).filter(Boolean).map(parseFloat) },
+          fill: { color: fill.slice(0, 3), opacity: fill[3] * Number(style.opacity) * Number(style.fillOpacity) }
+        };
+      });
+      const labels = Array.from(svg.querySelectorAll("text.evidence-label"), (node) => ({
+        id: node.textContent, x: Number(node.getAttribute("x")), y: Number(node.getAttribute("y")),
+        font_size: Number(node.getAttribute("font-size")), color: rgba(getComputedStyle(node).fill).slice(0, 3)
+      }));
+      return [side, { document_id: state[side].document.id, page: state[side].page,
+        width: image.width, height: image.height, rects, labels }];
+    }));
+    return { revision: state.revision, job_id: state.jobId, panes, items, filters: {
+      channel: $("channel-filter").selectedOptions[0].textContent, review: $("review-filter").selectedOptions[0].textContent,
+      interpretation: $("show-interpretation").checked, translation: $("show-translation").checked, scaling: $("show-scaling").checked
+    } };
+  }
+  async function exportPdf() {
+    if ($("export-button").disabled) return;
+    clearError();
+    const generation = state.generation, controller = new AbortController();
+    state.exporting = true;
+    state.exportController = controller;
+    updateControls();
+    try {
+      const body = JSON.stringify(exportSnapshot());
+      if (new TextEncoder().encode(body).length > 8 * 1024 * 1024) {
+        throw new Error("当前导出详情超过8MB，请缩小筛选范围后重试；没有截断内容。");
+      }
+      const blob = await request("/api/export/pdf", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body,
+        responseType: "pdf", signal: controller.signal
+      });
+      if (generation !== state.generation || controller.signal.aborted) return;
+      const url = URL.createObjectURL(blob), link = el("a");
+      link.href = url;
+      link.download = `drawing-comparison-${new Date().toISOString().replace(/[:.]/g, "-")}.pdf`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (err) {
+      if (generation === state.generation && err.name !== "AbortError") error(`PDF导出失败：${err.message}`);
+    } finally {
+      if (state.exportController === controller) {
+        state.exporting = false;
+        state.exportController = null;
+        updateControls();
+      }
+    }
+  }
   function wait(ms, signal) {
     return new Promise((resolve, reject) => {
       const abort = () => { clearTimeout(timer); reject(new DOMException("Aborted", "AbortError")); };
@@ -1207,6 +1346,7 @@
             result.graphics_coverage = { ...result.graphics_coverage, subview_matching: contentMatching };
           }
           state.result = result;
+          state.jobId = job.job_id;
           renderResults();
           renderCoverage(result);
           sides.forEach((side) => { renderBoxes(side); evidenceNote(side); });
@@ -1252,10 +1392,11 @@
     sides.forEach((side) => { renderBoxes(side); evidenceNote(side); });
   });
   $("compare-button").addEventListener("click", compare);
+  $("export-button").addEventListener("click", exportPdf);
   $("dismiss-error").addEventListener("click", clearError);
   $("retry-bootstrap").addEventListener("click", bootstrap);
   const observer = new ResizeObserver(() => sides.forEach(resizeStage));
   sides.forEach((side) => observer.observe($(`${side}-viewport`)));
-  window.addEventListener("beforeunload", () => state.jobController?.abort());
+  window.addEventListener("beforeunload", () => { state.jobController?.abort(); state.exportController?.abort(); });
   bootstrap();
 })();

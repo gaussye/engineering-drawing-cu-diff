@@ -30,6 +30,8 @@ h1 { font-size: 21px; font-weight: 650; letter-spacing: 2px; }
 .eyebrow { font: 10px/1.6 Consolas, "Courier New", Courier, monospace; letter-spacing: 1.5px; }
 .brand .eyebrow { color: var(--cp-chrome-muted); font-size: 9px; letter-spacing: 1px; }
 .workflow { display: flex; gap: 18px; align-items: center; margin-left: auto; color: var(--cp-chrome-muted); font-size: 12px; }
+.header-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-shrink: 0; }
+.export-button { padding: 11px 14px; background: var(--cp-chrome-raised); color: var(--cp-chrome-text); border-color: var(--cp-chrome-border); white-space: nowrap; }
 .primary { background: var(--cp-accent); color: var(--cp-accent-fg); border-color: var(--cp-accent); padding: 11px 20px; font-weight: 650; min-width: 144px; }
 .primary span { margin-left: 20px; }
 .primary:hover:not(:disabled) { background: var(--cp-accent-hover); color: var(--cp-accent-fg); }
@@ -223,7 +225,7 @@ summary { cursor: pointer; }
 }
 @media (max-width: 780px) {
   body { height: auto; min-height: 100dvh; }
-  .topbar { padding: 0 16px; gap: 16px; }
+  .topbar { padding: 8px 16px; gap: 12px; height: auto; min-height: 76px; flex-wrap: wrap; }
   .brand .eyebrow, .model-tag { display: none; }
   .statusbar { flex-wrap: wrap; padding: 8px 16px; gap: 6px; }
   .workspace { display: flex; flex-direction: column; }
