@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pymupdf
 
 from cu_diff.client import CUError, digest
-from cu_diff.model_compare import compare_with_model, options, _record, _focus_for_review
+from cu_diff.model_compare import compare_with_model, options, _record, _focus_for_review, _visual_placeholder
 
 
 def response(width=10, height=5, *, words=None, low=False):
@@ -346,13 +346,60 @@ class ModelComparisonTests(unittest.TestCase):
         result = self.run_comparison()
         deferred = [r for r in result["coverage"]["visual"]["regions"] if r["status"] == "unprocessed"]
         self.assertEqual(len(deferred), 1)
-        item, = [i for i in result["items"] if i["change"] == "model_visual_review"]
+        item, = [i for i in result["items"] if i["change"] == "model_visual_deferred"]
         self.assertEqual(item["old"]["locations"], [])
         self.assertEqual(item["new"]["locations"], [])
         self.assertEqual(item["old"]["raw_text"], "")
         self.assertEqual(item["visual_comparison"]["measurement_status"], "unmeasured")
         self.assertEqual(item["visual_comparison"]["changed_pixels"], {"old": None, "new": None})
         self.assertEqual(len(self.client.calls), 2)
+
+    def test_single_sided_route_has_priority_within_shared_budget_and_no_duplicate_record(self):
+        self.client.config["model_comparison"].update(visual_review=True, max_visual_regions=1)
+        self.coarse["pairs"].append(pair(2, label="Generic late one-sided object", old_ids=[]))
+        for proposal in self.coarse["pairs"]:
+            proposal["observations"] = [{
+                "kind": "visual_change", "description": "Check an object, not a physical addition",
+                "old_ids": [], "new_ids": [], "check": "Locate and search opposite pages",
+            }]
+
+        def presence(proposal, selected, paths, **kwargs):
+            self.assertFalse(kwargs["allow_submit"])
+            self.assertEqual(self.client.usage_context["stage"], "model_visual_presence")
+            self.assertEqual(selected["old"], [])
+            self.assertEqual(set(paths), {"old", "new"})
+            item = _visual_placeholder(
+                proposal, selected, "Synthetic review", route="single_sided",
+                status="presence_review", change="model_visual_presence_review")
+            return item, {"label": proposal["label"], "route": "single_sided", "status": "presence_review"}
+
+        with patch("cu_diff.model_presence.review_presence", side_effect=presence) as review:
+            result = self.run_comparison()
+        review.assert_called_once()
+        region, deferred = result["coverage"]["visual"]["regions"]
+        self.assertEqual(region["route"], "single_sided")
+        self.assertEqual(deferred["status"], "unprocessed")
+        self.assertEqual(self.chat.call_count, 2, "No paired visual call may bypass the shared budget")
+        self.assertEqual(sum(i["key"] == "Generic late one-sided object" for i in result["items"]), 1)
+
+    def test_coarse_unchanged_graphical_suggestions_do_not_use_budget_or_claim_change(self):
+        self.client.config["model_comparison"].update(visual_review=True, max_visual_regions=1)
+        self.coarse["pairs"][0]["assessment"] = "unchanged"
+        self.coarse["pairs"].append(pair(2, label="Actual visual hypothesis"))
+        for proposal in self.coarse["pairs"]:
+            proposal["observations"] = [{
+                "kind": "visual_change", "description": "Graphical check recommendation",
+                "old_ids": [], "new_ids": [], "check": "Check if needed",
+            }]
+        result = self.run_comparison()
+        regions = result["coverage"]["visual"]["regions"]
+        self.assertEqual([r["status"] for r in regions], ["context_review", "reviewed"])
+        row, = [i for i in result["items"] if i["change"] == "model_visual_context"]
+        self.assertEqual(row["old"]["locations"], [])
+        self.assertEqual(row["new"]["locations"], [])
+        self.assertEqual(row["model_comparison"]["status"], "coarse_unchanged")
+        self.assertTrue(any(i["change"] == "model_visual_no_change" for i in result["items"]))
+        self.assertEqual(self.chat.call_count, 3)
 
 
 

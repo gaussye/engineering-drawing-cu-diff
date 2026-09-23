@@ -79,7 +79,8 @@ def write_model_report(result: dict, path: Path) -> None:
     text_count = sum(item.get("change") == "model_text_modified" for item in result["items"])
     lines = ["# 模型配对、CU局部复读与非文字栅格证据", "",
              "模型仅提出语义对应关系。文字通道原文和词位置取自CU来源；"
-             "非文字通道使用本地PDF栅格残差，模型生成描述明确标记非OCR，不是提取原文。差异仍是候选，"
+             "双侧非文字变化使用本地PDF栅格残差；单侧搜索仅提供对象待核范围，非变化残差。"
+             "模型生成描述明确标记非OCR，不是提取原文。差异仍是候选，"
              "未引用、未复读或模型认为未变的区域不等于已证明无变化。", "",
              f"文字差异候选：{text_count}；非文字观察：{len(visual_items)}"
              "（含定位未解决项，独立计数，不相加为已确认工程变更）。", "",
@@ -99,19 +100,25 @@ def write_model_report(result: dict, path: Path) -> None:
         lines.append("| " + " | ".join([
             report_cell(item["id"]), report_cell(item["key"]), report_cell(f"{meta['stage']} / {meta['status']}"),
             *(report_cell(description) for description in descriptions),
-            ("本地PDF栅格非文字残差（非CU词坐标）；" if visual else "CU变化词来源；") +
+            ("对象待核范围（非变化残差，非CU词坐标）；"
+             if item.get("change") == "model_visual_presence_review" else
+             "本地PDF栅格非文字残差（非CU词坐标）；" if visual and meta.get("status") == "visual_grounded"
+             else "未确认局部变化；" if visual else "CU变化词来源；") +
             report_cell({side: (item.get(side) or {}).get("locations") for side in ("old", "new")}),
         ]) + " |")
     if visual_items:
-        lines.extend(["", "## 图纸填充／轮廓变化候选 · 非OCR", "",
+        lines.extend(["", "## 图形复核与待核对象 · 非OCR", "",
                       "非文字描述是模型生成观察，不确认实体部件增删。仅 locations 中实际测量的局部残差可作变化框；"
                       "context_locations 和 model_context 仅导航搜索区域，不作为变化证据。"
                       "visual_grounded / localized 表示局部栅格支持，不是已确认工程结论；"
-                      "review_only / unresolved 表示定位未解决，不作确认变更红框。"])
+                      "review_only / unresolved 表示定位未解决，不作确认变更红框。"
+                      "presence_review 是单侧对象搜索，范围内有笔画不等于已确认增删；"
+                      "deferred 为尚未执行，coarse_unchanged 为粗判未变的核查建议，均不是已定位差异。"])
         for item in visual_items:
             visual = item.get("visual_comparison", {})
             alignment = visual.get("alignment", {})
-            unmeasured = (visual.get("measurement_status") == "unmeasured"
+            presence = item.get("change") == "model_visual_presence_review"
+            unmeasured = (presence or visual.get("measurement_status") == "unmeasured"
                           or alignment.get("accepted") is False
                           or (visual.get("status") == "unresolved" and alignment.get("accepted") is not True
                               and visual.get("measurement_status") != "measured"))
@@ -119,7 +126,9 @@ def write_model_report(result: dict, path: Path) -> None:
                           "模型观察（非OCR）：" + report_cell(visual.get("description", "未提供")), "",
                           ("残差像素：未测量（定位未通过或尚未执行），不是零变化。" if unmeasured else
                            "实际残差像素：" + report_cell(visual.get("changed_pixels", "未提供"))), "",
-                          ("整体配准未通过，已独立核验子特征周边公共轮廓；不代表整幅视图一致。"
+                          ("单侧对象范围核验与对侧页面搜索，非成对变化残差；未找到对应不证明不存在。"
+                           if presence else
+                           "整体配准未通过，已独立核验子特征周边公共轮廓；不代表整幅视图一致。"
                            if alignment.get("scope") == "subfeature_neighborhood" else
                            "视图级核验；模型已发现的疑点若定位未解决，不等于没有变化。"), "",
                           "定位限制：" + report_cell(visual.get("limitations", "未提供")), "",
@@ -128,6 +137,9 @@ def write_model_report(result: dict, path: Path) -> None:
                                        "visual_comparison": visual,
                                        "sources": {side: item.get(side) for side in ("old", "new")},
                                        "model_context_navigation_only": item.get("model_context")})])
+            if presence:
+                lines.extend(["", "对侧搜索覆盖（包括未覆盖页，不能据此证明无遗漏）：",
+                              report_cell(visual.get("search_coverage", "未提供"))])
     visual_coverage = result["coverage"].get("visual")
     if visual_coverage is not None:
         enabled = visual_coverage.get("enabled")
@@ -139,13 +151,16 @@ def write_model_report(result: dict, path: Path) -> None:
                       "| 区域 | 视觉复核状态 | 模型观察特征 | 已局部定位特征 | 未观察到视觉变化（不保证无遗漏） | 限制 / 延后原因 | 直接视觉模型调用及用量 |",
                       "|---|---|---|---|---|---|---|"])
         statuses = {"reviewed": "已执行视觉复核（非全部变化已确认）",
-                    "unprocessed": "未处理 / 延后（不代表无变化）"}
+                    "unprocessed": "未处理 / 延后（不代表无变化）",
+                    "presence_review": "已执行单侧对象与对侧搜索（非确认增删）",
+                    "context_review": "粗判未变，仅核查建议"}
         for region in visual_coverage.get("regions", []):
             lines.append("| " + " | ".join(report_cell(value) for value in (
                 region.get("label", "未提供"), statuses.get(region.get("status"), region.get("status", "未提供")),
                 region.get("features", "未提供"), region.get("localized", "未提供"),
                 region.get("no_visual_change_observed", "未提供"),
-                {"limitations": region.get("limitations"), "reason": region.get("reason")},
+                {"limitations": region.get("limitations"), "reason": region.get("reason"),
+                 "route": region.get("route"), "search_coverage": region.get("search_coverage")},
                 region.get("model", "未提供（不按零计）"),
             )) + " |")
     lines.extend(["", "## 覆盖、用量与未解决项", "", "```json",

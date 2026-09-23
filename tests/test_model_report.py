@@ -84,3 +84,20 @@ class ModelReportTests(unittest.TestCase):
         for phrase in ("3A 125V", "8A 125V", "CU变化词来源", "文字差异候选：1",
                        "非文字观察：0", '"unprocessed": 2'):
             self.assertIn(phrase, report)
+
+    def test_presence_report_never_calls_object_bounds_change_residuals(self):
+        report = self.render([{
+            "id": "M001", "key": "Synthetic one-sided drawing", "change": "model_visual_presence_review",
+            "model_comparison": {"stage": "visual", "status": "presence_review", "route": "single_sided"},
+            "visual_comparison": {"status": "presence_review", "measurement_status": "object_extent_only",
+                                  "description": "Synthetic object observed", "counterpart_status": "not_found",
+                                  "search_coverage": {"searched_pages": [1], "total_pages": 3, "complete": False},
+                                  "changed_pixels": {"old": None, "new": None}},
+            "old": None,
+            "new": {"raw_text": "", "locations": [{"x": .2}], "visual_description": "Synthetic ink extent"},
+        }])
+        self.assertIn("对象待核范围（非变化残差", report)
+        self.assertIn("未找到对应不证明不存在", report)
+        self.assertIn("对侧搜索覆盖", report)
+        self.assertIn("未测量", report)
+        self.assertNotIn("实际残差像素：", report)

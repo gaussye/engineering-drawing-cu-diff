@@ -171,7 +171,11 @@ def _validate(snapshot, documents, result):
             if dash and not any(dash):
                 _fail("虚线长度不能全部为零。")
         for label in labels:
-            _object(label, "id x y font_size color", "标记标签")
+            _object(label, "id x y font_size color" + (" text" if "text" in label else ""), "标记标签")
+            if "text" in label:
+                _string(label["text"], "标记文字", 300, True)
+                if label["text"] not in [label["id"] + suffix for suffix in ("", " 待核", " 对应", " 视图范围")]:
+                    _fail("标记文字与候选编号或显示状态不一致。")
             _number(label["x"], "标签横坐标")
             _number(label["y"], "标签纵坐标")
             _number(label["font_size"], "标签字号", high=200, positive=True)
@@ -271,7 +275,7 @@ def _primitives(page, pane, image, typesetter):
                        stroke_opacity=stroke["opacity"], fill_opacity=fill["opacity"])
     for label in pane["labels"]:
         typesetter.text(page, image.x0 + label["x"] * sx, image.y0 + label["y"] * sy,
-                       label["id"], label["font_size"] * sy, label["color"])
+                       label.get("text", label["id"]), label["font_size"] * sy, label["color"])
 
 
 class _Report:

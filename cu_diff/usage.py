@@ -16,6 +16,7 @@ STAGES = {
     "cu_crop_old": "局部CU · 旧版", "cu_crop_new": "局部CU · 新版",
     "model_coarse": "模型 · 全页配对", "model_fine": "模型 · 词级核对",
     "model_visual": "模型 · 图形复核",
+    "model_visual_presence": "模型 · 单侧对象与对侧搜索",
 }
 CU_METERS = {
     "documentPagesMinimal": ("文档数字提取", "pages"),

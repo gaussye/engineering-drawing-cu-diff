@@ -107,6 +107,17 @@ class PdfExportTests(unittest.TestCase):
             # No selected rectangles at all in the new panel.
             self.assertFalse([d for d in rects + yellow if d["rect"].x0 > 600])
 
+    def test_label_status_text_is_preserved_separately_from_candidate_id(self):
+        label = self.snapshot["panes"]["old"]["labels"][0]
+        for suffix in (" 待核", " 对应", " 视图范围"):
+            with self.subTest(suffix=suffix):
+                label["text"] = "M001" + suffix
+                with fitz.open(stream=self.render(), filetype="pdf") as pdf:
+                    self.assertIn(label["text"], pdf[0].get_text())
+        label["text"] = "M002 待核"
+        with self.assertRaisesRegex(PdfExportError, "标记文字"):
+            self.render()
+
     def test_concise_candidates_share_pages_and_bookmark_exact_positions(self):
         self.snapshot["detail_mode"] = "concise"
         self.snapshot["items"] = [{

@@ -58,6 +58,25 @@ def visual_item(identifier="V001", feature="左侧填充", x=.2, review=False):
     return row
 
 
+def presence_item(identifier="P001"):
+    row = visual_item(identifier, review=True)
+    row.update(key="合成单侧详图", change="model_visual_presence_review", old=None)
+    row["model_comparison"].update(status="presence_review", route="single_sided",
+                                   highlight_scope="object_review_only")
+    row["visual_comparison"] = {
+        "status": "presence_review", "description": "新图可见合成对象，旧图所查页未找到对应。",
+        "counterpart_status": "not_found", "presence_side": "new",
+        "search_coverage": {"searched_pages": [1], "total_pages": 3, "complete": False},
+        "measurement_status": "object_extent_only", "changed_pixels": {"old": None, "new": None},
+        "limitations": ["未覆盖页待核；不是新增实物的证据"],
+    }
+    row["new"]["locations"] = [graphics.location(2, .55, .35, .2, .15)]
+    row["new"]["source"] = [{"kind": "pdf_object_extent", "page": 2}]
+    row["new"]["visual_description"] = "局部渲染可见笔画，模型对象仍需核对"
+    row["model_context"]["old"] = None
+    return row
+
+
 class ModelBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -228,6 +247,52 @@ class ModelBrowserTests(unittest.TestCase):
         for side in ("old", "new"):
             self.page.locator(f"#{side}-page").select_option("1")
             expect(self.page.locator(f'#{side}-stage rect[data-change="model_visual_modified"]')).to_have_count(0)
+
+    def test_single_side_object_shows_yellow_extent_not_red_or_phantom_counterpart(self):
+        row = presence_item()
+        self.result["items"] = [row]
+        self.compare()
+        self.select("P001")
+        self.assert_geometry("new", "P001", row["new"]["locations"][0])
+        rect = self.page.locator('#new-stage rect[data-id="P001"]')
+        expect(rect).to_have_class("evidence-box review-evidence selected")
+        expect(rect).to_have_attribute("data-evidence-role", "object_review_extent")
+        expect(self.page.locator('#old-stage rect[data-id="P001"]')).to_have_count(0)
+        expect(self.page.locator("#new-evidence-note")).to_contain_text("对象待核范围，非变化残差")
+        expect(self.page.locator("#old-evidence-note")).to_contain_text("不代表不存在")
+        expect(self.page.locator(".model-visual-detail")).to_contain_text("对侧已查 1 / 3 页")
+        expect(self.page.locator(".model-visual-detail")).to_contain_text("未覆盖页面仍需检查")
+        expect(self.page.locator(".visual-measurement")).to_contain_text("未测量")
+        expect(self.page.locator('.source-detail[data-side="new"]')).to_contain_text("非变化残差")
+        expect(self.page.locator("#model-count")).to_contain_text("1 条单侧范围待核")
+        self.page.locator("#review-filter").select_option("unpaired")
+        self.assertEqual(self.visible_ids(), ["P001"])
+        self.assertEqual(self.compare_requests, 1)
+
+    def test_context_and_model_no_change_are_not_default_differences_but_deferred_is_visible(self):
+        rows = []
+        for identifier, change in (("V001", "model_visual_context"),
+                                   ("V002", "model_visual_no_change"),
+                                   ("V003", "model_visual_deferred")):
+            row = visual_item(identifier, review=True)
+            row["change"] = change
+            row["visual_comparison"].update(measurement_status="unmeasured")
+            rows.append(row)
+        self.result["items"] = rows
+        self.compare()
+        self.assertEqual(self.visible_ids(), ["V003"])
+        self.select("V003")
+        expect(self.page.locator(".model-visual-detail")).to_contain_text("高清复核尚未执行")
+        expect(self.page.locator("#model-count")).to_contain_text("1 条尚未执行")
+        expect(self.page.locator(".model-visual-detail")).not_to_contain_text("模型已发现疑点")
+        expect(self.page.locator("rect.evidence-box")).to_have_count(0)
+        self.page.locator("#review-filter").select_option("review")
+        self.assertEqual(self.visible_ids(), ["V001", "V002", "V003"])
+        self.select("V001")
+        expect(self.page.locator(".model-visual-detail")).to_contain_text("粗模型未见明确内容变化")
+        self.select("V002")
+        expect(self.page.locator(".model-visual-detail")).to_contain_text("不代表已证明整个区域完全相同")
+        expect(self.page.locator("rect.evidence-box")).to_have_count(0)
 
     def test_visual_unresolved_and_incomplete_grounding_never_use_confirmed_red_boxes(self):
         row = visual_item(review=True)

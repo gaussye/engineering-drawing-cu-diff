@@ -380,6 +380,26 @@ def _changed_words(selected):
     return {side: list({entry["id"]: entry for entry in result[side]}.values()) for side in SIDES}
 
 
+def _visual_route(pair, selected):
+    if pair["assessment"] == "unchanged":
+        return "context_review"
+    return "paired" if all(selected.values()) else "single_sided"
+
+
+def _visual_placeholder(pair, selected, reason, *, route, status, change):
+    record = _record(pair, selected, stage="coarse", issues=[reason], suppress_highlights=True)
+    record["change"] = change
+    record["model_comparison"].update(
+        stage="visual", route=route, status=status, highlight_scope="navigation_only")
+    record["visual_comparison"] = {
+        "status": status, "description": reason, "limitations": [reason],
+        "measurement_status": "unmeasured", "changed_pixels": {"old": None, "new": None}}
+    for side in SIDES:
+        if record[side]:
+            record[side].update(raw_text="", visual_description="未完成变化定位；来源仅用于上下文。")
+    return record
+
+
 def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, cache,
                        analyzer_id, analyzer, allow_submit=False, pdf_lock=None, progress=None):
     """Add model hypotheses without suppressing existing full-document comparison channels."""
@@ -438,6 +458,9 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                                  issues=["模型将同一来源分配到多个对应区域；存在配对冲突，未进入局部确认。"],
                                  suppress_highlights=True))
         elif pair["assessment"] != "unchanged":
+            if (opts["visual_review"] and not all(selected.values()) and
+                    any(o["kind"] == "visual_change" for o in pair["observations"])):
+                continue
             candidates.append((pair, selected))
     if conflicts:
         warnings.append("部分模型区域共用同一来源，已明确列为配对冲突待核，不作为可靠区域配对。")
@@ -546,14 +569,37 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
         visual_candidates = [(pair, selected) for index, (pair, selected) in enumerate(pairs)
                              if index not in conflict_pairs and any(
                                  o["kind"] == "visual_change" for o in pair.get("observations", []))]
-        for number, (pair, selected) in enumerate(sorted(visual_candidates, key=lambda value: value[0]["priority"])):
+        # The model's assessment and source correspondence select the route; no object-name rules.
+        visual_candidates.sort(key=lambda value: (
+            value[0]["priority"], _visual_route(*value) != "single_sided"))
+        visual_used = 0
+        for pair, selected in visual_candidates:
+            route = _visual_route(pair, selected)
+            if route == "context_review":
+                reason = "粗模型未见明确内容变化；保留图形核查建议，尚未执行高清验证，不作为变化候选。"
+                items.append(_visual_placeholder(
+                    pair, selected, reason, route=route, status="coarse_unchanged",
+                    change="model_visual_context"))
+                visual_records.append({"label": pair["label"], "route": route,
+                                       "status": "context_review", "reason": reason})
+                continue
             reason = None
-            if number >= opts["max_visual_regions"]:
+            if visual_used >= opts["max_visual_regions"]:
                 reason = "本轮非文字高清复核预算已用尽；图形疑点尚未定位。"
-            elif not all(selected.values()):
-                reason = "图形疑点缺少两侧来源搜索范围；未推测变化位置。"
+            elif route == "single_sided":
+                from .model_presence import review_presence
+
+                visual_used += 1
+                progress(f"单侧图形复核 {visual_used}/{opts['max_visual_regions']}：定位对象并搜索对侧页面")
+                client.usage_context = {"stage": "model_visual_presence", "region_index": visual_used}
+                record, entry = review_presence(
+                    pair, selected, paths, client=client, cache=cache, opts=opts,
+                    catalogs=catalogs, allow_submit=allow_submit, pdf_lock=pdf_lock)
+                items.append(record)
+                visual_records.append(entry)
+                continue
             else:
-                progress(f"非文字高清复核 {number+1}/{opts['max_visual_regions']}：子特征定位与本地残差核验")
+                progress(f"非文字高清复核 {visual_used+1}/{opts['max_visual_regions']}：子特征定位与本地残差核验")
                 cached = visual_inputs.get(digest(canonical(pair)))
                 if cached:
                     crops, visual_words = cached
@@ -565,24 +611,19 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                     except ValueError as error:
                         reason = str(error)
             if reason:
-                record = _record(pair, selected, stage="coarse", issues=[reason], suppress_highlights=True)
-                record["change"] = "model_visual_review"
-                record["model_comparison"].update(stage="visual", highlight_scope="nontext_residual_only")
-                record["visual_comparison"] = {"status": "unresolved", "description": reason,
-                                               "limitations": [reason], "measurement_status": "unmeasured",
-                                               "changed_pixels": {"old": None, "new": None}}
-                for s in SIDES:
-                    if record[s]:
-                        record[s].update(raw_text="", visual_description="未完成图形定位；来源仅用于上下文。")
-                items.append(record)
-                visual_records.append({"label": pair["label"], "status": "unprocessed", "reason": reason})
+                items.append(_visual_placeholder(
+                    pair, selected, reason, route=route, status="deferred",
+                    change="model_visual_deferred"))
+                visual_records.append({"label": pair["label"], "route": route,
+                                       "status": "unprocessed", "reason": reason})
                 continue
             visual_payload = {
                 "version": model_visual.VERSION, "proposed_region": pair,
                 "coordinate_system": "0..1000 in each complete supplied crop image; boxes are proposals only",
                 "crops": {s: crops[s][2] for s in SIDES},
             }
-            client.usage_context = {"stage": "model_visual", "region_index": number+1}
+            visual_used += 1
+            client.usage_context = {"stage": "model_visual", "region_index": visual_used}
             visual, meta = complete_json(
                 client, cache, _body(client, opts, model_visual.PROMPT, visual_payload,
                                      [(s+" original high-resolution crop", crops[s][1]) for s in SIDES],
@@ -593,12 +634,15 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
             for record in localized:
                 record["model_context"] = {s: _combine(selected[s]) for s in SIDES}
             items.extend(localized)
-            visual_records.append({"label": pair["label"], "status": "reviewed", "model": meta,
+            visual_records.append({"label": pair["label"], "route": route, "status": "reviewed", "model": meta,
                                    "features": len(localized),
                                    "localized": sum(r["change"] == "model_visual_modified" for r in localized),
                                    "limitations": visual["limitations"],
                                    "no_visual_change_observed": not visual["views"]})
             if not visual["views"]:
+                items.append(_visual_placeholder(
+                    pair, selected, "高清模型未提供可定位的非文字变化；不代表已证明图形完全相同。",
+                    route=route, status="no_change_observed", change="model_visual_no_change"))
                 warnings.append(f"{pair['label']}：高清模型未提供可定位非文字变化，不代表已证明图形完全相同。")
     for index, item in enumerate(items, 1):
         item["id"] = f"M{index:03d}"

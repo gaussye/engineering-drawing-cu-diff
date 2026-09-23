@@ -161,6 +161,24 @@ class PdfExportBrowserTests(unittest.TestCase):
         self.assertIn("未提供模型理由，需人工复核", entry["blocks"][0]["text"])
         self.assertEqual(len(entry["blocks"]), 1)
 
+    def test_presence_export_keeps_yellow_extent_and_search_uncertainty_in_brief(self):
+        self.result["items"].append(model.presence_item("M003"))
+        self.compare()
+        self.page.locator("#channel-filter").select_option("model")
+        self.select("M003")
+        payload = self.download()
+        row = next(item for item in payload["items"] if item["id"] == "M003")
+        self.assertEqual(len(row["blocks"]), 1)
+        for phrase in ("对象范围仅待核", "不证明不存在", "对侧页面未查全"):
+            self.assertIn(phrase, row["blocks"][0]["text"])
+        self.assertFalse(any(rect["id"] == "M003" for rect in payload["panes"]["old"]["rects"]))
+        frame, = [rect for rect in payload["panes"]["new"]["rects"] if rect["id"] == "M003"]
+        self.assertEqual(frame["kind"], "review")
+        self.assertEqual(frame["stroke"]["dash"], [5, 3])
+        label, = payload["panes"]["new"]["labels"]
+        self.assertEqual(label["id"], "M003")
+        self.assertEqual(label["text"], "M003 待核")
+
     def test_service_error_or_invalid_pdf_does_not_clear_comparison(self):
         self.compare()
         self.select("M001")
