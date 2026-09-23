@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pymupdf
 
 from cu_diff.client import CUError, digest
-from cu_diff.model_compare import compare_with_model, options
+from cu_diff.model_compare import compare_with_model, options, _record, _focus_for_review
 
 
 def response(width=10, height=5, *, words=None, low=False):
@@ -30,7 +30,7 @@ def response(width=10, height=5, *, words=None, low=False):
 def pair(index=1, **extra):
     return {"label": "Synthetic specification", "old_ids": [f"old:e{index}"],
             "new_ids": [f"new:e{index}"], "assessment": "changed", "priority": 1,
-            "rationale": "Model proposes this same-role pairing.", **extra}
+            "rationale": "Model proposes this same-role pairing.", "observations": [], **extra}
 
 
 class FakeClient:
@@ -183,6 +183,56 @@ class ModelComparisonTests(unittest.TestCase):
         self.assertEqual(result["coverage"]["coarse"]["unchanged_model_assessments"], 1)
         self.assertEqual(result["coverage"]["status"], "completed_with_limits")
         self.assertTrue(result["coverage"]["catalog"]["unreferenced_ids"]["new"])
+
+    def test_fine_unchanged_is_not_a_default_review_with_stale_coarse_boxes(self):
+        self.fine = {"assessment": "unchanged", "changes": [], "limitations": ["Some context is outside the crop."]}
+        result = self.run_comparison()
+        item, = result["items"]
+        self.assertEqual(item["change"], "model_no_text_change")
+        self.assertEqual(item["old"]["raw_text"], "SYN 3A")
+        self.assertEqual(item["old"]["locations"], [])
+        self.assertEqual(item["new"]["locations"], [])
+        self.assertTrue(item["model_context"]["old"]["locations"])
+
+    def test_review_focus_excludes_unchanged_labels_and_visual_context(self):
+        selected = {side: [
+            {"id": f"{side}:e1", "role": "dimension", "raw_text": "H +/- 0.8", "confidence": .9,
+             "source": f"{side}:same", "locations": [{"page": 1, "x": .1}]},
+            {"id": f"{side}:e2", "role": "dimension", "raw_text": "7 Min" if side == "old" else "9 Min",
+             "confidence": .9, "source": f"{side}:different", "locations": [{"page": 1, "x": .2}]},
+            {"id": f"{side}:e3", "role": "figure context", "raw_text": "SYNTHETIC VIEW",
+             "confidence": None, "source": f"{side}:view", "locations": [{"page": 1, "x": .3}]},
+        ] for side in ("old", "new")}
+        proposal = pair(observations=[
+            {"kind": "text_change", "description": "Minimum value differs", "check": "Read the numbers.",
+             "old_ids": ["old:e1", "old:e2"], "new_ids": ["new:e1", "new:e2"]},
+            {"kind": "unchanged_text", "description": "Height annotation remains", "check": "Context only.",
+             "old_ids": ["old:e1"], "new_ids": ["new:e1"]},
+            {"kind": "visual_change", "description": "Old hatch fill, new unfilled area",
+             "check": "Inspect fill strokes, not physical material removal.",
+             "old_ids": ["old:e3"], "new_ids": ["new:e3"]},
+        ])
+        item = _record(proposal, selected, stage="coarse", issues=["Budget reached"])
+        for side in ("old", "new"):
+            self.assertEqual(item[side]["locations"], [{"page": 1, "x": .2}])
+            self.assertEqual(len(item["model_context"][side]["locations"]), 3)
+        self.assertEqual(item["model_comparison"]["observations"], proposal["observations"])
+        proposal["observations"][0]["old_ids"] = ["old:e3"]
+        with self.assertRaisesRegex(CUError, "figure context"):
+            _focus_for_review(proposal, selected)
+        proposal["observations"][0]["old_ids"] = ["old:unknown"]
+        with self.assertRaisesRegex(CUError, "unknown"):
+            _focus_for_review(proposal, selected)
+
+    def test_visual_only_suggestion_has_context_but_no_invented_text_frames(self):
+        self.coarse["pairs"][0].update(new_ids=[], observations=[
+            {"kind": "visual_change", "description": "Check an internal fill difference",
+             "old_ids": [], "new_ids": [], "check": "Inspect both source drawings."},
+        ])
+        item, = self.run_comparison()["items"]
+        self.assertEqual(item["old"]["locations"], [])
+        self.assertIsNone(item["new"])
+        self.assertTrue(item["model_context"]["old"]["locations"])
 
     def test_crop_cache_tampering_is_an_error(self):
         self.run_comparison()

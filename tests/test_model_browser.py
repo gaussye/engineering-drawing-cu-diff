@@ -140,6 +140,47 @@ class ModelBrowserTests(unittest.TestCase):
                                  "n => getComputedStyle(n).fill"))
             expect(self.page.locator(f"#{side}-evidence-note")).to_contain_text("黄色虚框")
 
+    def test_review_shows_separate_visual_and_text_suggestions_not_unchanged_boxes(self):
+        item = model_item(review=True)
+        item["model_context"] = {side: model_source("UNCHANGED DIMENSION", x=.1) for side in ("old", "new")}
+        item["model_comparison"]["observations"] = [
+            {"kind": "text_change", "description": "Synthetic rating differs", "check": "Read the rating."},
+            {"kind": "visual_change", "description": "旧版有斜线填充，新版未见该填充",
+             "check": "<img src=x onerror=alert(1)> 核对填充笔画，不推断部件删除"},
+            {"kind": "unchanged_text", "description": "UNCHANGED DIMENSION仍存在", "check": "保留上下文"},
+        ]
+        self.result["items"] = [item]
+        self.compare()
+        self.select("M001")
+        expect(self.page.locator(".model-visual-observation")).to_contain_text("旧版有斜线填充")
+        expect(self.page.locator(".model-visual-observation")).to_contain_text("不是OCR原文")
+        expect(self.page.locator(".model-observations img")).to_have_count(0)
+        self.page.locator(".model-unchanged-context summary").click()
+        expect(self.page.locator(".model-unchanged-context")).to_contain_text("不高亮")
+        for side in ("old", "new"):
+            expect(self.page.locator(f'#{side}-stage rect[data-id="M001"]')).to_have_count(1)
+            self.assert_geometry(side, "M001", item[side]["locations"][0])
+        self.assert_source_columns()
+
+    def test_no_text_change_is_hidden_by_default_and_has_no_highlight(self):
+        item = model_item(review=True)
+        item["change"] = "model_no_text_change"
+        item["model_comparison"].update(stage="fine", status="no_text_change_observed")
+        item["model_context"] = {side: model_source("SYN SAME", page=2) for side in ("old", "new")}
+        for side in ("old", "new"):
+            item[side]["locations"] = []
+            item[side]["raw_text"] = "SYN SAME"
+        self.result["items"] = [item]
+        self.compare()
+        self.assertEqual(self.visible_ids(), [])
+        self.page.locator("#review-filter").select_option("review")
+        self.assertEqual(self.visible_ids(), ["M001"])
+        self.select("M001")
+        expect(self.page.locator(".model-text-cleared")).to_contain_text("默认不列入差异候选")
+        for side in ("old", "new"):
+            expect(self.page.locator(f'#{side}-stage rect[data-id="M001"]')).to_have_count(0)
+            expect(self.page.locator(f"#{side}-page")).to_have_value("2")
+
     def test_missing_sources_navigate_context_without_fabricated_frames(self):
         for absent in ("old", "new"):
             with self.subTest(absent=absent):

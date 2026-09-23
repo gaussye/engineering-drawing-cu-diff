@@ -15,6 +15,7 @@
     table_column_added: "表格新增列候选", table_column_removed: "表格删除列候选",
     table_grid_changed: "表格网格结构不同",
     annotation_occurrence_changed: "图外标注次数不同（待核）",
+    model_no_text_change: "局部复读未发现文字差异",
     model_text_modified: "CU局部原文不同（模型配对待核）",
     model_review: "模型对应待复核（非确认变更）",
     visual_uncertain: "图形对应不确定（待复核）"
@@ -381,7 +382,7 @@
         if (!["model", "schema", "tables", "graphics"].includes(item.channel)) return false;
       } else if (channel !== "all" && item.channel !== channel) return false;
       switch ($("review-filter").value) {
-        case "paired": return item.channel === "model" || contentDifference(item) || annotationReview(item) || Boolean(item.old && item.new && transformation(item));
+        case "paired": return (item.channel === "model" && item.change !== "model_no_text_change") || contentDifference(item) || annotationReview(item) || Boolean(item.old && item.new && transformation(item));
         case "formatting": return item.change === "formatting_only";
         case "review": return Boolean(item.review_required);
         case "uncertain": return uncertain(item);
@@ -394,7 +395,7 @@
     const list = $("results-list");
     list.replaceChildren();
     const items = visibleItems();
-    const modelItems = (state.result?.items || []).filter((item) => item.channel === "model");
+    const modelItems = (state.result?.items || []).filter((item) => item.channel === "model" && item.change !== "model_no_text_change");
     $("model-count").hidden = !modelItems.length;
     $("model-count").textContent = modelItems.length
       ? `模型通道：${modelItems.filter(modelTextDifference).length} 条局部原文不同候选 / ${modelItems.filter((item) => !modelTextDifference(item)).length} 条待复核。可能与其他通道重叠，不相加为独立变更数。` : "";
@@ -642,6 +643,29 @@
         el("p", "", `阶段：${comparison.stage === "fine" ? "局部复读" : "粗比对"} · 来源状态：${comparison.status === "source_grounded" ? "已提供来源（仍需核验）" : "仅供复核"}`),
         el("p", "", `模型配对标签（非原文证据）：${text(comparison.pair_label) || "未提供"}`),
         el("p", "", `模型理由（非原文证据）：${text(comparison.rationale) || "未提供"}`));
+      if (item.change === "model_no_text_change") {
+        section.append(el("p", "model-text-cleared",
+          "局部复读未发现文字差异，默认不列入差异候选，也不画框；这不保证整个区域或条码编码一致。覆盖不足见下方限制。"));
+      }
+      if (Array.isArray(comparison.observations) && comparison.observations.length) {
+        const labels = { text_change: "文字差异疑点", visual_change: "图形复核建议",
+          unchanged_text: "仍存在的标注（不高亮）", unresolved: "尚未解决" };
+        const observations = el("div", "model-observations");
+        observations.append(el("h4", "", "逐项复核建议（模型观察，不是工程结论）"));
+        const unchanged = el("details", "model-unchanged-context");
+        unchanged.append(el("summary", "", "仍存在的标注 · 仅上下文，不高亮"));
+        for (const observation of comparison.observations) {
+          const entry = el("section", `model-observation ${observation.kind === "visual_change" ? "model-visual-observation" : ""}`);
+          entry.append(el("h4", "", labels[observation.kind] || "复核建议"),
+            el("p", "", observation.description),
+            el("p", "", `建议核对：${text(observation.check) || "核对两侧原图"}`));
+          if (observation.kind === "visual_change") entry.append(el("p", "source-meta",
+            "图形观察不是OCR原文或已验证像素差异；仅用来源上下文导航，不把附近未变文字画成图形变化框。"));
+          (observation.kind === "unchanged_text" ? unchanged : observations).append(entry);
+        }
+        if (unchanged.children.length > 1) observations.append(unchanged);
+        section.append(observations);
+      }
       if (Array.isArray(comparison.issues) && comparison.issues.length) {
         section.append(el("p", "review-reasons", `来源 / 预算限制：${comparison.issues.map(text).join("；")}`));
       }

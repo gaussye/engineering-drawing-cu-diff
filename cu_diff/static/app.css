@@ -121,6 +121,10 @@ summary { cursor: pointer; }
 .detail-content > :not(.source-detail) { grid-column: 1 / -1; min-width: 0; }
 .detail-placeholder { grid-column: 1 / -1; align-self: center; text-align: center; color: var(--cp-text-soft); font-size: 12px; letter-spacing: 1px; }
 .source-detail { min-width: 0; }
+.model-observations { display: grid; gap: 8px; margin-top: 10px; }
+.model-observation { border-left: 2px solid var(--cp-border); padding: 4px 10px; }
+.model-observation h4 { margin-bottom: 4px; }
+.model-unchanged-context { color: var(--cp-text-muted); }
 .source-detail[data-side="old"] { grid-column: 1; }
 .source-detail[data-side="new"] { grid-column: 2; }
 .table-detail pre { white-space: pre-wrap; overflow-wrap: anywhere; }
