@@ -67,8 +67,10 @@ class PdfExportBrowserTests(unittest.TestCase):
         expect(self.page.locator("#export-button")).to_be_enabled()
         return self.exports[-1]
 
-    def test_current_filter_boxes_ids_and_all_details_without_changing_selection(self):
+    def test_current_filter_boxes_and_concise_reasons_without_changing_web_details(self):
         expect(self.page.locator("#export-button")).to_be_disabled()
+        rationale = "同一合成标注由“3A”改为“8A”；另一处“3A”不变。"
+        next(item for item in self.result["items"] if item["id"] == "M001")["model_comparison"]["rationale"] = rationale
         self.compare()
         self.page.locator("#channel-filter").select_option("model")
         self.select("M001")
@@ -83,11 +85,14 @@ class PdfExportBrowserTests(unittest.TestCase):
         payload = self.download()
         self.assertEqual(payload["job_id"], "synthetic-job")
         self.assertEqual(payload["revision"], self.revision)
+        self.assertEqual(payload["detail_mode"], "concise")
         self.assertEqual([i["id"] for i in payload["items"]], ["M001", "M002"])
-        first = "\n".join(block.get("text", "") for block in payload["items"][0]["blocks"])
-        for text in ("3A 125V", "8A 125V", "可能对应同一额定值标注", "CU局部复读说明"):
-            self.assertIn(text, first)
-        self.assertIn("局部预算已用完", str(payload["items"][1]["blocks"]))
+        self.assertEqual(payload["items"][0]["meta"], "")
+        self.assertEqual(payload["items"][0]["blocks"],
+                         [{"kind": "paragraph", "text": "模型理由（非原文证据）：" + rationale}])
+        self.assertNotIn("局部预算已用完", str(payload["items"][1]["blocks"]))
+        self.assertIn("来源或对应关系待复核", str(payload["items"][1]["blocks"]))
+        self.assertIn("CU局部复读说明", before)
         for side in ("old", "new"):
             pane = payload["panes"][side]
             self.assertEqual(pane["page"], 1)
@@ -123,7 +128,8 @@ class PdfExportBrowserTests(unittest.TestCase):
         self.assertIn("G008", [i["id"] for i in payload["items"]])
         self.assertNotIn("G003", [i["id"] for i in payload["items"]])
         table = next(item for item in payload["items"] if item["id"] == "D001")
-        self.assertTrue(any(block["kind"] == "table" for block in table["blocks"]))
+        self.assertEqual(len(table["blocks"]), 1)
+        self.assertEqual(table["blocks"][0]["kind"], "paragraph")
         self.assertIn("OLD-PART", str(table["blocks"]))
         self.page.locator("#channel-filter").select_option("model")
         self.page.locator("#review-filter").select_option("formatting")
@@ -131,6 +137,29 @@ class PdfExportBrowserTests(unittest.TestCase):
         self.assertEqual(payload["items"], [])
         self.assertTrue(all(p["rects"] == [] and p["labels"] == [] for p in payload["panes"].values()))
         self.assertEqual(self.compare_requests, 1)
+
+    def test_visual_summary_uses_specific_feature_and_keeps_unresolved_status(self):
+        feature = model.visual_item("M003", review=True)
+        feature["model_comparison"]["rationale"] = "整个视图的泛化理由不应代替具体特征"
+        feature["visual_comparison"]["description"] = "合成左侧填充未见，仍需核对位置。"
+        self.result["items"].append(feature)
+        self.compare()
+        self.page.locator("#channel-filter").select_option("model")
+        payload = self.download()
+        entry = next(item for item in payload["items"] if item["id"] == "M003")
+        self.assertEqual(entry["blocks"], [{"kind": "paragraph",
+                         "text": "模型理由（非原文证据）：合成左侧填充未见，仍需核对位置。（定位未解决，待复核）"}])
+        self.assertNotIn("泛化理由", str(entry))
+        self.assertEqual(self.compare_requests, 1)
+
+    def test_missing_reason_is_explicit_not_fabricated_from_raw_json(self):
+        row = next(item for item in self.result["items"] if item["id"] == "M001")
+        row["model_comparison"].pop("rationale")
+        self.compare()
+        self.page.locator("#channel-filter").select_option("model")
+        entry = self.download()["items"][0]
+        self.assertIn("未提供模型理由，需人工复核", entry["blocks"][0]["text"])
+        self.assertEqual(len(entry["blocks"]), 1)
 
     def test_service_error_or_invalid_pdf_does_not_clear_comparison(self):
         self.compare()

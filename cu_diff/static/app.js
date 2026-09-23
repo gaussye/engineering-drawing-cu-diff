@@ -1179,56 +1179,41 @@
       if (meta) content.append(el("p", "", `${sideName[side]}：${meta.cache_hit ? "缓存命中" : "本轮提取"}\n上传原件 SHA256：${result.documents?.[side]?.sha256 || "未提供"}\nCU 分析文件 SHA256：${meta.document_sha256 || "未提供"}\n坐标依据：${meta.coordinate_basis || "未提供"}\n${meta.cache_hit ? "历史分析用量（非本次新增计费）" : "分析用量"}：${text(meta.usage) || "未提供"}`));
     }
   }
-  function exportDetailBlocks(root) {
-    const blocks = [];
-    const walk = (node) => {
-      if (node.nodeType === Node.TEXT_NODE) {
-        if (node.textContent.trim()) blocks.push({ kind: "paragraph", text: node.textContent });
-        return;
-      }
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
-      if (node.tagName === "TABLE") {
-        blocks.push({ kind: "table", rows: Array.from(node.rows, (row) => Array.from(row.cells, (cell) => cell.textContent)) });
-      } else if (node.tagName === "DL") {
-        blocks.push({ kind: "table", rows: Array.from(node.children, (row) => [
-          row.querySelector("dt")?.textContent || "", row.querySelector("dd")?.textContent || ""
-        ]) });
-      } else if (["H1", "H2", "H3", "H4", "SUMMARY", "P", "PRE", "LI"].includes(node.tagName)) {
-        blocks.push({ kind: ["H1", "H2", "H3", "H4", "SUMMARY"].includes(node.tagName) ? "heading"
-          : node.tagName === "PRE" ? "code" : "paragraph", text: node.textContent });
-      } else {
-        node.childNodes.forEach(walk);
-      }
-    };
-    root.childNodes.forEach(walk);
-    return blocks;
+  function exportBrief(item) {
+    const sentence = (value) => typeof value === "string" ? value.trim() : "";
+    if (item.channel === "model") {
+      const reason = (modelVisualItem(item) ? sentence(item.visual_comparison?.description) : "") ||
+        sentence(item.model_comparison?.rationale) || "未提供模型理由，需人工复核。";
+      const unresolved = item.change === "model_visual_review" ? "（定位未解决，待复核）"
+        : item.change === "model_review" ? "（来源或对应关系待复核）" : "";
+      return `模型理由（非原文证据）：${reason}${unresolved}`;
+    }
+    const raw = (source) => typeof source?.raw_text === "string"
+      ? source.raw_text || "（提取为空）" : "未提取到证据（不代表缺失）";
+    if (item.cell_comparison?.status === "complete") {
+      const changed = item.cell_comparison.fields.filter((field) => ["modified", "relocated"].includes(field.change));
+      if (changed.length) return "单元格差异（待复核）：" + changed.map(
+        (field) => `${field.label || field.key}：${raw(field.old)} → ${raw(field.new)}`).join("；");
+    }
+    if (annotationReview(item)) {
+      const counts = item.annotation_comparison.counts_outside_bom;
+      return `图外标注次数：${counts.old} → ${counts.new}；BOM文字未变，可能为OCR遗漏，需复核。`;
+    }
+    if (item.channel === "graphics") {
+      return `检测说明（非OCR，待复核）：${changes[item.change] || item.change}；旧侧：${raw(item.old)}；新侧：${raw(item.new)}。`;
+    }
+    if (["interpretation_only", "formatting_only", "unchanged", "reconciled"].includes(item.change)) {
+      return `${changes[item.change]}；不计确认内容变更，完整说明见网页。`;
+    }
+    return `${changes[item.change] || item.change}（待复核）：旧版：${raw(item.old)}；新版：${raw(item.new)}。`;
   }
   function exportSnapshot() {
     const itemsById = new Map(visibleItems().map((item) => [item.id, item]));
     const items = Array.from(document.querySelectorAll("#results-list .result-item"), (row) => {
       const item = itemsById.get(row.dataset.id);
       if (!item) throw new Error("显示结果已变化，请重新导出。");
-      const content = el("div"), meta = el("span");
-      renderDetails(item, content, meta);
-      const blocks = exportDetailBlocks(content);
-      const rows = [["侧别", "页码", "定位类型（归一化0–1，非工程尺寸）", "x", "y", "宽", "高"]];
-      for (const side of sides) {
-        const observed = locations(item, side), projected = counterpartLocations(item, side);
-        for (const [kind, positions] of [["显示证据框", observed], ["对侧映射位置，非本侧残差", projected]]) {
-          for (const loc of positions) {
-            const box = bounds(loc);
-            rows.push([sideName[side], String(loc.page), kind,
-              ...["x", "y", "width", "height"].map((key) => box[key].toFixed(6))]);
-          }
-        }
-        if (!observed.length && !projected.length) {
-          const pages = [...new Set(navigationLocations(item, side).map((loc) => loc.page))];
-          blocks.push({ kind: "paragraph", text: `${sideName[side]}没有可显示的证据框；${pages.length
-            ? `仅有第 ${pages.join("、")} 页导航上下文，不作为变化框。` : "没有可靠定位，不推测缺失位置。"}` });
-        }
-      }
-      if (rows.length > 1) blocks.push({ kind: "heading", text: "来源页与定位（其它页位置不在当前整页总览中绘制）" }, { kind: "table", rows });
-      return { id: item.id, title: item.key || item.region || "未命名条目", meta: meta.textContent, blocks };
+      return { id: item.id, title: item.key || item.region || "未命名条目", meta: "",
+        blocks: [{ kind: "paragraph", text: exportBrief(item) }] };
     });
     const canvas = document.createElement("canvas");
     canvas.width = canvas.height = 1;
@@ -1261,7 +1246,7 @@
       return [side, { document_id: state[side].document.id, page: state[side].page,
         width: image.width, height: image.height, rects, labels }];
     }));
-    return { revision: state.revision, job_id: state.jobId, panes, items, filters: {
+    return { revision: state.revision, job_id: state.jobId, detail_mode: "concise", panes, items, filters: {
       channel: $("channel-filter").selectedOptions[0].textContent, review: $("review-filter").selectedOptions[0].textContent,
       interpretation: $("show-interpretation").checked, translation: $("show-translation").checked, scaling: $("show-scaling").checked
     } };

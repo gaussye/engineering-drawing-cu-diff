@@ -107,6 +107,50 @@ class PdfExportTests(unittest.TestCase):
             # No selected rectangles at all in the new panel.
             self.assertFalse([d for d in rects + yellow if d["rect"].x0 > 600])
 
+    def test_concise_candidates_share_pages_and_bookmark_exact_positions(self):
+        self.snapshot["detail_mode"] = "concise"
+        self.snapshot["items"] = [{
+            "id": f"M{i:03}", "title": f"合成标注{i}", "meta": "",
+            "blocks": [{"kind": "paragraph", "text": "模型理由（非原文证据）：合成旧值改为新值；其它标注不变。"}]
+        } for i in range(1, 21)]
+        self.result["items"] = [{"id": item["id"]} for item in self.snapshot["items"]]
+        with fitz.open(stream=self.render(), filetype="pdf") as pdf:
+            self.assertLessEqual(len(pdf), 5, "Brief candidates must not each consume a whole page")
+            output = "".join(page.get_text() for page in pdf)
+            for item in self.snapshot["items"]:
+                self.assertEqual(output.count("候选编号："+item["id"]), 1)
+                self.assertIn(item["title"], output)
+            self.assertEqual(output.count("模型理由（非原文证据）"), 20)
+            toc = {row[1]: row for row in pdf.get_toc(simple=False)}
+            self.assertEqual(toc["M001"][2], toc["M002"][2])
+            self.assertLess(toc["M001"][3]["to"].y, toc["M002"][3]["to"].y)
+            self.assertIn("差异简述", output)
+            self.assertNotIn("启发式", output)
+
+    def test_concise_long_reason_continues_without_losing_text(self):
+        self.snapshot["detail_mode"] = "concise"
+        self.snapshot["items"] = [self.snapshot["items"][0]]
+        self.snapshot["items"][0].update(meta="", blocks=[
+            {"kind": "paragraph", "text": "模型理由（非原文证据）：" + "长理由必须完整保留。" * 900 + "理由终点"}])
+        with fitz.open(stream=self.render(), filetype="pdf") as pdf:
+            output = "".join(page.get_text() for page in pdf)
+            self.assertIn("理由终点", output)
+            self.assertGreater(len(pdf), 3)
+            self.assertIn("候选编号：M001", pdf[2].get_text())
+
+    def test_concise_long_title_retains_tail_body_and_bookmark(self):
+        self.snapshot["detail_mode"] = "concise"
+        self.snapshot["items"] = [self.snapshot["items"][0]]
+        self.snapshot["items"][0].update(
+            title="合成长标题" * 600 + "标题终点", meta="",
+            blocks=[{"kind": "paragraph", "text": "模型理由（非原文证据）：正文仍完整。"}])
+        with fitz.open(stream=self.render(), filetype="pdf") as pdf:
+            output = "".join(page.get_text() for page in pdf).replace("\n", "")
+            self.assertIn("标题终点", output)
+            self.assertIn("正文仍完整", output)
+            bookmark = next(row for row in pdf.get_toc() if row[1] == "M001")
+            self.assertIn("候选编号：M001", pdf[bookmark[2] - 1].get_text())
+
     def test_portrait_counterpart_mapping_and_dash(self):
         rect = marker(kind="counterpart", x=100, y=200, width=300, height=100)
         rect["stroke"]["dash"] = [3, 5]
@@ -161,9 +205,13 @@ class PdfExportTests(unittest.TestCase):
         self.snapshot["items"] = []
         for pane in self.snapshot["panes"].values():
             pane["rects"], pane["labels"] = [], []
-        with fitz.open(stream=self.render(), filetype="pdf") as pdf:
-            self.assertEqual(len(pdf), 2)
-            self.assertIn("当前筛选无候选项；这不表示图纸没有差异", pdf[0].get_text())
+        for mode in ("full", "concise"):
+            with self.subTest(mode=mode):
+                self.snapshot["detail_mode"] = mode
+                with fitz.open(stream=self.render(), filetype="pdf") as pdf:
+                    self.assertEqual(len(pdf), 2)
+                    self.assertIn("当前筛选无候选项；这不表示图纸没有差异", pdf[0].get_text())
+                    self.assertIn("当前筛选无候选项；这不表示图纸没有差异", pdf[1].get_text())
 
     def test_annotations_widgets_and_rotation_normalized_source(self):
         path = self.documents["old"]["path"]
@@ -217,6 +265,7 @@ class PdfExportTests(unittest.TestCase):
             lambda s: s["panes"]["old"]["rects"][0]["fill"].update(opacity=-.1),
             lambda s: s["panes"]["old"]["labels"][0].update(font_size=float("inf")),
             lambda s: s["filters"].update(translation="yes"),
+            lambda s: s.update(detail_mode="unknown"),
             lambda s: s["items"][0]["blocks"].append({"kind": "image", "text": "http://invalid"}),
             lambda s: s["items"][0]["blocks"].append({"kind": "table", "rows": [[]]}),
         ]

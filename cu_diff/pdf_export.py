@@ -81,7 +81,12 @@ def _validate(snapshot, documents, result):
         _fail("快照必须是有限、有效的 JSON 数据。")
     if len(encoded) > MAX_PAYLOAD_BYTES:
         _fail(f"快照超过 {MAX_PAYLOAD_BYTES // 1024 // 1024} MB 限制，请缩小筛选范围。")
-    _object(snapshot, "revision job_id filters panes items", "快照")
+    keys = "revision job_id filters panes items"
+    if isinstance(snapshot, dict) and "detail_mode" in snapshot:
+        keys += " detail_mode"
+    _object(snapshot, keys, "快照")
+    if snapshot.get("detail_mode", "full") not in ("full", "concise"):
+        _fail("不支持的详情模式。")
     _integer(snapshot["revision"], "版本", high=2**53 - 1)
     _string(snapshot["job_id"], "任务编号", 256, True)
     filters = snapshot["filters"]
@@ -283,6 +288,18 @@ class _Report:
         if identifier is not None:
             self.toc.append([1, identifier, len(self.t.pdf)])
 
+    def compact_item(self, identifier, title):
+        self.identifier = None
+        heading = f"候选编号：{identifier}  {title}"
+        required = len(self.t.wrap(heading, 523, 12)) * 18.6 + 38
+        if self.page is None or self.y + required > 792:
+            self._next()
+        self.identifier = identifier
+        self.toc.append([1, identifier, len(self.t.pdf),
+                         {"kind": fitz.LINK_GOTO, "page": len(self.t.pdf) - 1,
+                          "to": fitz.Point(36, self.y - 14)}])
+        self.paragraph(heading, 12, ACCENT, gap=6)
+
     def _next(self):
         self.page = self.t.new_page()
         self.t.text(self.page, 36, 31, "图纸对比 / 候选证据详情", 10, ACCENT)
@@ -380,31 +397,46 @@ def render_comparison_pdf(snapshot: dict, documents: dict, result: dict) -> byte
             t.text(overview, 32, 789, "本快照仅保留已有候选证据，不执行新的分析，也不保证覆盖全部变化。标记以捕获的颜色、虚线与透明度为准。", 10, MUTED)
             report = _Report(t)
             report.start()
-            report.toc.append([1, "快照范围与来源", 2])
-            report.paragraph("快照范围与来源", 19, ACCENT, gap=15)
-            report.paragraph("这是当前筛选结果的已有候选证据快照，不执行新的分析，不保证发现或覆盖全部变化。"
-                             "总览展示当前选定的完整旧图和新图页；不导出浏览器缩放、滚动裁切或其他未选定图纸页。")
-            report.paragraph(f"任务：{snapshot['job_id']}    版本：{snapshot['revision']}")
+            concise = snapshot.get("detail_mode") == "concise"
+            section_title = "差异简述" if concise else "快照范围与来源"
+            report.toc.append([1, section_title, 2])
+            report.paragraph(section_title, 19, ACCENT, gap=15)
             filters = snapshot["filters"]
-            report.paragraph(f"筛选 / 通道：{filters['channel']}；复核：{filters['review']}")
-            report.paragraph("显示开关 / " + "；".join(
-                f"{name}：{'开' if filters[key] else '关'}"
-                for key, name in (("interpretation", "解释"), ("translation", "翻译"), ("scaling", "缩放差异"))))
-            for side, name in (("old", "旧图（左）"), ("new", "新图（右）")):
-                doc, pane = documents[side], snapshot["panes"][side]
-                report.paragraph(name, 13, ACCENT)
-                report.paragraph(f"文件名：{doc['name']}\nSHA-256：{doc['sha256']}\n"
-                                 f"选定页：{pane['page']} / 总页数：{doc['page_count']}")
-            report.paragraph("图例与证据边界", 13, ACCENT)
-            report.paragraph("红色为已观察差异；红色虚线为投影对侧位置，不是实测变化；黄色为待复核区域。"
-                             "具体线宽、颜色、透明度及虚线采用当前页面捕获的样式。空白对侧没有标记时，不补画推测区域。")
-            report.paragraph(f"当前筛选候选数量：{len(snapshot['items'])}", 12)
+            if concise:
+                for side, name in (("old", "旧图"), ("new", "新图")):
+                    report.paragraph(f"{name}：{documents[side]['name']}（第 {snapshot['panes'][side]['page']} 页）",
+                                     9, MUTED, gap=4)
+                report.paragraph(f"筛选：{filters['channel']} / {filters['review']}；共 {len(snapshot['items'])} 项。",
+                                 9, MUTED, gap=6)
+                report.paragraph("以下均为待复核候选；模型理由非原文证据，图形变化不确认实体部件增删。"
+                                 "总览仅显示当前所选页；完整来源与定位细节见网页。", 9, MUTED, gap=16)
+            else:
+                report.paragraph("这是当前筛选结果的已有候选证据快照，不执行新的分析，不保证发现或覆盖全部变化。"
+                                 "总览展示当前选定的完整旧图和新图页；不导出浏览器缩放、滚动裁切或其他未选定图纸页。")
+                report.paragraph(f"任务：{snapshot['job_id']}    版本：{snapshot['revision']}")
+                report.paragraph(f"筛选 / 通道：{filters['channel']}；复核：{filters['review']}")
+                report.paragraph("显示开关 / " + "；".join(
+                    f"{name}：{'开' if filters[key] else '关'}"
+                    for key, name in (("interpretation", "解释"), ("translation", "平移"), ("scaling", "缩放差异"))))
+                for side, name in (("old", "旧图（左）"), ("new", "新图（右）")):
+                    doc, pane = documents[side], snapshot["panes"][side]
+                    report.paragraph(name, 13, ACCENT)
+                    report.paragraph(f"文件名：{doc['name']}\nSHA-256：{doc['sha256']}\n"
+                                     f"选定页：{pane['page']} / 总页数：{doc['page_count']}")
+                report.paragraph("图例与证据边界", 13, ACCENT)
+                report.paragraph("红色为已观察差异；红色虚线为投影对侧位置，不是实测变化；黄色为待复核区域。"
+                                 "具体线宽、颜色、透明度及虚线采用当前页面捕获的样式。空白对侧没有标记时，不补画推测区域。")
+                report.paragraph(f"当前筛选候选数量：{len(snapshot['items'])}", 12)
             if not snapshot["items"]:
                 report.paragraph("当前筛选无候选项；这不表示图纸没有差异。")
             for item in snapshot["items"]:
-                report.start(item["id"])
-                report.paragraph(item["title"], 16, ACCENT, gap=12)
-                report.paragraph(item["meta"], 9, MUTED, gap=14)
+                if concise:
+                    report.compact_item(item["id"], item["title"])
+                else:
+                    report.start(item["id"])
+                    report.paragraph(item["title"], 16, ACCENT, gap=12)
+                if item["meta"]:
+                    report.paragraph(item["meta"], 9, MUTED, gap=14)
                 for block in item["blocks"]:
                     if block["kind"] == "table":
                         report.table(block["rows"])
@@ -412,6 +444,13 @@ def render_comparison_pdf(snapshot: dict, documents: dict, result: dict) -> byte
                         heading, code = block["kind"] == "heading", block["kind"] == "code"
                         report.paragraph(block["text"], 12 if heading else 10,
                                          ACCENT if heading else INK, indent=7 if code else 0, shaded=code)
+                if concise:
+                    report.y += 8
+            if concise:
+                report.identifier = None
+                report.paragraph("来源标识 / " + "；".join(
+                    f"{name} SHA-256：{documents[side]['sha256']}" for side, name in (("old", "旧图"), ("new", "新图"))),
+                    7, MUTED, gap=4)
             for index, page in enumerate(pdf):
                 page.draw_line((32, 810), (page.rect.width - 32, 810), color=RULE, width=.5)
                 t.text(page, 32, 827, f"证据快照 · 第 {index + 1} / {len(pdf)} 页", 8, MUTED)
