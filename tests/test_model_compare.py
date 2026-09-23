@@ -350,6 +350,8 @@ class ModelComparisonTests(unittest.TestCase):
         self.assertEqual(item["old"]["locations"], [])
         self.assertEqual(item["new"]["locations"], [])
         self.assertEqual(item["old"]["raw_text"], "")
+        self.assertEqual(item["visual_comparison"]["measurement_status"], "unmeasured")
+        self.assertEqual(item["visual_comparison"]["changed_pixels"], {"old": None, "new": None})
         self.assertEqual(len(self.client.calls), 2)
 
 

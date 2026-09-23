@@ -7,6 +7,7 @@ from .graphics import _libraries, _transform_residual
 
 
 VERSION = "model-nontext-v1"
+LOCALIZER_VERSION = "subfeature-neighborhood-v2"
 SIDES = ("old", "new")
 
 
@@ -243,6 +244,73 @@ def _registration(ink, excluded, radius):
                        "distributed_contour_support": spatial_support}
 
 
+def _subfeature_registration(ink, excluded, feature_masks, limits, radius, whole):
+    """Retry bounded neighborhoods without fitting changed pixels or relaxing validation."""
+    _, np = _libraries()
+    features = {s: _bounds(feature_masks[s]) for s in SIDES}
+    attempts = []
+    if not all(features.values()):
+        return None, dict(whole, scope="whole_view", fallback_attempts=attempts)
+    for padding in (.2, .4, .7):
+        windows = {}
+        for s in SIDES:
+            x0, y0, x1, y1 = features[s]
+            margin = max(4*radius, round(max(x1-x0, y1-y0)*padding))
+            height, width = limits[s]
+            windows[s] = [max(0, x0-margin), max(0, y0-margin),
+                          min(width, x1+margin), min(height, y1+margin)]
+        h = max(p[3]-p[1] for p in windows.values())
+        w = max(p[2]-p[0] for p in windows.values())
+        local_ink, local_excluded = {}, {}
+        sufficient = True
+        for s in SIDES:
+            x0, y0, x1, y1 = windows[s]
+            local_ink[s] = np.zeros((h, w), np.uint8)
+            local_excluded[s] = np.ones((h, w), np.uint8)
+            local_ink[s][:y1-y0, :x1-x0] = ink[s][y0:y1, x0:x1]
+            local_excluded[s][:y1-y0, :x1-x0] = excluded[s][y0:y1, x0:x1]
+            bounds = _bounds(local_ink[s] & (1-local_excluded[s]))
+            fx0, fy0, fx1, fy1 = features[s]
+            if (not bounds or bounds[2]-bounds[0] < max(4*radius, (fx1-fx0)*.5)
+                    or bounds[3]-bounds[1] < max(4*radius, (fy1-fy0)*.5)):
+                sufficient = False
+        if not sufficient:
+            attempts.append({"windows": windows, "accepted": False,
+                             "reason": "子特征周边公共锚点的二维分布不足。"})
+            continue
+        _, local = _registration(local_ink, local_excluded, radius)
+        attempt = {"windows": windows, **local}
+        attempts.append(attempt)
+        if not local["accepted"]:
+            continue
+        factor = local["scale_ratio"]
+        dx = windows["new"][0]+local["dx_pixels"]-factor*windows["old"][0]
+        dy = windows["new"][1]+local["dy_pixels"]-factor*windows["old"][1]
+        old = features["old"]
+        projected = [old[0]*factor+dx, old[1]*factor+dy, old[2]*factor+dx, old[3]*factor+dy]
+        new = features["new"]
+        intersection = max(0, min(projected[2], new[2])-max(projected[0], new[0])) * max(
+            0, min(projected[3], new[3])-max(projected[1], new[1]))
+        area = max((projected[2]-projected[0])*(projected[3]-projected[1]),
+                   (new[2]-new[0])*(new[3]-new[1]))
+        overlap = intersection/max(1, area)
+        attempt["feature_overlap"] = overlap
+        if overlap < .5:
+            attempt.update(accepted=False, reason="局部配准与子特征对应搜索范围不一致，拒绝跳到相邻图形。")
+            continue
+        alignment = {
+            **local, "scope": "subfeature_neighborhood", "dx_pixels": dx, "dy_pixels": dy,
+            "local_transform": {k: local[k] for k in ("scale_ratio", "dx_pixels", "dy_pixels")},
+            "neighborhood_pixels": windows, "feature_overlap": overlap,
+            "whole_view_alignment": whole, "fallback_attempts": attempts,
+            "evidence_tolerance_pixels": radius+1,
+        }
+        residuals = _transform_residual(ink["old"], ink["new"], dx, dy, factor, radius+1)[:2]
+        return residuals, alignment
+    return None, dict(whole, scope="whole_view", fallback_attempts=attempts,
+                      reason="整体及子特征周边均未通过定位核验；模型已发现疑点，但位置尚未核实。")
+
+
 def localize(result, crops, words, pair):
     """Return separate visual records; model rectangles alone never become evidence frames."""
     cv, np = _libraries()
@@ -288,6 +356,7 @@ def localize(result, crops, words, pair):
                 excluded[s] |= mask
         radius = max(1, math.ceil(min(crops[s][2]["actual_dpi"] for s in SIDES)/72*.3))
         residuals, alignment = _registration(ink, excluded, radius)
+        alignment["scope"] = "whole_view"
         if alignment["accepted"]:
             # Require support beyond the registration tolerance to reject thin edge jitter.
             residuals = _transform_residual(
@@ -295,17 +364,23 @@ def localize(result, crops, words, pair):
                 alignment["scale_ratio"], radius+1)[:2]
             alignment["evidence_tolerance_pixels"] = radius+1
         for index, feature in enumerate(view["features"]):
+            feature_residuals, feature_alignment = residuals, alignment
+            if not alignment["accepted"] and feature["assessment"] == "changed":
+                feature_residuals, feature_alignment = _subfeature_registration(
+                    ink, excluded, {s: feature_masks[s][index] for s in SIDES},
+                    {s: (pixels[s][3]-pixels[s][1], pixels[s][2]-pixels[s][0]) for s in SIDES},
+                    radius, alignment)
             issues, locations, counts = list(result["limitations"]), {}, {}
-            if not alignment["accepted"]:
-                issues.append(alignment["reason"])
+            if not feature_alignment["accepted"]:
+                issues.append(feature_alignment["reason"])
             if feature["assessment"] != "changed":
                 issues.append("模型对子特征仍不确定，未确认图形变化位置。")
-            for s, residual in zip(SIDES, residuals or (None, None)):
-                locations[s], counts[s] = [], 0
+            for s, residual in zip(SIDES, feature_residuals or (None, None)):
+                locations[s], counts[s] = [], None
                 if residual is None or feature["assessment"] != "changed":
                     continue
                 other = "new" if s == "old" else "old"
-                factor, dx, dy = (alignment[k] for k in ("scale_ratio", "dx_pixels", "dy_pixels"))
+                factor, dx, dy = (feature_alignment[k] for k in ("scale_ratio", "dx_pixels", "dy_pixels"))
                 transform = (np.float32([[1/factor, 0, -dx/factor], [0, 1/factor, -dy/factor]])
                              if s == "old" else np.float32([[factor, 0, dx], [0, factor, dy]]))
                 text = text_crops[s] | cv.warpAffine(text_crops[other], transform, (w, h), flags=cv.INTER_NEAREST)
@@ -350,9 +425,11 @@ def localize(result, crops, words, pair):
                                      "pair_label": pair["label"], "rationale": feature["rationale"], "issues": issues,
                                      "highlight_scope": "nontext_residual_only"},
                 "visual_comparison": {"version": VERSION, "status": "localized" if localized else "unresolved",
+                                      "localizer_version": LOCALIZER_VERSION,
                                       "kind": feature["kind"], "description": "图纸中的填充与轮廓变化候选",
                                       "old_description": feature["old_description"], "new_description": feature["new_description"],
-                                      "alignment": alignment, "changed_pixels": counts,
+                                      "alignment": feature_alignment, "changed_pixels": counts,
+                                      "measurement_status": "measured" if all(v is not None for v in counts.values()) else "unmeasured",
                                       "view_proposals": boxes, "limitations": issues+LIMITATIONS},
             })
     return records

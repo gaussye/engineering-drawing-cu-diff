@@ -355,6 +355,7 @@
       item.model_comparison?.stage === "visual" && item.model_comparison?.status === "visual_grounded" &&
       item.model_comparison?.highlight_scope === "nontext_residual_only" &&
       item.visual_comparison?.status === "localized" &&
+      item.visual_comparison?.measurement_status !== "unmeasured" &&
       sides.every((side) => item[side]?.raw_text === "" &&
         Array.isArray(item[side]?.source) && item[side].source.some((source) => source?.kind === "pdf_raster"));
   }
@@ -661,18 +662,26 @@
     const visualModel = modelVisualItem(item);
     if (visualModel) {
       const comparison = item.model_comparison || {}, visual = item.visual_comparison || {};
+      const unmeasured = visual.measurement_status === "unmeasured" ||
+        visual.alignment?.accepted === false ||
+        (visual.status === "unresolved" && visual.alignment?.accepted !== true && visual.measurement_status !== "measured");
       $("detail-meta").textContent = `${item.id} · ${changes[item.change] || item.change} · 模型观察 + 本地PDF栅格核验（非OCR，不确认实体部件增删）`;
       const section = el("section", "model-detail model-visual-detail");
       section.append(el("h3", "", "图纸填充／轮廓变化候选"),
         el("p", "", "模型生成描述（非OCR）仅用于复核；定位依据是本地PDF栅格非文字残差，不是CU变化词框，不推断实体部件删除。"),
         el("p", "", modelVisualDifference(item)
           ? "已局部定位：红框仅表示实际测量的非文字残差；未变尺寸标注与搜索区域不高亮，仍需原图确认。"
-          : "定位未解决：模型观察尚无充分本地非文字定位支持；不显示确认变更红框。"),
+          : "定位未解决：模型已发现疑点，但位置尚未核实；不表示没有变化，也不显示确认变更红框。"),
         el("p", "", `模型配对标签（非原文证据）：${text(comparison.pair_label) || "未提供"}`),
         el("p", "", `模型理由（非原文证据）：${text(comparison.rationale) || "未提供"}`),
         el("p", "visual-description", `模型观察（非OCR）：${text(visual.description) || "未提供"}`),
         el("p", "", `类型：${text(visual.kind) || "未提供"} · 状态：${text(visual.status) || "未提供"}`),
-        el("p", "", `实际残差像素（旧 / 新）：${visual.changed_pixels?.old ?? "未提供"} / ${visual.changed_pixels?.new ?? "未提供"}`),
+        el("p", "visual-measurement", unmeasured
+          ? "残差像素：未测量（定位未通过或尚未执行），不是零变化。"
+          : `实际残差像素（旧 / 新）：${visual.changed_pixels?.old ?? "未提供"} / ${visual.changed_pixels?.new ?? "未提供"}`),
+        el("p", "visual-alignment-scope", visual.alignment?.scope === "subfeature_neighborhood"
+          ? "定位方式：整体配准未通过，已独立核验子特征周边公共轮廓；不代表整幅视图一致。"
+          : "定位方式：视图级核验；详细状态与未解决原因见下方。"),
         el("p", "review-reasons", `定位限制：${text(visual.limitations) || "未提供"}；来源 / 预算限制：${text(comparison.issues) || "未提供"}`));
       const provenance = el("details", "visual-provenance");
       provenance.append(el("summary", "", "本地定位依据、对齐与可追溯性（非CU词坐标）"),

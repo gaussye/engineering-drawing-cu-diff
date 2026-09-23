@@ -41,6 +41,12 @@ class ModelReportTests(unittest.TestCase):
         item["model_comparison"]["status"] = "review_only"
         item["visual_comparison"]["status"] = "unresolved"
         self.assertIn("定位未解决", self.render([item]))
+        self.assertIn("未测量", self.render([item]))
+        self.assertIn("不是零变化", self.render([item]))
+        item["visual_comparison"]["alignment"].update(accepted=True, scope="subfeature_neighborhood")
+        item["visual_comparison"]["measurement_status"] = "measured"
+        self.assertIn("已独立核验子特征周边公共轮廓", self.render([item]))
+        self.assertIn("不代表整幅视图一致", self.render([item]))
 
     def test_visual_coverage_budget_usage_and_minimal_deferred_item(self):
         report = self.render([{

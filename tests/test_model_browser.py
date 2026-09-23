@@ -276,6 +276,33 @@ class ModelBrowserTests(unittest.TestCase):
         expect(self.page.locator("#old-evidence-note")).to_contain_text("不绘制变化框")
         self.assert_geometry("new", "V001", row["new"]["locations"][0])
 
+    def test_subfeature_fallback_and_unmeasured_are_not_displayed_as_zero_changes(self):
+        row = visual_item()
+        row["visual_comparison"].update(measurement_status="measured")
+        row["visual_comparison"]["alignment"].update(
+            scope="subfeature_neighborhood", whole_view_alignment={"accepted": False})
+        self.result["items"] = [row]
+        self.compare()
+        self.select("V001")
+        expect(self.page.locator(".visual-alignment-scope")).to_contain_text("已独立核验子特征周边公共轮廓")
+        expect(self.page.locator(".visual-alignment-scope")).to_contain_text("不代表整幅视图一致")
+        expect(self.page.locator(".visual-measurement")).to_contain_text("24 / 0")
+        row = visual_item(review=True)
+        row["visual_comparison"].update(measurement_status="unmeasured", changed_pixels={"old": None, "new": None})
+        self.result["items"] = [row]
+        self.compare()
+        self.select("V001")
+        expect(self.page.locator(".model-visual-detail")).to_contain_text("模型已发现疑点，但位置尚未核实")
+        expect(self.page.locator(".visual-measurement")).to_contain_text("未测量")
+        expect(self.page.locator(".visual-measurement")).to_contain_text("不是零变化")
+        expect(self.page.locator("rect.evidence-box")).to_have_count(0)
+        row["visual_comparison"].pop("measurement_status")
+        row["visual_comparison"]["changed_pixels"] = {"old": 0, "new": 0}
+        self.compare()
+        self.select("V001")
+        expect(self.page.locator(".visual-measurement")).to_contain_text("未测量")
+        expect(self.page.locator(".visual-measurement")).not_to_contain_text("0 / 0")
+
     def test_visual_navigation_uses_model_context_only_when_search_context_is_missing(self):
         row = visual_item(review=True)
         for side in ("old", "new"):

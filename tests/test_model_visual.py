@@ -1,9 +1,11 @@
 import unittest
+from unittest.mock import patch
 
 import pymupdf
 
 from cu_diff.client import CUError, digest
-from cu_diff.model_visual import localize
+from cu_diff.model_visual import localize, _subfeature_registration
+from cu_diff.graphics import _libraries
 
 
 def box(x0, y0, x1, y1):
@@ -44,6 +46,38 @@ def proposal():
             "rationale": "Common outer rings retained",
             "old_box": box(x0, 60, x1, 114), "new_box": box(x0, 60, x1, 114),
         } for side, x0, x1 in (("Left", 61, 83), ("Right", 115, 138))],
+    }], "limitations": []}
+
+
+def strip_fixture(*, fill, short_body):
+    with pymupdf.open() as pdf:
+        page = pdf.new_page(width=420, height=220)
+        page.draw_rect(pymupdf.Rect(90 if short_body else 20, 40, 230, 180), width=.7)
+        for y in (70, 150):
+            page.draw_line((230, y), (380, y), width=.7)
+        if fill:
+            for y in range(44, 174, 3):
+                page.draw_line((232, y+3), (240, y), width=.6)
+        data = page.get_pixmap(matrix=pymupdf.Matrix(3, 3), alpha=False).tobytes("png")
+    mapping = {"page": 1, "rect": [0, 0, 420, 220], "width": 420, "height": 220,
+               "page_width": 420, "page_height": 220, "actual_dpi": 216,
+               "source_sha256": digest(data)}
+    return None, data, mapping
+
+
+def strip_proposal():
+    def grid(rect):
+        return dict(zip(("x0", "y0", "x1", "y1"),
+                        [round(v/size*1000) for v, size in zip(rect, (420, 220, 420, 220))]))
+    return {"views": [{
+        "label": "Synthetic side view",
+        "old_box": grid((10, 20, 395, 195)), "new_box": grid((10, 20, 395, 195)),
+        "features": [{
+            "label": "Synthetic narrow fill", "kind": "fill", "assessment": "changed",
+            "old_description": "Hatching", "new_description": "No hatching observed",
+            "rationale": "Local common body edge and two leader origins",
+            "old_box": grid((231, 41, 242, 179)), "new_box": grid((231, 41, 242, 179)),
+        }],
     }], "limitations": []}
 
 
@@ -90,7 +124,10 @@ class ModelVisualTests(unittest.TestCase):
     def test_model_uncertainty_does_not_create_change_frames(self):
         result = proposal()
         result["views"][0]["features"][0]["assessment"] = "uncertain"
-        self.assertEqual(self.run_local(result)[0]["old"]["locations"], [])
+        item = self.run_local(result)[0]
+        self.assertEqual(item["old"]["locations"], [])
+        self.assertEqual(item["visual_comparison"]["measurement_status"], "unmeasured")
+        self.assertEqual(item["visual_comparison"]["changed_pixels"], {"old": None, "new": None})
 
     def test_bad_bounds_wrong_containment_and_budgets_fail_explicitly(self):
         for modify in (
@@ -156,6 +193,58 @@ class ModelVisualTests(unittest.TestCase):
             self.assertEqual(item["change"], "model_visual_modified")
             self.assertEqual(item["new"]["locations"], [])
             self.assertTrue(item["visual_comparison"]["alignment"]["distributed_contour_support"])
+
+    def test_failed_whole_view_uses_only_subfeature_neighborhood_evidence(self):
+        self.crops = {"old": strip_fixture(fill=True, short_body=False),
+                      "new": strip_fixture(fill=False, short_body=True)}
+        self.words = {"old": [], "new": []}
+        item, = self.run_local(strip_proposal())
+        self.assertEqual(item["change"], "model_visual_modified")
+        alignment = item["visual_comparison"]["alignment"]
+        self.assertEqual(alignment["scope"], "subfeature_neighborhood")
+        self.assertFalse(alignment["whole_view_alignment"]["accepted"])
+        self.assertTrue(alignment["accepted"])
+        self.assertGreaterEqual(alignment["feature_overlap"], .5)
+        self.assertLessEqual(len(alignment["fallback_attempts"]), 3)
+        self.assertEqual(item["new"]["locations"], [])
+        box, = item["old"]["locations"]
+        self.assertGreaterEqual(box["x"], 231/420-.001)
+        self.assertLessEqual(box["x"]+box["width"], 242/420+.001)
+        self.assertLess(box["width"], .04)
+        self.assertEqual(item["visual_comparison"]["measurement_status"], "measured")
+
+    def test_local_retry_does_not_turn_unrelated_body_redraw_into_fill_change(self):
+        self.crops = {"old": strip_fixture(fill=False, short_body=False),
+                      "new": strip_fixture(fill=False, short_body=True)}
+        self.words = {"old": [], "new": []}
+        item, = self.run_local(strip_proposal())
+        self.assertEqual(item["change"], "model_visual_review")
+        self.assertEqual(item["old"]["locations"], [])
+        self.assertEqual(item["new"]["locations"], [])
+        self.assertEqual(item["visual_comparison"]["changed_pixels"], {"old": 0, "new": 0})
+        self.assertEqual(item["visual_comparison"]["measurement_status"], "measured")
+
+    def test_local_retry_rejects_one_dimensional_anchor_and_neighbor_jump(self):
+        _, np = _libraries()
+        ink = {s: np.zeros((120, 120), np.uint8) for s in ("old", "new")}
+        masks = {s: np.zeros((120, 120), np.uint8) for s in ink}
+        for s in ink:
+            masks[s][40:80, 50:60] = 1
+            ink[s][30, :] = 1
+        args = (ink, masks, masks, {s: (120, 120) for s in ink}, 1,
+                {"accepted": False, "reason": "Synthetic whole-view failure"})
+        residuals, alignment = _subfeature_registration(*args)
+        self.assertIsNone(residuals)
+        self.assertFalse(alignment["accepted"])
+        self.assertEqual(len(alignment["fallback_attempts"]), 3)
+        for s in ink:
+            ink[s][90, :] = 1
+        with patch("cu_diff.model_visual._registration", return_value=(None, {
+                "accepted": True, "scale_ratio": 1., "dx_pixels": 40., "dy_pixels": 0.})):
+            residuals, alignment = _subfeature_registration(*args)
+        self.assertIsNone(residuals)
+        self.assertFalse(alignment["accepted"])
+        self.assertTrue(any("相邻图形" in a.get("reason", "") for a in alignment["fallback_attempts"]))
 
 
 if __name__ == "__main__":

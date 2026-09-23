@@ -566,7 +566,8 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                 record["change"] = "model_visual_review"
                 record["model_comparison"].update(stage="visual", highlight_scope="nontext_residual_only")
                 record["visual_comparison"] = {"status": "unresolved", "description": reason,
-                                               "limitations": [reason], "changed_pixels": {"old": 0, "new": 0}}
+                                               "limitations": [reason], "measurement_status": "unmeasured",
+                                               "changed_pixels": {"old": None, "new": None}}
                 for s in SIDES:
                     if record[s]:
                         record[s].update(raw_text="", visual_description="未完成图形定位；来源仅用于上下文。")

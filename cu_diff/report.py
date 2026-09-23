@@ -110,8 +110,18 @@ def write_model_report(result: dict, path: Path) -> None:
                       "review_only / unresolved 表示定位未解决，不作确认变更红框。"])
         for item in visual_items:
             visual = item.get("visual_comparison", {})
+            alignment = visual.get("alignment", {})
+            unmeasured = (visual.get("measurement_status") == "unmeasured"
+                          or alignment.get("accepted") is False
+                          or (visual.get("status") == "unresolved" and alignment.get("accepted") is not True
+                              and visual.get("measurement_status") != "measured"))
             lines.extend(["", f"### {report_cell(item['id'])} · {report_cell(item['key'])}", "",
                           "模型观察（非OCR）：" + report_cell(visual.get("description", "未提供")), "",
+                          ("残差像素：未测量（定位未通过或尚未执行），不是零变化。" if unmeasured else
+                           "实际残差像素：" + report_cell(visual.get("changed_pixels", "未提供"))), "",
+                          ("整体配准未通过，已独立核验子特征周边公共轮廓；不代表整幅视图一致。"
+                           if alignment.get("scope") == "subfeature_neighborhood" else
+                           "视图级核验；模型已发现的疑点若定位未解决，不等于没有变化。"), "",
                           "定位限制：" + report_cell(visual.get("limitations", "未提供")), "",
                           "本地定位、对齐、来源哈希与模型提议（非CU词坐标）：", "",
                           report_cell({"model_comparison": item.get("model_comparison"),
