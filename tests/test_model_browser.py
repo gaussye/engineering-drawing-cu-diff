@@ -77,6 +77,24 @@ def presence_item(identifier="P001"):
     return row
 
 
+def semantic_text_item(identifier="D900", channel="ocr"):
+    row = {
+        "id": identifier, "channel": channel, "key": "合成参数Q", "region": "尺寸参数",
+        "change": "modified", "review_required": True, "review_reasons": ["模型对应仍需复核"],
+        "match": {"method": "llm_source_id_pairing", "certainty": "model_proposed", "score": None},
+        "semantic_pairing": {"status": "supported", "rationale": "同一区域的合成参数对应，公差仍相同"},
+        "text_comparison": {"status": "complete", "issues": [],
+                            "changed_text": {"old": ["4.50"], "new": ["5.75"]}},
+    }
+    for side, value, page, x in (("old", "4.50", 1, .3), ("new", "5.75", 2, .7)):
+        row[side] = graphics.source([graphics.location(page, x, .3, .04, .02)],
+                                    [graphics.location(page, x-.1, .3, .25, .02)],
+                                    raw_text=f"Q={value}±0.2")
+        row[side]["confidence"] = .98
+        row["text_comparison"][side] = [model_source(value, page, x)]
+    return row
+
+
 class ModelBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -154,6 +172,35 @@ class ModelBrowserTests(unittest.TestCase):
         self.page.wait_for_load_state("networkidle")
         expect(self.page.locator("#model-tag")).to_contain_text("CU：synthetic-local")
         expect(self.page.locator("#model-tag")).to_contain_text("模型对比：synthetic-next")
+
+    def test_semantic_ocr_result_has_two_sided_numeric_boxes_and_original_context(self):
+        row = semantic_text_item()
+        self.result["items"] = [row]
+        self.compare()
+        self.page.locator("#channel-filter").select_option("ocr")
+        self.select("D900")
+        for side in ("old", "new"):
+            self.assert_geometry(side, "D900", row[side]["locations"][0])
+            expect(self.page.locator(f'#{side}-stage rect[data-id="D900"]')).to_have_class("evidence-box selected")
+            expect(self.page.locator(f'.source-detail[data-side="{side}"]')).to_contain_text(row[side]["raw_text"])
+            expect(self.page.locator(f"#{side}-evidence-note")).to_contain_text("CU变化词")
+        expect(self.page.locator(".semantic-word-summary")).to_contain_text("4.50 → 5.75")
+        expect(self.page.locator(".semantic-word-summary")).not_to_contain_text("±0.2")
+        expect(self.page.locator("#detail-meta")).to_contain_text("LLM语义配对")
+        self.assertEqual(self.compare_requests, 1)
+
+    def test_semantic_word_failure_only_navigates_not_full_line_red_box(self):
+        row = semantic_text_item(channel="schema")
+        row["text_comparison"].update(status="unavailable", issues=["CU词未完整对应"])
+        row["old"]["locations"] = row["new"]["locations"] = []
+        self.result["items"] = [row]
+        self.compare()
+        self.select("D900")
+        expect(self.page.locator("rect.evidence-box")).to_have_count(0)
+        for side, number in (("old", "1"), ("new", "2")):
+            expect(self.page.locator(f"#{side}-page")).to_have_value(number)
+            expect(self.page.locator(f"#{side}-evidence-note")).to_contain_text("不画整行变化框")
+        expect(self.page.locator(".semantic-word-summary")).to_contain_text("CU词未完整对应")
 
     def test_visual_coverage_distinguishes_budget_deferred_features_and_direct_usage(self):
         attack = '<img src=x onerror="window.modelXss=1">'

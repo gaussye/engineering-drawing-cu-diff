@@ -141,6 +141,32 @@ def web_result(comparison: dict, documents: dict, metadata: dict) -> dict:
                         if not entry["locations"]:
                             errors.append("无法可靠定位变化单元格；仅保留整行原文，不将整行画成差异框")
                         entry["location_error"] = "；".join(dict.fromkeys(errors)) or None
+            if record.get("semantic_pairing"):
+                item["semantic_pairing"] = record["semantic_pairing"]
+                if not item["key"]:
+                    item["key"] = (item["old"] or item["new"] or {}).get("raw_text", "")
+            words = record.get("text_comparison")
+            if words is not None:
+                mapped_words = {role: [side(word, role) for word in words.get(role, [])]
+                                for role in ("old", "new")}
+                errors = list(words.get("issues", []))
+                errors.extend(word["location_error"] or "变化词缺少可定位来源"
+                              for entries in mapped_words.values() for word in entries
+                              if word["location_error"] or not word["locations"])
+                complete = words.get("status") == "complete" and not errors
+                item["text_comparison"] = {
+                    "status": "complete" if complete else "unavailable",
+                    "issues": errors, "changed_text": words.get("changed_text", {}),
+                    **mapped_words,
+                }
+                for role in ("old", "new"):
+                    entry = item[role]
+                    if entry:
+                        entry["context_locations"] = entry["locations"]
+                        entry["locations"] = ([loc for word in mapped_words[role] for loc in word["locations"]]
+                                              if complete else [])
+                        entry["location_error"] = (None if complete else
+                            "；".join(dict.fromkeys(errors)) or "无法可靠定位变化词；仅导航完整原文，不画整行变化框")
             items.append(item)
     return {
         "items": items, "coverage": comparison["coverage"], "warnings": comparison["warnings"],

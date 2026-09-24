@@ -45,6 +45,20 @@ def operation(items=None, lines=None, width=1000, height=1000):
 
 
 class CompareTests(unittest.TestCase):
+    def test_semantic_mode_defers_changed_geometry_matches_but_keeps_equal_text(self):
+        old = operation([item("A=12", key="old hint", region="figure", category="dimension")],
+                        [line("A=12"), line("UNCHANGED", y=30)])
+        new = operation([item("A=14", key="new hint", region="figure", category="dimension")],
+                        [line("A=14"), line("UNCHANGED", y=30)])
+        legacy = compare_documents(old, new)
+        self.assertEqual(legacy["differences"][0]["match"]["method"], "geometry_text")
+        semantic = compare_documents(old, new, semantic_pairing=True)
+        self.assertEqual([r["change"] for r in semantic["differences"]], ["unpaired_old", "unpaired_new"])
+        self.assertEqual([r["change"] for r in semantic["ocr_differences"]], ["unpaired_old", "unpaired_new"])
+        self.assertEqual(len(semantic["ocr_unchanged"]), 1)
+        with self.assertRaises(ValueError):
+            compare_documents(old, new, semantic_pairing="true")
+
     def test_bom_row_swap_pairs_components_instead_of_row_numbers(self):
         old = operation([
             item("1 BRACKET COVER 1 pcs 2.5 g SYN-A1", key="row 1"),

@@ -294,7 +294,16 @@ class Store:
                     analyzer_id=analyzer_id, analyzer=analyzer, allow_submit=self.allow_azure,
                     pdf_lock=PDF_LOCK, progress=phase)
             phase("配对BOM、字段和OCR证据")
-            comparison = compare_responses(responses["old"], responses["new"])
+            text_pairing = self.model_options["enabled"] and self.model_options["text_pairing"]
+            comparison = compare_responses(
+                responses["old"], responses["new"], semantic_pairing=text_pairing)
+            if text_pairing:
+                from .semantic_text import resolve_text_pairing
+
+                comparison = resolve_text_pairing(
+                    comparison, responses, {role: doc.analysis_path for role, doc in documents.items()},
+                    client=client, cache=self.cache, allow_submit=self.allow_azure,
+                    pdf_lock=PDF_LOCK, progress=phase)
             public_docs = {role: doc.public() for role, doc in documents.items()}
             result = web_result(comparison, public_docs, metadata)
             if semantic is not None:
@@ -455,6 +464,7 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
                         "session_ttl_hours": SESSION_TTL},
                 azure_enabled=allow_azure, model=config.get("completion_model"), graphics_enabled=True,
                 model_comparison_enabled=store.model_options["enabled"],
+                semantic_text_pairing_enabled=store.model_options["enabled"] and store.model_options["text_pairing"],
                 model_comparison_deployment=(
                     store.model_options["deployment"] or
                     config.get("model_deployments", {}).get(config.get("completion_model"))),

@@ -179,6 +179,22 @@ class PdfExportBrowserTests(unittest.TestCase):
         self.assertEqual(label["id"], "M003")
         self.assertEqual(label["text"], "M003 待核")
 
+    def test_semantic_d_export_contains_only_changed_words_and_preserves_source_frames(self):
+        row = model.semantic_text_item(channel="schema")
+        self.result["items"] = [row]
+        self.compare()
+        self.select("D900")
+        payload = self.download()
+        item, = payload["items"]
+        self.assertIn("4.50 → 5.75", item["blocks"][0]["text"])
+        self.assertIn("LLM语义对应仍需复核", item["blocks"][0]["text"])
+        self.assertNotIn("±0.2", item["blocks"][0]["text"])
+        for side in ("old", "new"):
+            frame, = payload["panes"][side]["rects"]
+            self.assertEqual(frame["id"], "D900")
+            self.assertAlmostEqual(frame["width"], 40)
+            self.assertEqual(frame["kind"], "change")
+
     def test_service_error_or_invalid_pdf_does_not_clear_comparison(self):
         self.compare()
         self.select("M001")

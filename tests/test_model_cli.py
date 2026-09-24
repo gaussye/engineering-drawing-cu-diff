@@ -49,3 +49,21 @@ class ModelCliTests(TablesCliTests):
         self.assertFalse((self.args.output / "model-comparison.json").exists())
         self.assertEqual(json.loads((self.args.output / "model-api-events.json").read_text())["events"],
                          self.client.events)
+
+    def test_semantic_pairing_writes_real_text_channel_outputs_with_cache_only_permission(self):
+        self.args.config.write_text(json.dumps({"model_comparison": {"enabled": True, "text_pairing": True}}))
+        result = {"items": [], "coverage": {"enabled": True}, "warnings": []}
+        text_result = {"differences": [], "ocr_differences": [], "unchanged": [], "ocr_unchanged": [],
+                       "coverage": {"semantic_text": {"enabled": True, "status": "complete"}},
+                       "warnings": []}
+        with patch("cu_diff.cli.Client", return_value=self.client), patch(
+                "cu_diff.model_compare.compare_with_model", return_value=result), patch(
+                "cu_diff.semantic_text.resolve_text_pairing", return_value=text_result) as pairing:
+            model_compare(self.args)
+        self.assertFalse(pairing.call_args.kwargs["allow_submit"])
+        self.assertEqual(pairing.call_args.args[0]["coverage"]["changed_text_pairing"], "semantic_pending")
+        self.assertEqual(pairing.call_args.args[2], {"old": self.args.old, "new": self.args.new})
+        self.assertEqual(json.loads((self.args.output / "text-comparison.json").read_text(encoding="utf-8")), text_result)
+        self.assertTrue((self.args.output / "text-comparison.zh.md").exists())
+        saved = json.loads((self.args.output / "model-comparison.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["coverage"]["semantic_text"], text_result["coverage"]["semantic_text"])

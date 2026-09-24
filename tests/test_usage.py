@@ -54,6 +54,14 @@ def record(service="model", state="new", key="synthetic", **changes):
 
 
 class AccountingTests(unittest.TestCase):
+    def test_semantic_pairing_has_named_usage_and_cache_replay_does_not_rebill(self):
+        report = usage_report([record(stage="model_text_pairing")], prices())
+        self.assertEqual(report["entries"][0]["stage"], "模型 · 字段与OCR语义配对")
+        self.assertEqual(report["summary"]["current"]["model_tokens"], 1200)
+        replay = usage_report([record(stage="model_text_pairing", state="cached")], prices())
+        self.assertEqual(replay["summary"]["current"]["estimated_cost"], 0)
+        self.assertEqual(replay["summary"]["reused"]["model_tokens"], 1200)
+
     def test_direct_cached_and_reasoning_tokens_are_not_added_twice(self):
         report = usage_report([record()], prices())
         current = report["summary"]["current"]

@@ -106,6 +106,9 @@ def options(config):
     if type(raw.get("visual_review", False)) is not bool:
         raise ValueError("model_comparison.visual_review must be a boolean")
     result["visual_review"] = raw.get("visual_review", False)
+    if type(raw.get("text_pairing", False)) is not bool:
+        raise ValueError("model_comparison.text_pairing must be a boolean")
+    result["text_pairing"] = raw.get("text_pairing", False)
     deployment, version = raw.get("deployment"), raw.get("deployment_version")
     if (deployment is None) != (version is None) or (
             deployment is not None and
@@ -118,6 +121,7 @@ def options(config):
         ("max_catalog_entries", 800, 50, 1500), ("crop_dpi", 400, 200, 600),
         ("max_completion_tokens", 12000, 2000, 20000),
         ("max_visual_regions", 2, 1, 4),
+        ("max_text_pairing_entries", 300, 20, 800),
     ):
         value = raw.get(key, default)
         if type(value) is not int or not low <= value <= high:

@@ -354,6 +354,14 @@ class ModelComparisonTests(unittest.TestCase):
         self.assertEqual(item["visual_comparison"]["changed_pixels"], {"old": None, "new": None})
         self.assertEqual(len(self.client.calls), 2)
 
+    def test_semantic_text_pairing_requires_explicit_boolean_and_bounded_catalogue(self):
+        self.assertFalse(options({})["text_pairing"])
+        self.assertTrue(options({"model_comparison": {"text_pairing": True}})["text_pairing"])
+        for setting in ({"text_pairing": 1}, {"max_text_pairing_entries": 0},
+                        {"max_text_pairing_entries": 801}, {"max_text_pairing_entries": True}):
+            with self.assertRaises(ValueError):
+                options({"model_comparison": setting})
+
     def test_single_sided_route_has_priority_within_shared_budget_and_no_duplicate_record(self):
         self.client.config["model_comparison"].update(visual_review=True, max_visual_regions=1)
         self.coarse["pairs"].append(pair(2, label="Generic late one-sided object", old_ids=[]))

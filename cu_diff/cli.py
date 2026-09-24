@@ -219,6 +219,19 @@ def model_compare(args: argparse.Namespace) -> None:
             cache=args.cache_dir, analyzer_id=analyzer_id, analyzer=analyzer,
             allow_submit=args.allow_azure_upload,
             progress=lambda message: print(message, flush=True))
+        if options(config)["text_pairing"]:
+            from .compare import compare_responses
+            from .report import write_report
+            from .semantic_text import resolve_text_pairing
+
+            text_result = resolve_text_pairing(
+                compare_responses(responses["old"], responses["new"], semantic_pairing=True),
+                responses, {"old": args.old, "new": args.new},
+                client=client, cache=args.cache_dir, allow_submit=args.allow_azure_upload,
+                progress=lambda message: print(message, flush=True))
+            result["coverage"]["semantic_text"] = text_result["coverage"]["semantic_text"]
+            save_json(args.output / "text-comparison.json", text_result)
+            write_report(text_result, args.output / "text-comparison.zh.md")
         result["usage_cost"] = usage_report(client.usage_records, pricing)
         save_json(args.output / "model-comparison.json", result)
         write_model_report(result, args.output / "model-comparison.zh.md")

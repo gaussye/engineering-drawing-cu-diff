@@ -217,6 +217,54 @@ class WebTests(unittest.TestCase):
         self.assertIn("Synthetic model failure", result["error"])
         self.assertNotIn("result", result)
 
+    def test_semantic_pairing_changes_d_channel_and_propagates_cache_only_permission(self):
+        store = self.app.extensions["review_store"]
+        store.model_options.update(enabled=True, text_pairing=True)
+        self.assertTrue(self.client.get("/api/bootstrap", base_url=BASE).get_json()["semantic_text_pairing_enabled"])
+        self.upload("old", pdf_bytes("SYNTHETIC A"))
+        revision = self.upload("new", pdf_bytes("SYNTHETIC B")).get_json()["revision"]
+
+        def reconcile(comparison, responses, paths, **kwargs):
+            self.assertEqual(comparison["coverage"]["changed_text_pairing"], "semantic_pending")
+            self.assertEqual(set(responses), {"old", "new"})
+            self.assertTrue(all(path.is_file() for path in paths.values()))
+            comparison["coverage"]["semantic_text"] = {"status": "complete", "supported_pairs": 1}
+            record = comparison["differences"][0]
+            record["semantic_pairing"] = {"status": "supported", "rationale": "Synthetic pairing"}
+            record["text_comparison"] = {"status": "unavailable", "old": [], "new": [],
+                                         "issues": ["Synthetic words unavailable"]}
+            return comparison
+
+        with patch("cu_diff.model_compare.compare_with_model", return_value={
+                "items": [], "coverage": {}, "warnings": []}), patch(
+                "cu_diff.semantic_text.resolve_text_pairing", side_effect=reconcile) as pairing:
+            job = self.wait_job(self.compare(revision).get_json()["job_id"])
+        self.assertEqual(job["status"], "succeeded")
+        self.assertFalse(pairing.call_args.kwargs["allow_submit"])
+        record = next(i for i in job["result"]["items"] if i["channel"] == "schema")
+        self.assertTrue(record["id"].startswith("D"))
+        self.assertEqual(record["semantic_pairing"]["rationale"], "Synthetic pairing")
+        self.assertEqual(record["old"]["locations"], [])
+        self.assertEqual(job["result"]["coverage"]["semantic_text"]["status"], "complete")
+
+    def test_semantic_failure_is_explicit_and_model_disabled_never_invokes_it(self):
+        store = self.app.extensions["review_store"]
+        store.model_options["text_pairing"] = True
+        self.upload("old", pdf_bytes("SYNTHETIC A"))
+        revision = self.upload("new", pdf_bytes("SYNTHETIC B")).get_json()["revision"]
+        with patch("cu_diff.semantic_text.resolve_text_pairing") as pairing:
+            job = self.wait_job(self.compare(revision).get_json()["job_id"])
+        self.assertEqual(job["status"], "succeeded")
+        pairing.assert_not_called()
+        store.model_options["enabled"] = True
+        with patch("cu_diff.model_compare.compare_with_model", return_value={
+                "items": [], "coverage": {}, "warnings": []}), patch(
+                "cu_diff.semantic_text.resolve_text_pairing", side_effect=CUError("Synthetic semantic failure")):
+            job = self.wait_job(self.compare(revision).get_json()["job_id"])
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("Synthetic semantic failure", job["error"])
+        self.assertNotIn("result", job)
+
     def test_table_pipeline_preserves_items_diagnostics_and_coverage(self):
         self.upload("old", pdf_bytes("SYNTHETIC A"))
         revision = self.upload("new", pdf_bytes("SYNTHETIC B")).get_json()["revision"]

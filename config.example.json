@@ -24,6 +24,8 @@
     "deployment": null,
     "deployment_version": null,
     "visual_review": false,
+    "text_pairing": false,
+    "max_text_pairing_entries": 300,
     "max_visual_regions": 2,
     "max_regions": 4,
     "max_pages_per_side": 2,

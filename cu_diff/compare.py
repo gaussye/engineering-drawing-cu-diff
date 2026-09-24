@@ -407,7 +407,7 @@ def _mutual_candidates(old, new, old_free, new_free, candidate):
     return selected
 
 
-def _compare_items(old, new):
+def _compare_items(old, new, *, allow_geometry=True):
     old_free, new_free = set(range(len(old))), set(range(len(new)))
     records, warnings = [], []
     old_keys, new_keys = defaultdict(list), defaultdict(list)
@@ -486,7 +486,7 @@ def _compare_items(old, new):
         text_equal = bool(_text(left)) and _text(left) == _text(right)
         overlap = _overlap(left, right)
         similarity = _similarity(left, right)
-        if overlap >= 0.65 and similarity >= 0.55:
+        if allow_geometry and overlap >= 0.65 and similarity >= 0.55:
             return 0.65 * overlap + 0.35 * similarity, "geometry_text"
         if same_region and text_equal:
             return 0.8, "unique_text_same_region"
@@ -670,7 +670,7 @@ def _reconcile_lines(old, new, old_free, new_free):
     return records
 
 
-def _compare_lines(old, new):
+def _compare_lines(old, new, *, allow_geometry=True):
     old_free, new_free = set(range(len(old))), set(range(len(new)))
     records = []
 
@@ -692,7 +692,7 @@ def _compare_lines(old, new):
         if not _same_page(left, right):
             return None
         overlap, similarity = _overlap(left, right), _similarity(left, right)
-        if overlap >= 0.65 and similarity >= 0.55 and _text(left) and _text(right):
+        if allow_geometry and overlap >= 0.65 and similarity >= 0.55 and _text(left) and _text(right):
             return 0.65 * overlap + 0.35 * similarity, "geometry_text"
         return None
 
@@ -730,7 +730,7 @@ def _coverage(records, old_count, new_count):
     }
 
 
-def compare_documents(old, new, *, confidence_threshold=0.8):
+def compare_documents(old, new, *, confidence_threshold=0.8, semantic_pairing=False):
     """Return a JSON-compatible report without mutating either raw operation.
 
     Match scores are heuristics, not extraction confidence or probabilities.
@@ -743,6 +743,8 @@ def compare_documents(old, new, *, confidence_threshold=0.8):
     """
     if not _valid_number(confidence_threshold) or not 0 <= confidence_threshold <= 1:
         raise ValueError("confidence_threshold must be a finite number between 0 and 1")
+    if type(semantic_pairing) is not bool:
+        raise ValueError("semantic_pairing must be a boolean")
     old_items, old_lines, old_warnings, old_counts = _extract(old, "old", confidence_threshold)
     new_items, new_lines, new_warnings, new_counts = _extract(new, "new", confidence_threshold)
     old_uncertainties, old_service_warnings, old_diagnostics = _diagnostics(old, "old")
@@ -751,14 +753,15 @@ def compare_documents(old, new, *, confidence_threshold=0.8):
     service_warnings = old_service_warnings + new_service_warnings
     title_pairs, old_remaining, new_remaining, title_warnings = reconcile_title_fields(
         old_items, new_items, old_lines, new_lines)
-    item_records, pairing_warnings = _compare_items(old_remaining, new_remaining)
+    item_records, pairing_warnings = _compare_items(
+        old_remaining, new_remaining, allow_geometry=not semantic_pairing)
     item_records.extend(_record(left, right, "printed_title_label_value", 1.0, "high")
                         for left, right in title_pairs)
     table_warnings = reconcile_bom(item_records, old, new)
     refine_bom(item_records, old, new)
     if old.get("status") == new.get("status") == "Succeeded":
         _annotation_occurrences(item_records, old_lines, new_lines)
-    ocr_records = _compare_lines(old_lines, new_lines)
+    ocr_records = _compare_lines(old_lines, new_lines, allow_geometry=not semantic_pairing)
     warnings = (old_warnings + new_warnings + pairing_warnings + title_warnings + table_warnings
                 + old_diagnostics + new_diagnostics)
     review_required = (bool(warnings) or bool(uncertainties) or bool(service_warnings)
@@ -779,6 +782,7 @@ def compare_documents(old, new, *, confidence_threshold=0.8):
             "service_warning_count": len(service_warnings),
             "scope": "custom_schema_items_and_full_ocr_lines",
             "completeness": "not_guaranteed",
+            "changed_text_pairing": "semantic_pending" if semantic_pairing else "geometry_text",
         },
         "uncertainties": uncertainties,
         "service_warnings": service_warnings,

@@ -28,7 +28,8 @@
   };
   const channels = { model: "模型引导复核", schema: "结构化字段", tables: "表格专项证据", graphics: "本地图形候选", ocr: "OCR 原文", unchanged: "一致项复核" };
   const state = {
-    ready: false, csrf: "", revision: 0, azure: false, graphicsEnabled: false, modelEnabled: false, generation: 0,
+    ready: false, csrf: "", revision: 0, azure: false, graphicsEnabled: false, modelEnabled: false,
+    semanticTextEnabled: false, generation: 0,
     limits: { max_bytes: 20971520, max_pages: 20 }, result: null, selected: null,
     comparing: false, jobController: null, jobId: null, exporting: false, exportController: null, mutationQueue: Promise.resolve(),
     old: { document: null, page: 1, zoom: "fit", epoch: 0, pending: false, loaded: false, imageEpoch: 0 },
@@ -301,7 +302,7 @@
     if (state.modelEnabled) menu.querySelector('[value="primary"]').textContent = state.graphicsEnabled
       ? "模型 + 字段 + 表格 + 图形" : "模型 + 字段 + 表格";
     $("model-status").hidden = !state.modelEnabled;
-    $("model-status").textContent = state.modelEnabled ? `模型引导对比已启用（服务配置）。${modelLimits}` : "";
+    $("model-status").textContent = state.modelEnabled ? `模型引导对比已启用（服务配置）。${modelLimits}${state.semanticTextEnabled ? " 字段/OCR启用LLM语义配对，新增批量请求有独立缓存；坐标与原文仍取自CU。" : ""}` : "";
     const option = menu.querySelector('[value="graphics"]');
     option.disabled = !state.graphicsEnabled;
     option.textContent = state.graphicsEnabled ? "本地图形候选" : "本地图形候选（未启用）";
@@ -369,6 +370,7 @@
       state.azure = Boolean(data.azure_enabled);
       state.graphicsEnabled = data.graphics_enabled === true;
       state.modelEnabled = data.model_comparison_enabled === true;
+      state.semanticTextEnabled = data.semantic_text_pairing_enabled === true;
       updateGraphicsAvailability();
       state.ready = true;
       $("connection-status").textContent = "会话已连接";
@@ -552,6 +554,9 @@
   }
   function navigationLocations(item, side) {
     const evidence = locations(item, side);
+    if (!evidence.length && item?.text_comparison) {
+      return validLocations(item[side]?.context_locations, side);
+    }
     if (!evidence.length && item?.channel === "model") {
       const context = modelVisualItem(item) ? validLocations(item[side]?.context_locations, side) : [];
       if (context.length) return context;
@@ -777,6 +782,14 @@
     const node = $(`${side}-evidence-note`);
     if (!item) { node.textContent = state.result ? "点击证据框或索引查看证据；黄色虚框不是确认内容变更。" : "预览已就绪，等待开始对比。"; return; }
     const source = item[side], located = locations(item, side), counterparts = counterpartLocations(item, side);
+    if (item.semantic_pairing) {
+      node.textContent = `${item.id} · LLM语义配对（仍需复核） · ${item.text_comparison?.status === "complete"
+        ? located.length ? `${sideName[side]}第 ${[...new Set(located.map((loc) => loc.page))].join("、")} 页CU变化词；未变参数名和公差不整行高亮`
+          : "本侧无变化词框，仅导航已有原文，不推测缺失位置"
+        : item.semantic_pairing.status === "supported" ? "已建立候选对应，但变化词定位不足；仅导航完整原文，不画整行变化框"
+          : "对应关系仍不明确；保留已有证据待核，不确认新增或删除"}${source?.location_error ? `；${source.location_error}` : ""}`;
+      return;
+    }
     if (item.channel === "model") {
       const context = navigationLocations(item, side);
       if (modelVisualItem(item)) {
@@ -929,6 +942,20 @@
     content.replaceChildren();
     meta.textContent = item ? `${item.id} · ${changes[item.change] || item.change} · 匹配 ${text(item.match?.method) || "未提供"} / 确定性 ${text(item.match?.certainty) || "未提供"} / 启发式得分 ${text(item.match?.score) || "未提供"}（非准确率）` : "选择索引或证据框，联动定位两侧证据";
     if (!item) { content.append(el("p", "detail-placeholder", "保留原文 · 核对外观 · 不推测缺失证据")); return; }
+    if (item.semantic_pairing) {
+      const pairing = item.semantic_pairing, words = item.text_comparison;
+      meta.textContent = `${item.id} · ${changes[item.change] || item.change} · LLM语义配对 + CU原文证据（对应仍需复核）`;
+      const section = el("section", "semantic-text-detail");
+      section.append(el("h3", "", "字段 / OCR 语义对应"),
+        el("p", "", `模型理由（非原文证据）：${text(pairing.rationale) || "未提供"}`),
+        el("p", "", pairing.status === "supported"
+          ? "对应关系由模型提出，程序校验已有来源编号；数值及坐标来自CU，不以文字框重叠作为配对门槛。"
+          : "模型未能建立可靠对应，仍保留为未配对待核；不强行合并或推断增删。"),
+        el("p", "semantic-word-summary", words?.status === "complete"
+          ? `CU变化词：${words.changed_text?.old?.join(" ") || "（无变化词）"} → ${words.changed_text?.new?.join(" ") || "（无变化词）"}。只框不同的CU词，不把整行和未变标注一并高亮。`
+          : `变化词未可靠定位；保留完整原文与上下文，不猜测字符坐标。${text(words?.issues)}`));
+      content.append(section);
+    }
     const visualModel = modelVisualItem(item);
     if (visualModel) {
       const comparison = item.model_comparison || {}, visual = item.visual_comparison || {};
@@ -1092,7 +1119,7 @@
         content.append(section);
         continue;
       }
-      section.append(el("h3", "", `${sideName[side]} / ${item.channel === "model" ? (modelTextDifference(item) ? "CU局部复读原文" : "复核来源原文（非确认变更）") : item.change === "table_grid_changed" ? "本地网格测量（非 OCR 原文）" : graphical ? "本地渲染证据描述（非 OCR 原文）" : item.cell_comparison ? "整行原文（上下文，非整行变更）" : "原始文本"}`));
+      section.append(el("h3", "", `${sideName[side]} / ${item.channel === "model" ? (modelTextDifference(item) ? "CU局部复读原文" : "复核来源原文（非确认变更）") : item.change === "table_grid_changed" ? "本地网格测量（非 OCR 原文）" : graphical ? "本地渲染证据描述（非 OCR 原文）" : item.cell_comparison || item.text_comparison ? "整行原文（上下文，非整行变更）" : "原始文本"}`));
       section.append(el("p", "source-text", source ? (source.raw_text ?? (graphical ? "未提供本地渲染描述" : "未提供原文")) : "未配对到证据（不代表原图没有）"));
       if (source) {
         if (Array.isArray(source.schema_sources) && source.schema_sources.length) {
@@ -1199,6 +1226,13 @@
       ? "对比仅覆盖成功提取的字段、OCR 原文、可定位的表格及已处理的本地图形区域；未识别、未配对或无法定位不等于无变更。证据框不是工程结论。"
       : `${graphicsUnavailable}对比仅覆盖成功提取的字段、OCR 原文与可定位的表格，不包含图形残差检测。未识别、未配对或无法定位不等于无变更。`));
     content.append(el("p", "", `覆盖信息：\n${text(result.coverage) || "未提供覆盖统计"}`));
+    if (result.coverage?.semantic_text != null) {
+      const section = el("section", "semantic-text-coverage");
+      section.append(el("h4", "", "字段 / OCR 语义配对覆盖"),
+        el("p", "", "配对结果已写入字段/OCR索引；没有引用、超出页数或目录预算、对应不明确的条目仍保留待核。"),
+        coverageFacts(result.coverage.semantic_text));
+      content.append(section);
+    }
     if (result.model_coverage != null) {
       content.append(renderModelCoverage(result.model_coverage));
     } else if (state.modelEnabled) {
@@ -1229,6 +1263,12 @@
   }
   function exportBrief(item) {
     const sentence = (value) => typeof value === "string" ? value.trim() : "";
+    if (item.semantic_pairing) {
+      const words = item.text_comparison;
+      return words?.status === "complete"
+        ? `CU变化词：${words.changed_text?.old?.join(" ") || "（无变化词）"} → ${words.changed_text?.new?.join(" ") || "（无变化词）"}；LLM语义对应仍需复核，完整原文见网页。`
+        : `模型理由（非原文证据）：${sentence(item.semantic_pairing.rationale) || "未提供"}；${item.semantic_pairing.status === "supported" ? "已建立候选对应，变化词定位不足" : "对应关系尚未明确"}，需复核。`;
+    }
     if (item.channel === "model") {
       const reason = (modelVisualItem(item) ? sentence(item.visual_comparison?.description) : "") ||
         sentence(item.model_comparison?.rationale) || "未提供模型理由，需人工复核。";

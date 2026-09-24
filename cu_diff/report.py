@@ -243,6 +243,22 @@ def write_report(result: dict, path: Path) -> None:
             str(number), evidence(diff.get("old")), evidence(diff.get("new")),
             cell({"change": diff.get("change"), "match": diff.get("match")}),
         ]) + " |")
+    paired = [entry for group in ("differences", "ocr_differences", "unchanged", "ocr_unchanged")
+              for entry in result.get(group, []) if entry.get("semantic_pairing")]
+    if paired:
+        lines.extend(["", "## LLM语义配对与CU变化词", "",
+                      "模型只提出已有来源编号的对应关系，不能生成原文或坐标；对应仍需复核。"
+                      "变化词无法可靠定位时仅保留原文上下文，不以整行框或推算字符框替代。", "",
+                      "| 项目 | 对应状态 | CU变化词（旧 → 新） | 模型理由（非原文证据） | 定位限制 |",
+                      "|---|---|---|---|---|"])
+        for diff in paired:
+            pairing, words = diff["semantic_pairing"], diff.get("text_comparison", {})
+            lines.append("| " + " | ".join(cell(value) for value in (
+                diff.get("key"), pairing.get("status"),
+                words.get("changed_text", "未可靠定位"), pairing.get("rationale"),
+                {"word_status": words.get("status"), "issues": words.get("issues", []),
+                 "limitations": pairing.get("limitations", [])},
+            )) + " |")
     lines.extend([
         "", "## 可追溯性", "",
         "完整字段、OCR、表格、图形描述、source、usage 与服务 warning 保留在本地 "

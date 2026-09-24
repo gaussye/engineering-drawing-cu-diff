@@ -17,6 +17,7 @@ STAGES = {
     "model_coarse": "模型 · 全页配对", "model_fine": "模型 · 词级核对",
     "model_visual": "模型 · 图形复核",
     "model_visual_presence": "模型 · 单侧对象与对侧搜索",
+    "model_text_pairing": "模型 · 字段与OCR语义配对",
 }
 CU_METERS = {
     "documentPagesMinimal": ("文档数字提取", "pages"),
