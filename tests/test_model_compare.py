@@ -174,6 +174,44 @@ class ModelComparisonTests(unittest.TestCase):
         self.assertEqual(self.client.calls, [])
         self.assertEqual(self.chat.call_count, 1)
 
+    def test_layout_figure_as_text_is_explicit_unboxed_review_and_valid_pairs_continue(self):
+        self.client.config["extraction_profile"] = "layout"
+        self.client.config["model_comparison"]["visual_review"] = True
+        document = response()
+        document["result"]["contents"][0]["figures"] = [{
+            "description": "SYNTHETIC FIGURE CONTEXT", "source": "D(1,1,1,2,.3)"}]
+        self.coarse["pairs"][0]["observations"] = [
+            {"kind": "text_change", "old_ids": ["old:e1"], "new_ids": ["new:e1"],
+             "description": "Synthetic invalid figure-as-text", "check": "Check OCR"},
+            {"kind": "visual_change", "old_ids": ["old:e1"], "new_ids": ["new:e1"],
+             "description": "Synthetic visual observation", "check": "Check geometry"}]
+        self.coarse["pairs"].append(pair(2))
+        result = self.run_comparison(old=document, new=document)
+        review = result["items"][0]
+        self.assertEqual(review["change"], "model_review")
+        self.assertEqual(review["model_comparison"]["invalid_text_source_ids"],
+                         {"old": ["old:e1"], "new": ["new:e1"]})
+        self.assertEqual(review["old"]["locations"], [])
+        self.assertEqual(review["new"]["locations"], [])
+        self.assertTrue(any("图形上下文" in warning for warning in result["warnings"]))
+        self.assertEqual(result["items"][1]["change"], "model_text_modified")
+        self.assertEqual(result["coverage"]["visual"]["regions"], [])
+        self.assertEqual(len(self.client.calls), 2)
+
+    def test_layout_figure_text_review_still_validates_all_observation_ids(self):
+        self.client.config["extraction_profile"] = "layout"
+        document = response()
+        document["result"]["contents"][0]["figures"] = [{
+            "description": "SYNTHETIC FIGURE CONTEXT", "source": "D(1,1,1,2,.3)"}]
+        self.coarse["pairs"][0]["observations"] = [
+            {"kind": "text_change", "old_ids": ["old:e1"], "new_ids": ["new:e1"],
+             "description": "Invalid text evidence", "check": "Check OCR"},
+            {"kind": "visual_change", "old_ids": ["old:invented"], "new_ids": [],
+             "description": "Unknown evidence", "check": "Verify"}]
+        with self.assertRaisesRegex(CUError, "unknown or wrong-side"):
+            self.run_comparison(old=document, new=document)
+        self.assertEqual(self.client.calls, [])
+
     def test_insertion_does_not_color_unchanged_anchor_as_difference(self):
         self.client.old_words, self.client.new_words = ["SYN", "END"], ["SYN", "NEW", "END"]
         self.fine["changes"][0]["new_ids"].append("new:w3")
@@ -227,12 +265,72 @@ class ModelComparisonTests(unittest.TestCase):
         self.assertEqual(record["change"], "model_review")
         self.assertEqual(self.client.calls, [])
 
-    def test_unknown_cross_side_and_repeated_ids_fail_without_crop_calls(self):
-        for ids in (["old:invented"], ["new:e1"], ["old:e1", "old:e1"]):
+    def test_unknown_and_cross_side_ids_still_fail_even_when_repeated(self):
+        for ids in (["old:invented"], ["new:e1"], ["old:invented"] * 2, ["new:e1"] * 2):
             self.coarse["pairs"][0]["old_ids"] = ids
             with self.assertRaises(CUError):
                 self.run_comparison()
         self.assertEqual(self.client.calls, [])
+
+    def test_repeated_coarse_ids_are_stably_deduplicated_with_original_audit(self):
+        for profile in ("engineering", "layout"):
+            with self.subTest(profile=profile):
+                self.client.config["extraction_profile"] = profile
+                self.coarse["pairs"][0]["old_ids"] = ["old:e1", "old:e1"]
+                self.coarse["pairs"][0]["observations"] = [{
+                    "kind": "text_change", "old_ids": ["old:e1"] * 2,
+                    "new_ids": ["new:e1"] * 2, "description": "Synthetic change", "check": "Verify"}]
+                before = copy.deepcopy(self.coarse)
+                result = self.run_comparison()
+                self.assertEqual(result["items"][0]["change"], "model_text_modified")
+                audit = result["coverage"]["coarse"]
+                self.assertEqual(audit["proposed_pairs"], before["pairs"])
+                self.assertEqual(len(audit["reference_adjustments"]), 3)
+                self.assertEqual(audit["reference_adjustments"][0], {
+                    "pair_index": 0, "observation_index": None, "side": "old",
+                    "original_ids": ["old:e1", "old:e1"], "normalized_ids": ["old:e1"],
+                    "removed_count": 1})
+                self.assertTrue(any("去重" in warning for warning in result["warnings"]))
+                self.assertEqual(self.coarse, before)
+
+    def test_coarse_dedup_keeps_first_occurrence_order(self):
+        from cu_diff.model_compare import _normalize_coarse_references
+        self.coarse["pairs"][0]["old_ids"] = ["old:e2", "old:e1", "old:e2", "old:e1"]
+        normalized, adjustments = _normalize_coarse_references(self.coarse)
+        self.assertEqual(normalized["pairs"][0]["old_ids"], ["old:e2", "old:e1"])
+        self.assertEqual(adjustments[0]["removed_count"], 2)
+
+    def test_oversized_coarse_references_still_fail_before_dedup_or_crops(self):
+        self.coarse["pairs"][0]["old_ids"] = ["old:e1"] * 41
+        with self.assertRaisesRegex(CUError, "excessive"):
+            self.run_comparison()
+        self.assertEqual(self.client.calls, [])
+
+    def test_duplicate_observation_does_not_bypass_parent_group_validation(self):
+        self.client.config["extraction_profile"] = "layout"
+        self.coarse["pairs"][0]["observations"] = [{
+            "kind": "visual_change", "old_ids": ["old:e2"] * 2, "new_ids": [],
+            "description": "Synthetic out-of-group observation", "check": "Verify"}]
+        result = self.run_comparison()
+        self.assertEqual(self.client.calls, [])
+        item, = result["items"]
+        self.assertEqual(item["model_comparison"]["highlight_scope"], "none_invalid_observation_group")
+        self.assertEqual(item["old"]["locations"], [])
+        self.assertEqual(item["new"]["locations"], [])
+
+    def test_dedup_within_pair_does_not_hide_conflicts_between_pairs(self):
+        self.coarse["pairs"][0]["old_ids"] *= 2
+        self.coarse["pairs"].append(pair())
+        result = self.run_comparison()
+        self.assertEqual(self.client.calls, [])
+        self.assertEqual(len(result["items"]), 2)
+        self.assertTrue(result["coverage"]["coarse"]["conflicting_source_ids"])
+        self.assertTrue(all(item["old"]["locations"] == [] for item in result["items"]))
+
+    def test_fine_word_duplicates_are_not_normalized(self):
+        self.fine["changes"][0]["old_ids"] = ["old:w1", "old:w1", "old:w2"]
+        with self.assertRaisesRegex(CUError, "repeated"):
+            self.run_comparison()
 
     def test_reused_region_evidence_is_explicitly_ambiguous_not_sent_for_confirmation(self):
         self.coarse["pairs"].append(pair())

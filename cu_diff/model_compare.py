@@ -267,6 +267,30 @@ def _references(record, catalogs, limit):
     return selected
 
 
+def _normalize_coarse_references(coarse):
+    """Deduplicate region/context IDs, never ordered fine-grained word evidence."""
+    from copy import deepcopy
+    normalized, adjustments = deepcopy(coarse), []
+    for pair_index, pair in enumerate(normalized["pairs"]):
+        if len(pair["observations"]) > 20:
+            raise CUError("Model exceeded review observation budget")
+        records = [(None, pair), *enumerate(pair["observations"])]
+        for observation_index, record in records:
+            for side in SIDES:
+                ids = record[f"{side}_ids"]
+                if len(ids) > 40:
+                    raise CUError("Model supplied excessive evidence references")
+                unique = list(dict.fromkeys(ids))
+                if len(unique) != len(ids):
+                    record[f"{side}_ids"] = unique
+                    adjustments.append({
+                        "pair_index": pair_index, "observation_index": observation_index,
+                        "side": side, "original_ids": ids, "normalized_ids": unique,
+                        "removed_count": len(ids) - len(unique),
+                    })
+    return normalized, adjustments
+
+
 def _source_schema(schema, catalogs):
     """Constrain layout-mode generation to the actual evidence IDs on each side."""
     from copy import deepcopy
@@ -301,13 +325,9 @@ def _combine(entries):
             "location_error": None, "detail": "原文与坐标来自CU；对应关系由模型提出，仍需工程复核。"}
 
 
-def _focus_for_review(pair, selected):
-    """Only proposed changed text may be boxed; visual/context references never become text boxes."""
-    catalog = {side: {entry["id"]: entry for entry in selected[side]} for side in SIDES}
-    observations = pair.get("observations", [])
+def _observation_references(observations, catalog):
     if len(observations) > 20:
         raise CUError("Model exceeded review observation budget")
-    focus, unchanged = {side: {} for side in SIDES}, {side: set() for side in SIDES}
     for observation in observations:
         if observation["old_ids"] or observation["new_ids"]:
             refs = _references(observation, catalog, 40)
@@ -315,6 +335,14 @@ def _focus_for_review(pair, selected):
             refs = {side: [] for side in SIDES}
         else:
             raise CUError("Text review observation requires source references")
+        yield observation, refs
+
+
+def _focus_for_review(pair, selected):
+    """Only proposed changed text may be boxed; visual/context references never become text boxes."""
+    catalog = {side: {entry["id"]: entry for entry in selected[side]} for side in SIDES}
+    focus, unchanged = {side: {} for side in SIDES}, {side: set() for side in SIDES}
+    for observation, refs in _observation_references(pair.get("observations", []), catalog):
         for side in SIDES:
             if observation["kind"] == "text_change":
                 for entry in refs[side]:
@@ -472,6 +500,8 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
     _json_shape(coarse, COARSE_SCHEMA)
     if len(coarse["pairs"]) > 40:
         raise CUError("Model exceeded maximum region pairs")
+    original_coarse = coarse
+    coarse, reference_adjustments = _normalize_coarse_references(coarse)
     seen, pairs, owners, rejected_groups = {side: set() for side in SIDES}, [], {}, {}
     for pair in coarse["pairs"]:
         selected = _references(pair, catalogs, 40)
@@ -479,10 +509,13 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                                 for identifier in observation[f"{side}_ids"]
                                 if identifier not in pair[f"{side}_ids"]})
                    for side in SIDES}
-        if layout and any(outside.values()):
-            # Validate all references before retaining an unsafe grouping for review.
-            _focus_for_review(pair, {side: list(catalogs[side].values()) for side in SIDES})
-            rejected_groups[len(pairs)] = outside
+        observations = list(_observation_references(pair["observations"], catalogs))
+        figure_text = {side: sorted({entry["id"] for observation, refs in observations
+                                    if observation["kind"] == "text_change"
+                                    for entry in refs[side] if entry["role"] == "figure context"})
+                       for side in SIDES}
+        if layout and (any(outside.values()) or any(figure_text.values())):
+            rejected_groups[len(pairs)] = {"outside": outside, "figure_text": figure_text}
         else:
             _focus_for_review(pair, selected)
         for side in SIDES:
@@ -493,17 +526,27 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
         pairs.append((pair, selected))
     coverage["unreferenced_ids"] = {side: sorted(set(catalogs[side])-seen[side]) for side in SIDES}
     items, fine_records, warnings, used = [], [], list(coarse["limitations"]), 0
+    if reference_adjustments:
+        warnings.append("模型在单个区域或观察内重复引用同一CU来源；已按首次出现顺序去重，"
+                        "不新增证据、不合并跨区域冲突；原始引用与调整记录保留在审计中。")
     visual_inputs = {}
     conflicts = {identifier: indices for identifier, indices in owners.items() if len(indices) > 1}
     conflict_pairs = {index for indices in conflicts.values() for index in indices}
     candidates = []
     for index, (pair, selected) in enumerate(pairs):
         if index in rejected_groups:
-            reason = "模型观察引用了该配对范围之外的CU来源；保留待核记录，不自动补配、裁剪或绘制差异框。"
+            rejected = rejected_groups[index]
+            reasons = []
+            if any(rejected["outside"].values()):
+                reasons.append("模型观察引用了该配对范围之外的CU来源。")
+            if any(rejected["figure_text"].values()):
+                reasons.append("模型将图形上下文用作文字差异证据；图形来源不能替代OCR原文。")
+            reason = "".join(reasons) + "保留待核记录，不自动补配、裁剪或绘制差异框。"
             record = _record({**pair, "observations": []}, selected, stage="coarse",
                              issues=[reason], suppress_highlights=True)
             record["model_comparison"].update(
-                observations=pair["observations"], rejected_source_ids=rejected_groups[index],
+                observations=pair["observations"], rejected_source_ids=rejected["outside"],
+                invalid_text_source_ids=rejected["figure_text"],
                 highlight_scope="none_invalid_observation_group")
             items.append(record)
             warnings.append(f"{pair['label']}：{reason}")
@@ -722,7 +765,8 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
               "直接模型请求遵循所选现有部署的处理边界，不继承CU的processingLocation参数。")
     return {"items": items, "warnings": warnings + list(limits), "coverage": {
         "enabled": True, "version": VERSION, "status": "completed_with_limits",
-        "catalog": coverage, "coarse": {"model": coarse_meta, "proposed_pairs": coarse["pairs"],
+        "catalog": coverage, "coarse": {"model": coarse_meta, "proposed_pairs": original_coarse["pairs"],
+                   "reference_adjustments": reference_adjustments,
                    "conflicting_source_ids": conflicts,
                    "unchanged_model_assessments": sum(p["assessment"] == "unchanged" for p, _ in pairs)},
         "fine": fine_records, "max_regions": opts["max_regions"], "reread_regions": used,
