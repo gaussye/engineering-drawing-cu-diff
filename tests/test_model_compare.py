@@ -92,7 +92,10 @@ class ModelComparisonTests(unittest.TestCase):
 
     def test_model_pairing_then_crop_words_and_original_coordinates(self):
         before = [digest(path.read_bytes()) for path in self.paths]
-        result = self.run_comparison()
+        stages = []
+        result = self.run_comparison(stage_progress=stages.append)
+        self.assertEqual(stages, ["model_coarse", "cu_crop_preparation", "cu_crop_old",
+                                  "cu_crop_new", "model_fine"])
         self.assertEqual(len(self.client.calls), 2)
         self.assertTrue(all(not submit for _, submit in self.client.calls))
         self.assertEqual(self.chat.call_count, 2)
@@ -322,7 +325,10 @@ class ModelComparisonTests(unittest.TestCase):
             "kind": "visual_change", "description": "A potential nontext fill change",
             "old_ids": [], "new_ids": [], "check": "Inspect separate subfeatures",
         }]
-        result = self.run_comparison()
+        stages = []
+        result = self.run_comparison(stage_progress=stages.append)
+        self.assertEqual(stages, ["model_coarse", "cu_crop_preparation", "cu_crop_old",
+                                  "cu_crop_new", "model_fine", "model_visual"])
         self.assertEqual(len(self.client.calls), 2)
         self.assertEqual(self.chat.call_count, 3)
         self.assertEqual(self.chat.call_args_list[-1].args[2]["model"], "synthetic-next")
@@ -381,8 +387,11 @@ class ModelComparisonTests(unittest.TestCase):
                 status="presence_review", change="model_visual_presence_review")
             return item, {"label": proposal["label"], "route": "single_sided", "status": "presence_review"}
 
+        stages = []
         with patch("cu_diff.model_presence.review_presence", side_effect=presence) as review:
-            result = self.run_comparison()
+            result = self.run_comparison(stage_progress=stages.append)
+        self.assertEqual(stages[-1], "model_visual_presence")
+        self.assertNotIn("model_visual", stages)
         review.assert_called_once()
         region, deferred = result["coverage"]["visual"]["regions"]
         self.assertEqual(region["route"], "single_sided")

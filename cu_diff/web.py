@@ -18,8 +18,10 @@ from flask import Flask, Response, g, jsonify, request, send_file
 import pymupdf
 from werkzeug.exceptions import HTTPException
 
+from .analysis_options import AnalysisOptions
 from .client import CacheMiss, Client, CUError, digest, save_json
 from .compare import compare_responses
+from .timing import JobTiming, STAGES
 from .web_evidence import response_geometry_matches, web_result
 
 
@@ -70,7 +72,9 @@ class Store:
                  client_factory=Client):
         from .model_compare import options
         from .usage import validate_pricing
-        self.model_options = options(config)
+        self.analysis_options = AnalysisOptions(config)
+        default_config, _ = self.analysis_options.snapshot()
+        self.model_options = options(default_config)
         self.pricing = validate_pricing(config.get("pricing"))
         self.config, self.root, self.cache = config, root.resolve(), cache.resolve()
         self.allow_azure, self.client_factory = allow_azure, client_factory
@@ -228,8 +232,18 @@ class Store:
                 session.uploading = False
                 self.prune_files(session)
 
-    def start_job(self, session: Session, revision: int) -> dict:
+    def start_job(self, session: Session, revision: int, *, use_cache=True, model=None) -> dict:
+        try:
+            job_config, analysis_options = self.analysis_options.snapshot(use_cache, model)
+        except ValueError as error:
+            raise WebError(str(error)) from error
+        if not use_cache and not self.allow_azure:
+            raise WebError("此服务为仅缓存模式（cache-only），不能关闭缓存；未提交任何Azure请求。", 409)
         with self.lock:
+            # Snapshot server pipeline switches too; never read mutable options mid-job.
+            job_config.setdefault("model_comparison", {}).update(
+                {key: value for key, value in self.model_options.items()
+                 if key not in ("deployment", "deployment_version")})
             if revision != session.revision:
                 raise WebError("文件已更换，旧版本对比请求已失效。", 409)
             if session.uploading or set(session.documents) != {"old", "new"}:
@@ -245,56 +259,88 @@ class Store:
             identifier = uuid.uuid4().hex
             self.jobs[identifier] = {
                 "job_id": identifier, "status": "queued", "phase": "等待分析",
+                "analysis_options": analysis_options,
+                "_config": job_config, "_timing": JobTiming(),
                 "revision": revision, "session_id": session.id, "invalidated": False,
                 "protected_paths": [path for doc in session.documents.values()
                                     for path in (doc.path, doc.analysis_path)],
             }
+            self.jobs[identifier]["timing"] = self.jobs[identifier]["_timing"].snapshot()
             session.job_id = identifier
             self.executor.submit(self.run_job, session, identifier, dict(session.documents))
-            return {"job_id": identifier, "status": "queued", "revision": revision}
+            return {"job_id": identifier, "status": "queued", "revision": revision,
+                    "analysis_options": dict(analysis_options),
+                    "timing": self.jobs[identifier]["timing"]}
 
     def run_job(self, session: Session, identifier: str, documents: dict[str, Document]):
         from .usage import usage_report
 
         job = self.jobs[identifier]
+        timing = job["_timing"]
+        with self.lock:
+            job_config = job.pop("_config")
+        from .model_compare import options
+        model_options = options(job_config)
+        use_cache = job["analysis_options"]["use_cache"]
+        # OFF isolates all persistent results/guards, but deduplicates within this job.
+        cache = self.cache if use_cache else self.cache / "uncached-jobs" / identifier
         client = None
 
         def usage_changed(records):
             report = usage_report(records, self.pricing)
             with self.lock:
                 job["usage_cost"] = report
+                job["timing"] = timing.snapshot()
 
         def phase(message):
             with self.lock:
                 if job["invalidated"]:
                     raise WebError("文件已更换，此作业结果已失效。", 409)
                 job.update(status="running", phase=message)
+                job["timing"] = timing.snapshot()
+
+        def stage(identifier, message):
+            with self.lock:
+                phase(message)
+                timing.stage(identifier)
+                job["timing"] = timing.snapshot()
+
+        def model_stage(identifier):
+            with self.lock:
+                if identifier != "model_coarse" or timing.active_stage != identifier:
+                    stage(identifier, STAGES[identifier])
 
         try:
-            phase("核对现有CU分析器与缓存")
-            client = self.client_factory(self.config)
+            with self.lock:
+                timing.start()
+            stage("analyzer_preparation", "核对现有CU分析器与缓存")
+            client = self.client_factory(job_config)
             client.usage_observer = usage_changed
             usage_changed(getattr(client, "usage_records", None))
             # Web requests may use only an existing analyzer; never create one.
             analyzer_id, analyzer = client.ensure_analyzer(allow_create=False)
             responses, metadata = {}, {}
             for role, label in (("old", "原图"), ("new", "调整图")):
-                phase(f"正在提取{label}（优先复用缓存，请勿关闭服务）")
+                policy = "优先复用缓存" if use_cache else "不复用历史缓存"
+                stage(f"cu_full_{role}", f"正在提取{label}（{policy}，请勿关闭服务）")
                 client.usage_context = {"stage": f"cu_full_{role}"}
-                response, meta = self.analyze_document(client, documents[role], analyzer_id, analyzer)
+                response, meta = self.analyze_document(
+                    client, documents[role], analyzer_id, analyzer, cache=cache,
+                    use_cache=use_cache)
                 if response.get("status", "").lower() != "succeeded":
                     raise CUError("CU未成功，不能生成无差异结果。")
                 responses[role], metadata[role] = response, meta
             semantic = None
-            if self.model_options["enabled"]:
+            if model_options["enabled"]:
                 from .model_compare import compare_with_model
+                stage("model_coarse", STAGES["model_coarse"])
                 semantic = compare_with_model(
                     documents["old"].analysis_path, documents["new"].analysis_path,
-                    responses["old"], responses["new"], client=client, cache=self.cache,
+                    responses["old"], responses["new"], client=client, cache=cache,
                     analyzer_id=analyzer_id, analyzer=analyzer, allow_submit=self.allow_azure,
-                    pdf_lock=PDF_LOCK, progress=phase)
-            phase("配对BOM、字段和OCR证据")
-            text_pairing = self.model_options["enabled"] and self.model_options["text_pairing"]
+                    pdf_lock=PDF_LOCK, progress=phase, stage_progress=model_stage)
+            stage("semantic_text_pairing", "配对BOM、字段和OCR证据")
+            text_pairing = model_options["enabled"] and model_options["text_pairing"]
             comparison = compare_responses(
                 responses["old"], responses["new"], semantic_pairing=text_pairing)
             if text_pairing:
@@ -302,55 +348,75 @@ class Store:
 
                 comparison = resolve_text_pairing(
                     comparison, responses, {role: doc.analysis_path for role, doc in documents.items()},
-                    client=client, cache=self.cache, allow_submit=self.allow_azure,
+                    client=client, cache=cache, allow_submit=self.allow_azure,
                     pdf_lock=PDF_LOCK, progress=phase)
-            public_docs = {role: doc.public() for role, doc in documents.items()}
-            result = web_result(comparison, public_docs, metadata)
-            if semantic is not None:
-                result["items"].extend(semantic["items"])
-                result["model_coverage"] = semantic["coverage"]
-                result["warnings"].extend(semantic["warnings"])
-            phase("核对非BOM表格的列内容与实际网格")
+            stage("local_table_comparison", "核对非BOM表格的列内容与实际网格")
             from .document_tables import compare_document_tables
             with PDF_LOCK:
                 tabular = compare_document_tables(
                     documents["old"].analysis_path, documents["new"].analysis_path,
                     responses["old"], responses["new"])
-            result["items"].extend(tabular["items"])
-            result["table_coverage"] = tabular["coverage"]
-            result["warnings"].extend(tabular["warnings"])
+            stage("local_graphics_comparison", "核对本地图形")
             from .graphics import compare_graphics
             graphical = compare_graphics(
                 documents["old"].analysis_path, documents["new"].analysis_path,
                 responses["old"], responses["new"], pdf_lock=PDF_LOCK, progress=phase,
                 include_transformations=True)
+            stage("result_preparation", "整理对比结果与用量")
+            public_docs = {role: doc.public() for role, doc in documents.items()}
+            result = web_result(comparison, public_docs, metadata)
+            result["analysis_options"] = dict(job["analysis_options"])
+            if semantic is not None:
+                result["items"].extend(semantic["items"])
+                result["model_coverage"] = semantic["coverage"]
+                result["warnings"].extend(semantic["warnings"])
+            result["items"].extend(tabular["items"])
+            result["table_coverage"] = tabular["coverage"]
+            result["warnings"].extend(tabular["warnings"])
             result["items"].extend(graphical["items"])
             result["graphics_coverage"] = graphical["coverage"]
             usage_changed(getattr(client, "usage_records", None))
             result["usage_cost"] = job["usage_cost"]
             with self.lock:
+                timing.finish(failed=job["invalidated"])
+                job["timing"] = timing.snapshot()
+                job.pop("_timing", None)
+                result["timing"] = job["timing"]
                 if job["invalidated"]:
                     job.update(status="stale", phase="文件已更换，旧结果已作废")
                 else:
                     job.update(status="succeeded", phase="对比完成；结果是待复核候选", result=result)
         except (CUError, WebError, ValueError, OSError, KeyError) as error:
             with self.lock:
+                timing.finish(failed=True)
+                job["timing"] = timing.snapshot()
+                job.pop("_timing", None)
                 job.update(status="stale" if job["invalidated"] else "failed",
                            phase="对比未完成", error=str(error))
             # Only generated job ID and exception class in server logs, never document text.
             LOGGER.warning("Job %s failed (%s)", identifier, type(error).__name__)
         except Exception as error:
             with self.lock:
+                timing.finish(failed=True)
+                job["timing"] = timing.snapshot()
+                job.pop("_timing", None)
                 job.update(status="failed", phase="对比失败",
                            error=f"服务器内部错误（{type(error).__name__}）；未生成结果，请检查本地作业记录。")
             LOGGER.error("Job %s internal failure (%s)", identifier, type(error).__name__)
         finally:
             with self.lock:
+                timing.finish(failed=job["status"] != "succeeded")
+                job["timing"] = timing.snapshot()
+                if "result" in job:
+                    job["result"]["timing"] = job["timing"]
                 try:
                     usage_changed(getattr(client, "usage_records", None) if client else [])
                     save_json(session.directory / f"{identifier}.json", {
                         "status": job["status"], "error": job.get("error"),
                         "revision": job["revision"],
+                        "analysis_options": job["analysis_options"],
+                        "timing": job["timing"],
+                        "cache_namespace": str(cache),
                         "events": client.events if client else [],
                         "usage_records": getattr(client, "usage_records", []) if client else [],
                         "usage_cost": job["usage_cost"],
@@ -363,11 +429,13 @@ class Store:
                 self.prune_files(session)
 
     def analyze_document(self, client: Client, document: Document,
-                         analyzer_id: str, analyzer: dict) -> tuple[dict, dict]:
-        if document.path != document.analysis_path:
+                         analyzer_id: str, analyzer: dict, *, cache=None,
+                         use_cache=True) -> tuple[dict, dict]:
+        cache = self.cache if cache is None else cache
+        if use_cache and document.path != document.analysis_path:
             try:
                 response, metadata = client.analyze(
-                    document.path, self.cache, analyzer_id, analyzer, allow_submit=False)
+                    document.path, cache, analyzer_id, analyzer, allow_submit=False)
             except CacheMiss:
                 pass
             else:
@@ -375,7 +443,7 @@ class Store:
                         and response_geometry_matches(response, document.pages)):
                     return response, dict(metadata, coordinate_basis="original-cache-displayed-page")
         response, metadata = client.analyze(
-            document.analysis_path, self.cache, analyzer_id, analyzer, allow_submit=self.allow_azure)
+            document.analysis_path, cache, analyzer_id, analyzer, allow_submit=self.allow_azure)
         return response, dict(metadata, coordinate_basis="rotation-normalized-page")
 
 
@@ -463,6 +531,7 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
                 limits={"max_bytes": MAX_BYTES, "max_pages": MAX_PAGES,
                         "session_ttl_hours": SESSION_TTL},
                 azure_enabled=allow_azure, model=config.get("completion_model"), graphics_enabled=True,
+                analysis_options=store.analysis_options.bootstrap(),
                 model_comparison_enabled=store.model_options["enabled"],
                 semantic_text_pairing_enabled=store.model_options["enabled"] and store.model_options["text_pairing"],
                 model_comparison_deployment=(
@@ -519,7 +588,11 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
         body = request.get_json()
         if not isinstance(body, dict) or type(body.get("revision")) is not int:
             raise WebError("缺少有效文件版本，请刷新页面。")
-        return jsonify(store.start_job(g.review_session, body["revision"])), 202
+        if "model" in body and not isinstance(body["model"], str):
+            raise WebError("model必须为服务端已批准的模型标识。")
+        return jsonify(store.start_job(
+            g.review_session, body["revision"], use_cache=body.get("use_cache", True),
+            model=body.get("model"))), 202
 
     @app.get("/api/jobs/<identifier>")
     def job_status(identifier):
@@ -527,8 +600,11 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
             job = store.jobs.get(identifier)
             if not job or job["session_id"] != g.review_session.id:
                 raise WebError("作业不存在或不属于当前会话。", 404)
+            if "_timing" in job:
+                job["timing"] = job["_timing"].snapshot()
             public = {key: value for key, value in job.items()
-                      if key not in ("session_id", "invalidated", "protected_paths")}
+                      if key not in ("session_id", "invalidated", "protected_paths")
+                      and not key.startswith("_")}
             if job["invalidated"]:
                 public.update(status="stale", phase="文件已更换，旧结果已作废")
                 public.pop("result", None)

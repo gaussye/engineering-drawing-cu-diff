@@ -405,7 +405,8 @@ def _visual_placeholder(pair, selected, reason, *, route, status, change):
 
 
 def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, cache,
-                       analyzer_id, analyzer, allow_submit=False, pdf_lock=None, progress=None):
+                       analyzer_id, analyzer, allow_submit=False, pdf_lock=None, progress=None,
+                       stage_progress=None):
     """Add model hypotheses without suppressing existing full-document comparison channels."""
     opts = options(client.config)
     if not opts["enabled"]:
@@ -414,7 +415,9 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
     responses = {"old": old_response, "new": new_response}
     cache = Path(cache)
     progress = progress or (lambda message: None)
+    stage_progress = stage_progress or (lambda identifier: None)
     catalogs, coverage, images, full_words, mask_coverage = {}, {}, [], {}, {}
+    stage_progress("model_coarse")
     progress("模型语义配对：准备全页图像与CU来源目录")
     for side in SIDES:
         with pdf_lock or nullcontext():
@@ -478,6 +481,7 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
             items.append(_record(pair, selected, stage="coarse", issues=["一侧缺少有来源的搜索区域；不推测对应位置或确认增删。"]))
             continue
         crops, crop_images, word_catalogs, crop_meta, word_coverage = {}, [], {}, {}, {}
+        stage_progress("cu_crop_preparation")
         try:
             for side in SIDES:
                 crops[side] = _crop(paths[side], selected[side], cache / "model-crops",
@@ -488,6 +492,7 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
         used += 1
         progress(f"模型候选局部复读 {used}/{opts['max_regions']}：CU高清提取与来源核验")
         for side in SIDES:
+            stage_progress(f"cu_crop_{side}")
             progress(f"局部复读 {used}/{opts['max_regions']}：{side} CU来源提取")
             client.usage_context = {"stage": f"cu_crop_{side}", "region_index": used}
             path, image, mapping = crops[side]
@@ -506,6 +511,7 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
             continue
         fine_payload = {"version": VERSION, "proposed_region": pair,
                         **{side: _public_catalog(word_catalogs[side]) for side in SIDES}}
+        stage_progress("model_fine")
         progress(f"局部复读 {used}/{opts['max_regions']}：模型核对词级来源")
         client.usage_context = {"stage": "model_fine", "region_index": used}
         fine, fine_meta = complete_json(
@@ -594,6 +600,7 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                 from .model_presence import review_presence
 
                 visual_used += 1
+                stage_progress("model_visual_presence")
                 progress(f"单侧图形复核 {visual_used}/{opts['max_visual_regions']}：定位对象并搜索对侧页面")
                 client.usage_context = {"stage": "model_visual_presence", "region_index": visual_used}
                 record, entry = review_presence(
@@ -603,6 +610,7 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                 visual_records.append(entry)
                 continue
             else:
+                stage_progress("model_visual")
                 progress(f"非文字高清复核 {visual_used+1}/{opts['max_visual_regions']}：子特征定位与本地残差核验")
                 cached = visual_inputs.get(digest(canonical(pair)))
                 if cached:

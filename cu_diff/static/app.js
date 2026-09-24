@@ -30,6 +30,8 @@
   const state = {
     ready: false, csrf: "", revision: 0, azure: false, graphicsEnabled: false, modelEnabled: false,
     semanticTextEnabled: false, generation: 0,
+    analysisSupported: false, analysisModels: [], analysisModel: "", useCache: true,
+    activeAnalysisOptions: null, cuModel: "", configuredComparison: "",
     limits: { max_bytes: 20971520, max_pages: 20 }, result: null, selected: null,
     comparing: false, jobController: null, jobId: null, exporting: false, exportController: null, mutationQueue: Promise.resolve(),
     old: { document: null, page: 1, zoom: "fit", epoch: 0, pending: false, loaded: false, imageEpoch: 0 },
@@ -62,6 +64,44 @@
     });
   }
   const usageNumber = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+  function duration(value) {
+    if (!usageNumber(value)) return "未提供";
+    if (value < 60) return `${value.toFixed(value > 0 && value < 1 ? 3 : 2)} 秒`;
+    return `${Math.floor(value / 60)} 分 ${(value % 60).toFixed(1)} 秒`;
+  }
+  function renderTiming(timing, options = state.activeAnalysisOptions) {
+    const content = $("timing-content"), scrollTop = $("usage-panel").scrollTop;
+    content.replaceChildren();
+    const heading = el("div", "timing-heading");
+    heading.append(el("h3", "", "本轮分析耗时"));
+    if (timing && typeof timing === "object") {
+      const total = el("span", "timing-total", duration(timing.total_seconds));
+      total.id = "timing-total";
+      heading.append(total, el("span", "timing-meta", `其中排队 ${duration(timing.queue_seconds)}`));
+    }
+    content.append(heading);
+    if (options && typeof options === "object") content.append(el("p", "timing-meta",
+      `本轮模型：${text(options.model_label || options.model) || "未提供"} · 缓存：${options.use_cache === false
+        ? "关闭（重新分析）" : options.use_cache === true ? "开启（优先复用）" : "未提供"}`));
+    if (!timing || typeof timing !== "object") {
+      content.append(el("p", "timing-empty", "暂无耗时数据。开始对比后显示本轮实际耗时，不使用缓存中的历史耗时。"));
+    } else {
+      const list = el("ol", "timing-stages");
+      for (const stage of Array.isArray(timing.stages) ? timing.stages : []) {
+        if (!stage || typeof stage !== "object") continue;
+        const row = el("li", "timing-stage");
+        row.dataset.stageId = typeof stage.id === "string" ? stage.id : "";
+        row.dataset.status = ["running", "completed", "failed"].includes(stage.status) ? stage.status : "unknown";
+        row.append(el("span", "timing-stage-label", text(stage.label) || "未命名步骤"),
+          el("span", "timing-stage-time", duration(stage.elapsed_seconds)),
+          el("span", "timing-stage-state", ({ running: "进行中", completed: "已完成", failed: "失败，保留已耗时间" })[stage.status] || "状态未提供"));
+        list.append(row);
+      }
+      content.append(list, el("p", "timing-meta",
+        "本轮服务端实际耗时，含排队；步骤按实际执行记录，不将缓存里的历史服务耗时累计为本轮耗时。"));
+    }
+    $("usage-panel").scrollTop = scrollTop;
+  }
   const usageCount = (value) => usageNumber(value) ? value.toLocaleString("zh-CN", { maximumFractionDigits: 8 }) : "未提供";
   const usageMoney = (value) => !usageNumber(value) ? "未知" : value > 0 && value < 1e-10
     ? "< US$0.0000000001"
@@ -293,6 +333,51 @@
     return Boolean(state.old.document?.sha256) &&
       state.old.document.sha256 === state.new.document?.sha256;
   }
+  function configureAnalysis(data) {
+    state.cuModel = data.model || "未提供";
+    state.configuredComparison = data.model_comparison_deployment || "";
+    const options = data.analysis_options, menu = $("analysis-model");
+    state.analysisSupported = options != null && typeof options === "object";
+    state.analysisModels = state.analysisSupported && Array.isArray(options.models)
+      ? options.models.filter((m) => m && typeof m.id === "string" && m.id &&
+        typeof m.label === "string" && m.label) : [];
+    state.useCache = !state.analysisSupported || options.use_cache !== false;
+    state.analysisModel = state.analysisSupported && typeof options.model === "string" ? options.model : "";
+    if (state.analysisModels.length && !state.analysisModels.some((m) => m.id === state.analysisModel)) {
+      throw new Error("服务返回的默认分析模型不在可选列表中，未开始分析。");
+    }
+    menu.replaceChildren();
+    for (const model of state.analysisModels) {
+      const option = el("option", "", model.label);
+      option.value = model.id;
+      menu.append(option);
+    }
+    if (!state.analysisModels.length) {
+      const option = el("option", "", "由服务配置");
+      option.value = "";
+      menu.append(option);
+    }
+    menu.value = state.analysisModel;
+    $("use-cache").checked = state.useCache;
+  }
+  function updateAnalysisDisplay() {
+    $("cache-state-label").textContent = state.useCache ? "开" : "关";
+    const selected = state.analysisModels.find((m) => m.id === state.analysisModel);
+    const active = state.activeAnalysisOptions;
+    const model = active?.model_label || active?.model || selected?.label || state.configuredComparison;
+    const cache = active && typeof active.use_cache === "boolean" ? active.use_cache : state.useCache;
+    $("model-tag").textContent = `${state.modelEnabled && model ? `CU：${state.cuModel} · 模型对比：${model}` : state.cuModel || "模型"} / ${state.azure ? cache ? "缓存优先 · 可提交 CU" : "不复用历史缓存 · 可提交 CU" : "只读缓存模式"}`;
+    const notes = [];
+    if (!state.useCache) notes.push("缓存已关闭：下次对比不复用历史 CU / 模型结果，将重新分析并可能产生费用；不删除已有缓存。");
+    if (active && (active.model !== state.analysisModel || active.use_cache !== state.useCache)) {
+      notes.push("设置仅用于下一次对比；当前结果和用量仍属于上一轮，不会随选项切换而改变。");
+    }
+    if (state.analysisModel === "gpt-6-luna") notes.push("Luna 仅用于模型对比，CU 提取仍使用原模型；未核实的费用会标为未知，不套用 Astra 单价。");
+    const note = $("analysis-settings-note");
+    note.textContent = notes.join(" ");
+    note.hidden = !notes.length;
+    note.classList.toggle("cache-bypassed", !state.useCache);
+  }
   const graphicsUnavailable = "图形检测未接入/未启用：当前仅展示文字与表格证据。";
   const modelDisclaimer = "模型提出对应关系，CU局部复读提供原文；不是模型文字直接作为证据";
   const modelLimits = "粗比对后按预算裁切并用CU局部复读，可能产生模型及CU费用；预算、来源或定位限制可能留下未处理区域，不保证没有遗漏。";
@@ -318,6 +403,9 @@
   }
   function updateControls() {
     const busy = sides.some((side) => state[side].pending);
+    const settingsLocked = !state.ready || busy || state.comparing || state.exporting || !state.analysisSupported;
+    $("use-cache").disabled = settingsLocked || !state.azure;
+    $("analysis-model").disabled = settingsLocked || !state.modelEnabled || !state.analysisModels.length;
     $("compare-button").disabled = !state.ready || busy || state.comparing || state.exporting ||
       !sides.every((side) => state[side].document) || identicalFiles();
     $("export-button").disabled = !state.ready || busy || state.comparing || state.exporting ||
@@ -339,6 +427,7 @@
       for (const name of ["page", "zoom", "fit"]) $(`${side}-${name}`).disabled = !available;
       $(`${side}-viewport`).setAttribute("aria-busy", String(state[side].pending));
     }
+    updateAnalysisDisplay();
   }
   function invalidateResults() {
     state.generation++;
@@ -351,6 +440,8 @@
     state.comparing = false;
     state.result = null;
     state.selected = null;
+    state.activeAnalysisOptions = null;
+    renderTiming(null);
     renderUsage(null);
     sides.forEach((side) => $(`${side}-stage`).querySelector("svg").replaceChildren());
     renderResults();
@@ -371,12 +462,10 @@
       state.graphicsEnabled = data.graphics_enabled === true;
       state.modelEnabled = data.model_comparison_enabled === true;
       state.semanticTextEnabled = data.semantic_text_pairing_enabled === true;
+      configureAnalysis(data);
       updateGraphicsAvailability();
       state.ready = true;
       $("connection-status").textContent = "会话已连接";
-      const modelLabel = state.modelEnabled && data.model_comparison_deployment
-        ? `CU：${data.model || "未提供"} · 模型对比：${data.model_comparison_deployment}` : (data.model || "模型");
-      $("model-tag").textContent = `${modelLabel} / ${state.azure ? "缓存优先 · 可提交 CU" : "只读缓存模式"}`;
       $("storage-notice").textContent = data.storage_notice || `会话存储期限：${data.limits.session_ttl_hours} 小时。`;
       document.querySelectorAll(".upload-limit").forEach((node) => {
         node.textContent = `PDF · 单文件最大 ${Math.round(data.limits.max_bytes / 1048576)} MB · 最多 ${data.limits.max_pages} 页`;
@@ -1399,8 +1488,16 @@
   }
   async function compare() {
     if ($("compare-button").disabled) return;
+    const options = state.analysisSupported ? {
+      use_cache: state.useCache, ...(state.analysisModel ? { model: state.analysisModel } : {})
+    } : {};
     clearError();
     invalidateResults();
+    if (state.analysisSupported) {
+      state.activeAnalysisOptions = { ...options,
+        model_label: state.analysisModels.find((m) => m.id === options.model)?.label };
+      renderTiming(null);
+    }
     const generation = state.generation, revision = state.revision;
     const controller = new AbortController();
     state.jobController = controller;
@@ -1410,13 +1507,24 @@
     try {
       const job = await request("/api/compare", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ revision }), signal: controller.signal
+        body: JSON.stringify({ revision, ...options }), signal: controller.signal
       });
       if (generation !== state.generation) return;
+      renderTiming(job.timing ?? null);
       while (generation === state.generation) {
         const data = await request(`/api/jobs/${encodeURIComponent(job.job_id)}`, { signal: controller.signal });
         if (generation !== state.generation) return;
         renderUsage(data.usage_cost ?? data.result?.usage_cost ?? null);
+        const reportedOptions = data.analysis_options ?? data.result?.analysis_options;
+        if (reportedOptions) {
+          if (options.model && reportedOptions.model !== options.model ||
+              typeof options.use_cache === "boolean" && reportedOptions.use_cache !== options.use_cache) {
+            renderTiming(data.timing ?? data.result?.timing ?? null, reportedOptions);
+            throw new Error("返回的分析设置与本轮请求不一致，未显示错误来源的对比结果。");
+          }
+          state.activeAnalysisOptions = reportedOptions;
+        }
+        renderTiming(data.timing ?? data.result?.timing ?? null);
         if (data.status === "stale") { status("文件版本已变化，本次结果已作废。请重新上传或刷新后再对比。"); return; }
         if (data.status === "failed") throw new Error(data.error || "对比失败，请重试。");
         if (data.status === "succeeded") {
@@ -1481,6 +1589,16 @@
     sides.forEach((side) => { renderBoxes(side); evidenceNote(side); });
   });
   $("compare-button").addEventListener("click", compare);
+  $("use-cache").addEventListener("change", () => {
+    if ($("use-cache").disabled) return;
+    state.useCache = $("use-cache").checked;
+    updateControls();
+  });
+  $("analysis-model").addEventListener("change", () => {
+    if ($("analysis-model").disabled) return;
+    state.analysisModel = $("analysis-model").value;
+    updateControls();
+  });
   $("export-button").addEventListener("click", exportPdf);
   $("dismiss-error").addEventListener("click", clearError);
   $("retry-bootstrap").addEventListener("click", bootstrap);

@@ -23,6 +23,21 @@
     "enabled": false,
     "deployment": null,
     "deployment_version": null,
+    "default_model": "gpt-6-astra",
+    "models": [
+      {
+        "id": "gpt-6-astra",
+        "label": "GPT-6 Astra",
+        "deployment": "YOUR-EXISTING-ASTRA-DEPLOYMENT",
+        "deployment_version": "gpt-6-astra:RECORD-ACTUAL-VERSION:RECORD-ACTUAL-SKU"
+      },
+      {
+        "id": "gpt-6-luna",
+        "label": "GPT-6 Luna",
+        "deployment": "YOUR-EXISTING-LUNA-DEPLOYMENT",
+        "deployment_version": "gpt-6-luna:RECORD-ACTUAL-VERSION:RECORD-ACTUAL-SKU"
+      }
+    ],
     "visual_review": false,
     "text_pairing": false,
     "max_text_pairing_entries": 300,
