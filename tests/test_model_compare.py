@@ -441,14 +441,60 @@ class ModelComparisonTests(unittest.TestCase):
         self.assertTrue(result["coverage"]["coarse"]["conflicting_source_ids"])
         self.assertTrue(any("配对冲突" in warning for warning in result["warnings"]))
 
-    def test_word_order_and_fabricated_fields_are_rejected(self):
+    def test_word_order_is_review_only_and_fabricated_fields_are_rejected(self):
         self.fine["changes"][0]["old_ids"].reverse()
-        with self.assertRaisesRegex(CUError, "reading order"):
-            self.run_comparison()
+        result = self.run_comparison()
+        record, = result["items"]
+        self.assertEqual(record["change"], "model_review")
+        self.assertEqual(record["old"]["raw_text"], "3A\nSYN")
+        self.assertEqual(record["old"]["locations"], [])
+        self.assertEqual(record["new"]["locations"], [])
+        self.assertEqual(record["model_context"]["old"]["raw_text"], "")
+        self.assertTrue(record["model_context"]["old"]["locations"])
+        self.assertEqual(result["coverage"]["fine"][0]["status"], "partial")
         self.fine["changes"][0]["old_ids"].reverse()
         self.fine["changes"][0]["new_text"] = "MODEL INVENTED CORRECTION"
         with self.assertRaisesRegex(CUError, "properties"):
             self.run_comparison()
+
+    def test_discontinuous_word_group_keeps_exact_fragments_and_valid_changes_continue(self):
+        self.client.old_words = ["SYN", "3A", "SKIP", "TAIL"]
+        self.client.new_words = ["ALT", "8A", "GAP", "TAIL"]
+        self.fine["changes"] = [
+            {"label": "Valid first word", "old_ids": ["old:w1"], "new_ids": ["new:w1"],
+             "rationale": "Synthetic valid difference"},
+            {"label": "Disconnected words", "old_ids": ["old:w2"], "new_ids": ["new:w2", "new:w4"],
+             "rationale": "Synthetic unsafe grouping"}]
+        before = copy.deepcopy(self.fine)
+        result = self.run_comparison()
+        valid, review = result["items"]
+        self.assertEqual(valid["change"], "model_text_modified")
+        self.assertEqual(review["change"], "model_review")
+        self.assertEqual(review["new"]["raw_text"], "8A\nTAIL")
+        self.assertNotIn("GAP", review["new"]["raw_text"])
+        self.assertEqual([fragment["id"] for fragment in review["new"]["source_fragments"]],
+                         ["new:w2", "new:w4"])
+        self.assertEqual(review["model_comparison"]["source_reference_issues"][0]["catalog_positions"], [1, 3])
+        for side in ("old", "new"):
+            self.assertEqual(review[side]["locations"], [])
+            self.assertTrue(review["model_context"][side]["locations"])
+        self.assertEqual(result["coverage"]["fine"][0]["reference_reviews"][0]["change_index"], 1)
+        self.assertIn("new:w3", result["coverage"]["fine"][0]["unreferenced_word_ids"]["new"])
+        self.assertTrue(any("不补入中间词" in warning for warning in result["warnings"]))
+        self.assertEqual(self.fine, before)
+        self.assertEqual(self.chat.call_count, 2)
+
+    def test_review_only_fine_group_does_not_hide_later_invalid_or_reused_references(self):
+        self.fine["changes"][0]["old_ids"].reverse()
+        for ids, message in ((["old:invented"], "unknown or wrong-side"),
+                             (["new:w1"], "unknown or wrong-side"),
+                             (["old:w1"], "reused source")):
+            with self.subTest(ids=ids):
+                self.fine["changes"] = self.fine["changes"][:1] + [{
+                    "label": "Invalid following record", "old_ids": ids,
+                    "new_ids": [], "rationale": "Synthetic invalid references"}]
+                with self.assertRaisesRegex(CUError, message):
+                    self.run_comparison()
 
     def test_geometry_mismatch_fails_before_model_request(self):
         with self.assertRaisesRegex(CUError, "geometry"):

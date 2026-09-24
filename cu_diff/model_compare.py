@@ -644,8 +644,10 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                 or (fine["assessment"] == "changes" and not fine["changes"])):
             raise CUError("Fine model assessment/changes are inconsistent or excessive")
         word_seen = {side: set() for side in SIDES}
-        for change in fine["changes"]:
+        reference_reviews = []
+        for change_index, change in enumerate(fine["changes"]):
             evidence = _references(change, word_catalogs, 120)
+            reference_issues = []
             for side in SIDES:
                 ids = set(change[f"{side}_ids"])
                 if ids & word_seen[side]:
@@ -653,8 +655,32 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                 order = list(word_catalogs[side])
                 indices = [order.index(key) for key in change[f"{side}_ids"]]
                 if indices and indices != list(range(indices[0], indices[-1]+1)):
-                    raise CUError("Fine model word references must preserve contiguous CU reading order")
+                    reference_issues.append({
+                        "side": side, "reason": "noncontiguous_or_unordered_words",
+                        "proposed_ids": list(change[f"{side}_ids"]), "catalog_positions": indices})
                 word_seen[side].update(ids)
+            if reference_issues:
+                reason = "模型引用的局部词不是按CU读序排列的连续片段；仅逐词展示原文，" \
+                         "不拼接成完整字段、不补入中间词、不绘制差异框，其他合规条目继续核验。"
+                record = _record(change, evidence, stage="fine", issues=[reason, *fine["limitations"]])
+                record["model_context"] = {side: _combine(evidence[side]) for side in SIDES}
+                for side in SIDES:
+                    if record[side]:
+                        record[side].update(
+                            raw_text="\n".join(entry["raw_text"] for entry in evidence[side]),
+                            locations=[], detail="逐词CU原文片段（每行独立），不是已重建的连续字段。",
+                            source_fragments=[{"id": entry["id"], "raw_text": entry["raw_text"],
+                                               "source": entry["source"], "locations": entry["locations"]}
+                                              for entry in evidence[side]])
+                        record["model_context"][side].update(
+                            raw_text="", detail="离散来源仅用于导航，不作为确认变化的文字或差异框。")
+                record["model_comparison"].update(
+                    observations=pair.get("observations", []), fine_assessment=fine["assessment"],
+                    highlight_scope="none_invalid_word_group", source_reference_issues=reference_issues)
+                items.append(record)
+                reference_reviews.append({"change_index": change_index, "issues": reference_issues})
+                warnings.append(f"{change['label']}：{reason}")
+                continue
             combined = {side: _combine(evidence[side]) for side in SIDES}
             if all(combined.values()) and normalize_text(combined["old"]["raw_text"]) == normalize_text(combined["new"]["raw_text"]):
                 warnings.append("模型提出的一个变化引用了相同CU文字；未作为文字差异展示。")
@@ -691,7 +717,8 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                 record["change"] = "model_no_text_change"
                 record["model_comparison"]["status"] = "no_text_change_observed"
             items.append(record)
-        fine_records.append({"label": pair["label"], "status": fine["assessment"], "cu": crop_meta,
+        fine_records.append({"label": pair["label"], "status": "partial" if reference_reviews else fine["assessment"],
+                             "model_assessment": fine["assessment"], "reference_reviews": reference_reviews, "cu": crop_meta,
                              "model": fine_meta, "word_coverage": word_coverage,
                              "unreferenced_word_ids": {s: sorted(set(word_catalogs[s])-word_seen[s]) for s in SIDES}})
     visual_records = []

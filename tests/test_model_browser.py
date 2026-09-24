@@ -166,6 +166,25 @@ class ModelBrowserTests(unittest.TestCase):
             expect(self.page.locator(".model-coverage")).to_contain_text(phrase)
         self.assertEqual(self.compare_requests, 1)
 
+    def test_discontinuous_fine_words_show_fragments_and_reason_without_difference_boxes(self):
+        row = model_item(review=True)
+        reason = "局部词引用不连续，逐词保留，不拼接完整字段。"
+        row["model_comparison"].update(stage="fine", highlight_scope="none_invalid_word_group",
+                                        issues=[reason])
+        row["model_context"] = {side: model_source("", page=2) for side in ("old", "new")}
+        for side in ("old", "new"):
+            row[side].update(raw_text="L2\n40\n±\n5", locations=[],
+                             detail="逐词CU原文片段（每行独立），不是已重建的连续字段。")
+        self.result["items"] = [row]
+        self.compare()
+        self.select("M001")
+        expect(self.page.locator("rect.evidence-box")).to_have_count(0)
+        expect(self.page.locator(".model-detail")).to_contain_text(reason)
+        expect(self.page.locator("#model-count")).to_contain_text("0 条局部原文不同候选 / 1 条待复核")
+        for side in ("old", "new"):
+            expect(self.page.locator(f"#{side}-page")).to_have_value("2")
+            expect(self.page.locator(f'.source-detail[data-side="{side}"] .source-text')).to_have_text("L2\n40\n±\n5")
+
     def test_model_tag_distinguishes_cu_and_comparison_deployments(self):
         self.comparison_deployment = "synthetic-next"
         self.page.reload()
