@@ -12,6 +12,7 @@ dependencies = ["PyMuPDF>=1.28,<2"]
 [project.optional-dependencies]
 graphics = ["numpy>=1.26,<3", "opencv-python-headless>=4.10,<5"]
 web = ["Flask>=3.1,<4", "waitress>=3.0,<4", "numpy>=1.26,<3", "opencv-python-headless>=4.10,<5"]
+appservice = ["engineering-drawing-cu-diff[web]", "azure-identity>=1.19,<2"]
 test = ["playwright>=1.50,<2"]
 
 [project.scripts]

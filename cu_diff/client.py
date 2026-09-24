@@ -1,4 +1,4 @@
-"""GA REST client; Entra via Azure CLI, no shared default mutations."""
+"""GA REST client; explicit Entra credentials, no shared default mutations."""
 
 import base64
 from contextlib import contextmanager
@@ -80,12 +80,34 @@ class Client:
         self._cu_unknown = set()
         self._token = ""
         self._token_at = 0.0
+        self._token_expires = 0.0
+        self._credential = None
+        auth = config.get("auth", {})
+        if not isinstance(auth, dict) or auth.get("mode", "azure_cli") not in (
+                "azure_cli", "managed_identity"):
+            raise ValueError("auth.mode must be azure_cli or managed_identity")
+        self.auth_mode = auth.get("mode", "azure_cli")
 
     def _authenticate(self) -> str:
         with self._auth_lock:
             return self._authenticate_locked()
 
     def _authenticate_locked(self) -> str:
+        if self.auth_mode == "managed_identity":
+            if not self._token or time.time() >= self._token_expires - 120:
+                try:
+                    from azure.core.exceptions import ClientAuthenticationError
+                    from azure.identity import ManagedIdentityCredential
+                except ImportError as error:
+                    raise CUError("Managed identity requires the appservice dependency extra.") from error
+                if self._credential is None:
+                    self._credential = ManagedIdentityCredential()
+                try:
+                    token = self._credential.get_token("https://cognitiveservices.azure.com/.default")
+                except ClientAuthenticationError as error:
+                    raise CUError("Azure managed identity authentication failed; check identity and AI roles.") from error
+                self._token, self._token_expires = token.token, token.expires_on
+            return self._token
         if time.monotonic() - self._token_at > 2400 or not self._token:
             az = shutil.which("az")
             if not az:

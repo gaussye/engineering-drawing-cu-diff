@@ -1,4 +1,4 @@
-"""Loopback-only engineering drawing review server. No infrastructure deployment."""
+"""Engineering drawing review server; loopback-only unless explicitly hosted."""
 
 import argparse
 import atexit
@@ -21,6 +21,7 @@ from werkzeug.exceptions import HTTPException
 from .analysis_options import AnalysisOptions
 from .client import CacheMiss, Client, CUError, digest, save_json
 from .compare import compare_responses
+from .hosting import CloudBoundary
 from .parallel import cu_workers, parallel_cu_enabled, run_cu_pair
 from .schema import extraction_profile
 from .timing import JobTiming, STAGES
@@ -68,6 +69,7 @@ class Session:
     last_used: float = field(default_factory=time.time)
     job_id: str | None = None
     uploading: bool = False
+    principal: str | None = None
 
 
 class Store:
@@ -124,11 +126,14 @@ class Store:
         return bool(session.job_id and self.jobs.get(session.job_id, {}).get("status")
                     in ("queued", "running"))
 
-    def session(self, cookie: str | None, create: bool = False) -> tuple[Session, bool]:
+    def session(self, cookie: str | None, create: bool = False,
+                principal: str | None = None) -> tuple[Session, bool]:
         self.cleanup()
         with self.lock:
             if cookie in self.sessions:
                 session = self.sessions[cookie]
+                if session.principal != principal:
+                    raise WebError("会话不属于当前登录用户，请清除本站Cookie后重新登录。", 403)
                 session.last_used = time.time()
                 return session, False
             if not create:
@@ -138,7 +143,7 @@ class Store:
             sid = secrets.token_urlsafe(32)
             directory = self.root / ("web-session-" + uuid.uuid4().hex)
             directory.mkdir()
-            session = Session(sid, secrets.token_urlsafe(32), directory)
+            session = Session(sid, secrets.token_urlsafe(32), directory, principal=principal)
             self.sessions[sid] = session
             return session, True
 
@@ -479,27 +484,36 @@ class Store:
 
 
 def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 8765,
-               allow_azure: bool = False, client_factory=Client) -> Flask:
+               allow_azure: bool = False, client_factory=Client,
+               cloud: CloudBoundary | None = None) -> Flask:
     app = Flask(__name__, static_folder=None)
     app.config.update(MAX_CONTENT_LENGTH=MAX_BYTES, JSON_AS_ASCII=False)
     app.json.ensure_ascii = False
     store = Store(config, data_dir, cache_dir, allow_azure, client_factory)
     app.extensions["review_store"] = store
-    origin = f"http://127.0.0.1:{port}"
-    cookie_name = f"cu_review_{port}"
+    origin = cloud.origin if cloud else f"http://127.0.0.1:{port}"
+    cookie_name = "__Host-cu_review" if cloud else f"cu_review_{port}"
     assets = Path(__file__).parent / "static"
 
     @app.before_request
     def boundary():
-        if request.host != f"127.0.0.1:{port}":
-            raise WebError("仅允许指定127.0.0.1本地地址，拒绝代理或外部Host。", 403)
+        if request.host != (cloud.host if cloud else f"127.0.0.1:{port}"):
+            raise WebError("请求Host不符合此服务配置。" if cloud else
+                           "仅允许指定127.0.0.1本地地址，拒绝代理或外部Host。", 403)
         if request.headers.get("Origin") not in (None, origin):
             raise WebError("拒绝跨站请求。", 403)
         if request.headers.get("Sec-Fetch-Site") == "cross-site":
             raise WebError("拒绝跨站请求。", 403)
+        principal = None
+        if cloud and request.path != "/api/health":
+            try:
+                principal = cloud.authenticate(request.headers.get("X-MS-CLIENT-PRINCIPAL"))
+            except ValueError as error:
+                raise WebError("云端身份验证失败或账号未获授权，请使用已批准的Microsoft账号登录。", 403) from error
         if request.path.startswith("/api/") and request.path != "/api/health":
             g.review_session, g.new_session = store.session(
-                request.cookies.get(cookie_name), create=request.path == "/api/bootstrap")
+                request.cookies.get(cookie_name), create=request.path == "/api/bootstrap",
+                principal=principal)
             if request.method in ("PUT", "POST", "DELETE"):
                 if not secrets.compare_digest(request.headers.get("X-CSRF-Token", "").encode(),
                                               g.review_session.csrf.encode()):
@@ -518,7 +532,9 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
         })
         if getattr(g, "new_session", False):
             response.set_cookie(cookie_name, g.review_session.id, httponly=True,
-                                samesite="Strict", max_age=SESSION_TTL)
+                                samesite="Strict", max_age=SESSION_TTL, secure=cloud is not None)
+        if cloud:
+            response.headers["Strict-Transport-Security"] = "max-age=31536000"
         return response
 
     @app.errorhandler(WebError)
@@ -551,7 +567,7 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
 
     @app.get("/api/health")
     def health():
-        return jsonify(status="ok", local_only=True)
+        return jsonify(status="ok", local_only=cloud is None)
 
     @app.get("/api/bootstrap")
     def bootstrap():

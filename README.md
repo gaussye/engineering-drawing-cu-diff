@@ -1,6 +1,6 @@
 # 工程图 CU 提取与证据差异
 
-Python CLI 与本地 Web 审阅台，使用 **Azure Content Understanding GA `2025-11-01`** 对两份原始 PDF
+Python CLI 与 Web 审阅台，使用 **Azure Content Understanding GA `2025-11-01`** 对两份原始 PDF
 分别进行全页 OCR/layout 提取，再进行有来源约束的语义比较。不是仅凭 LLM 看图总结。
 示例配置采用 **`extraction_profile: "layout"` 轻量模式**：CU保留原文、表格和坐标，
 工程语义由所选Sol/Astra/Luna判断；旧版生成工程字段的模式仍可显式选择 `"engineering"`。
@@ -21,7 +21,8 @@ Python CLI 与本地 Web 审阅台，使用 **Azure Content Understanding GA `20
 [本地 Web](#本地-web-工程图审阅台不部署) · [验证与局限](#验证与局限)
 
 本文说明当前实现和设计取舍，不是客户差异报告。讨论中的例子均按通用问题归纳；
-客户原文、真实料号、截图、差异坐标、资源配置和调用用量明细仅保留在本地证据文件。
+本地模式下，客户原文、真实料号、截图、差异坐标、资源配置和调用用量明细仅保留在本地证据文件。
+显式部署App Service后，新上传的数据保存在所批准Azure区域的私有目录，不迁移历史本地文件。
 
 ## 隐私与前提
 
@@ -931,9 +932,49 @@ CLI `extract`输出本轮`usage-cost.json`，`model-compare`输出`model-usage-c
 不要删除或覆盖原始客户文件。所有运行数据应放在仓库外，或已忽略的 `local\` / `output\`。
 
 当前是单机审阅工具，服务随启动它的进程/会话退出而停止；终端内可用 Ctrl+C 停止。
-保留了标准 WSGI `create_app` 工厂，便于以后适配 Azure App Service；**本轮没有部署**。
-公网部署前仍需组织认证、跨进程作业队列、存储策略和额外运行隔离，不应直接改成
-`0.0.0.0` 暴露此本地模式。
+公网托管使用下面的独立App Service入口；不应直接改成`0.0.0.0`暴露此本地模式。
+
+### Azure App Service 托管
+
+`python -m cu_diff.appservice`是专用云端入口，依赖`pip install ".[appservice]"`。
+**准备了部署支持不代表已经部署成功**；实际URL和权限需部署后验证，不能用本地测试代替。
+发布步骤和参数见[部署说明](deploy/README.md)。`deploy\Deploy-AppService.ps1`默认仅预览，
+实际执行需要同时传入`-Execute -ApprovePaidResources`；脚本会在云端写操作前检查配额。
+
+- Linux Python 3.11、Waitress单进程、单实例，启用Always On。作业和浏览器会话仍在内存，
+  **重启后须刷新并重新上传，正在执行的任务不能保证完成**。不要开启多worker或横向扩容；
+  需要扩容时先实现共享会话、持久作业队列及重复计费保护。
+- 公网入口仅允许HTTPS，启用App Service **Easy Auth / Microsoft Entra单租户认证**，
+  并配置明确的用户object ID白名单。应用同时验证Easy Auth注入的租户/用户声明，
+  将会话绑定到用户，保留CSRF检查，并使用Secure/HttpOnly/SameSite Cookie。
+  `/api/health`仅暴露无敏感信息的存活状态。不能绕开Easy Auth直接公开容器端口，
+  也不能在普通反向代理上信任客户端自行提供的`X-MS-CLIENT-PRINCIPAL`。
+- CU和直接模型调用使用**系统分配托管身份**，不依赖Azure CLI登录或API key。
+  只在目标AI资源授予`Cognitive Services Content Understanding Reader`和
+  `Cognitive Services OpenAI User`，不更改模型部署、共享映射或创建analyzer。
+  缺少托管身份或权限时明确失败，不回退到其他身份。
+- Easy Auth采用专用用户分配身份及Entra联合凭据进行无密钥登录；
+  此登录身份不授予AI权限，也不复用于其他应用。
+- 部署包仅包含代码、静态资源、公开价格快照和依赖声明。
+  **不包含`local`、原图、提取结果、报告、缓存、日志或历史审计**。
+  资源配置经App Settings传入，不提交Git。上传数据和缓存保存在App Service私有持久目录
+  `/home/cu-review/data`及`/home/cu-review/cache`，不在静态网站目录内。
+  云端用户新上传的文件会保存在Azure；不是仅浏览器内处理。原本的24小时会话清理及缓存
+  长期保留规则仍然适用，上线前须确认客户允许的存储区域和保留策略。
+
+入口必需环境变量：
+
+| 变量 | 含义 |
+|---|---|
+| `CU_CONFIG_JSON` | 已批准的完整运行配置JSON；入口强制`auth.mode=managed_identity` |
+| `CU_PUBLIC_ORIGIN` | 无路径的站点HTTPS地址，必须匹配App Service主机名 |
+| `CU_TENANT_ID` | Entra租户ID |
+| `CU_ALLOWED_PRINCIPALS` | 允许登录的object ID，逗号分隔且不能为空 |
+| `WEBSITE_HOSTNAME` | App Service提供的站点主机名 |
+| `WEBSITE_AUTH_ENABLED` | Easy Auth必须为`true`；未启用时拒绝启动 |
+
+托管模式不改变缓存默认关闭、默认Sol、用户提供的Sol/Luna单价、CU价格或证据校验逻辑。
+本地`cu-diff-web`仍默认仅监听`127.0.0.1`并使用Azure CLI凭据。
 
 ### Web 验证
 
