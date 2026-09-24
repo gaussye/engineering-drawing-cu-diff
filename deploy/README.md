@@ -84,6 +84,23 @@ root), `Python` (default `python`), `AuthMode` (`entra` by default), `DemoCreden
 Keep `DeploymentId` and all resource names for later reruns. Losing them is not a
 reason to adopt or delete a resource automatically.
 
+For repeat deployments, an operator may keep these parameters in ignored
+`local\appservice-target.json`. Include `AuthMode` and `DemoCredentialFile` when
+using demo login; otherwise the script's default is Entra. Store only the path to
+the hash-only credential settings, never the plaintext password or hash in this
+target file. Reuse the same resource names and `DeploymentId`:
+
+```powershell
+$deployment = Get-Content local\appservice-target.json -Raw | ConvertFrom-Json -AsHashtable
+.\deploy\Deploy-AppService.ps1 @deployment
+# After reviewing the preview and approving the existing target/cost:
+.\deploy\Deploy-AppService.ps1 @deployment -Execute -ApprovePaidResources
+```
+
+This file is operator-maintained and is not distributed with the repository.
+Do not pass a parameter both in the saved hashtable and again as an explicit
+argument; edit the hashtable when intentionally switching authentication mode.
+
 ```powershell
 # Synthetic packaging tests; never contacts Azure.
 python -m unittest discover -s tests -p test_deployment_package.py -v
@@ -155,7 +172,10 @@ files with mode 0600 where supported. Never use a public output directory.
 
 The deployment keeps Entra enforced during package build. Only after live health
 reports the new `auth_mode=demo` process does it disable platform EasyAuth and
-verify the application's login form and anonymous API denial. The application
+wait for the actual login form to become available, then verify anonymous API
+denial. Gateway changes can lag behind ARM read-back and application health;
+bounded retries do not accept a wrong form or an anonymously accessible API.
+The application
 refuses startup if credentials are missing/malformed. Unknown auth modes fail
 closed. Do not manually disable the gateway before the new application is ready.
 

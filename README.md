@@ -1,4 +1,4 @@
-# 工程图 CU 提取与证据差异
+# 工程图对比：Azure CU 提取、模型分析与证据复核
 
 Python CLI 与 Web 审阅台，使用 **Azure Content Understanding GA `2025-11-01`** 对两份原始 PDF
 分别进行全页 OCR/layout 提取，再进行有来源约束的语义比较。不是仅凭 LLM 看图总结。
@@ -6,9 +6,14 @@ Python CLI 与 Web 审阅台，使用 **Azure Content Understanding GA `2025-11-
 工程语义由所选Sol/Astra/Luna判断；旧版生成工程字段的模式仍可显式选择 `"engineering"`。
 支持 BOM、插头认证印字、线材印字、包装/标签、尺寸公差、备注及图框字段。
 本地 Web 另有独立图形候选通道：基于原始PDF渲染和CU布局来源，不额外调用生成模型。
-可选**模型语义配对＋CU局部复读**通道：让现有模型先提出跨版本区域对应关系，再高清裁剪复读，
+**模型语义配对＋CU局部复读**通道：让现有模型先提出跨版本区域对应关系，再高清裁剪复读，
 最后只用CU词级原文和坐标生成文字差异候选；原有全页通道仍保留为独立覆盖检查。
 文件名/料号不用于推断新旧顺序，必须由调用者指定。
+
+**当前交付形态：本地 Web + Azure App Service Demo + 分阶段 CLI。**
+本文按当前实现整理（2026-09-24）；当前演示配置使用轻量CU、默认GPT-6 Sol、
+缓存关闭和固定账号登录。以下区分“已部署Demo配置”“仓库示例”和“兼容旧配置”，
+不能把它们混为一套自动生效的默认值。
 
 **默认比较设计内容；“显示平移”“显示绘图缩放”两个复选框默认不勾选。**
 侧栏的“显示选项与说明”默认收起，点击后可查看复选框和完整说明；收起不会改变已选显示条件，也不会重新调用CU或模型。
@@ -16,27 +21,112 @@ Python CLI 与 Web 审阅台，使用 **Azure Content Understanding GA `2025-11-
 跨位置配对与受约束的对齐仍用于核对内容；移动/缩放同时伴随文字、线条或尺寸标注修改时，
 内容候选独立保留，不会因为关闭复选框就整项隐藏。不能可靠配对/对齐时明确待核。
 
-**阅读导航：** [运行](#运行powershell) · [分析逻辑详解](#分析逻辑详解) ·
-[讨论中的问题与修正](#讨论中的问题与修正脱敏归纳) ·
-[本地 Web](#本地-web-工程图审阅台不部署) · [验证与局限](#验证与局限)
+**阅读导航：** [当前配置](#当前配置与兼容边界) · [系统架构](#系统架构) ·
+[使用流程](#使用流程) · [首次运行](#运行powershell) ·
+[完整分析链路](#分析逻辑详解) · [本地 Web](#本地-web-工程图审阅台不部署) ·
+[耗时与费用](#每轮用量与费用) · [Azure部署与登录](#azure-app-service-托管) ·
+[验证与局限](#验证与局限)
 
 本文说明当前实现和设计取舍，不是客户差异报告。讨论中的例子均按通用问题归纳；
 本地模式下，客户原文、真实料号、截图、差异坐标、资源配置和调用用量明细仅保留在本地证据文件。
 显式部署App Service后，新上传的数据保存在所批准Azure区域的私有目录，不迁移历史本地文件。
 
+## 当前配置与兼容边界
+
+| 项目 | 当前演示配置 / 行为 | 新安装与兼容说明 |
+|---|---|---|
+| CU提取 | `extraction_profile: "layout"`，开启OCR/layout，不生成旧版工程字段 | 示例同为`layout`；旧配置缺省仍为`engineering` |
+| 分析模型 | 默认`gpt-6-sol`，可选择Astra/Luna | 菜单来自服务端批准的`models`；必须填写真实部署及版本/SKU，不会创建模型 |
+| 模型通道 | `enabled`、`text_pairing`、`visual_review`均开启 | **示例三项均为false以避免自动付费**；轻量Web必须显式开启前两项，视觉复核独立选择 |
+| 缓存 | 允许Azure调用的Web默认关闭历史缓存 | 只读缓存Web强制开启；CLI提取/模型命令沿用缓存优先，不受网页开关控制 |
+| 并行 | 每轮两侧CU默认并行，`cu_workers`缺省为2 | 只允许1或2；完整作业仍串行执行，运行中与排队中合计最多4个 |
+| 图形处理 | 本地表格/图形通道 + 已开启的模型高清复核 | 本地残差不调用Azure；模型高清复核是额外模型请求，二者不是同一通道 |
+| 云端用户登录 | 固定账号Demo表单，不再跳转Microsoft登录 | 通用部署脚本仍默认`entra`；必须显式指定`demo`及哈希配置，或复用已保存的部署参数 |
+| AI服务身份 | App Service系统分配托管身份 | 本地默认Azure CLI身份；网页登录账号不直接拥有或代替AI访问身份 |
+| 托管形态 | Linux Python 3.11、B2单实例、Waitress单进程 | 会话与作业在内存，不支持直接扩成多实例/多进程 |
+
+`completion_model: "gpt-5.4"`是旧工程字段模式的CU配置，不代表当前轻量CU仍调用GPT-5.4，
+也不代表网页分析模型是GPT-5.4。**CU内部模型和直接分析模型是两条独立调用路径。**
+选Sol/Astra/Luna不修改CU analyzer、共享模型映射或原有CU缓存身份。
+
+## 系统架构
+
+```mermaid
+flowchart LR
+    B["浏览器<br/>双图预览、证据、耗时、费用、PDF导出"]
+    subgraph Host["Azure App Service：单实例 / 单进程"]
+        A["用户访问控制<br/>Demo表单 或 Entra Easy Auth + 应用校验"]
+        W["Flask API + Waitress<br/>会话隔离 / CSRF / 文件版本校验"]
+        J["作业协调器<br/>配置快照 / 串行作业 / 双侧CU并行"]
+        E["本地证据校验与比较<br/>文字 / 表格网格 / 图形残差 / 坐标回映射"]
+        S["私有持久目录<br/>上传文件 / 响应缓存 / 作业审计"]
+        A --> W --> J
+        J --> E --> W
+        W --- S
+        J --- S
+    end
+    subgraph AI["已批准的现有 Azure AI 资源"]
+        CU["Content Understanding<br/>完整PDF提取 + 高清局部复读"]
+        M["Azure OpenAI v1<br/>Sol / Astra / Luna"]
+    end
+    B <-->|HTTPS| A
+    J <-->|系统托管身份| CU
+    J <-->|同一系统托管身份| M
+```
+
+- **浏览器**只访问应用API，不持有Azure token/API key，也不能指定任意模型部署；
+  仅显示服务端允许的选项和本轮运行信息。上传后即可预览，点击“开始对比”才运行分析。
+  Demo密码只用于应用登录，不转发给CU或分析模型。
+- **应用服务**协调提取与模型调用、校验来源并产生候选。模型只返回结构化建议，
+  不执行工具；不能直接以模型给出的文字、坐标或置信度充当原始证据。
+- **CU**负责提取原文、表格、布局和坐标；**直接模型**负责区域/文字对应及复核建议；
+  **本地代码**核对ID、原文、几何和像素证据；**人工**判断是否构成真实工程变更。
+- **持久存储与内存状态分离**：云端文件/缓存位于`/home/cu-review/data`、
+  `/home/cu-review/cache`，会话与队列仍在进程内。持久文件存在不等于重启后能恢复旧浏览器作业。
+- **身份分离**：系统分配身份仅在目标AI资源拥有CU Reader和OpenAI User。
+  Entra模式的专用用户分配身份只用于登录联合凭据；Demo模式保留该配置供切回，不给共享账号授予Azure角色。
+
+本地模式复用同一分析流水线，但仅绑定`127.0.0.1`，默认以Azure CLI获取AI访问token，
+文件写入启动参数指定目录，不启用云端Demo/Entra登录。不可直接将本地入口改成公网监听。
+
+## 使用流程
+
+1. **进入审阅台**：云端使用管理员提供的固定账号登录；本地直接打开启动时显示的回环地址。
+   真实URL、资源标识与凭据保存在操作员本机，不写入通用配置或此README。
+2. **上传原图与调整图**：明确新旧顺序。每份最多20MB、20物理页；同字节文件被拒绝比较。
+   系统保留原件，必要时制作旋转归一化副本，记录两种hash并生成预览。
+3. **选择本轮设置**：默认Sol、缓存关闭。手动开启缓存才优先读取历史结果；
+   提交后配置固定，分析中不能切换。关闭缓存意味着可能产生新的CU和模型费用。
+4. **执行完整分析链路**：两侧全页CU → 模型区域配对 → 有预算的高清裁剪与CU复读 →
+   局部文字/可选图形复核 → 全页剩余文字语义配对 → 本地表格与图形比较 → 来源校验后的结果汇总。
+   后续通道保留自己的覆盖检查，不只比较模型第一轮挑中的区域。
+5. **逐项复核**：默认轻量模式显示“模型 + OCR + 表格 + 图形”。
+   点击候选同步定位原始证据，并查看低确定性、未配对、预算外和未覆盖范围；
+   不把“没找到”“没框出来”解释为“没有变化”。
+6. **查看耗时和费用**：图纸下方三个独立标签页为“证据详情 / 分析耗时 / 用量与费用”。
+   拖动分隔线可调整上下窗口；耗时按步骤表展示，费用按本轮总额、三个分项和明细展示。
+7. **导出与退出**：导出当前筛选和页面状态的PDF，不重新分析；下载内容仍是客户敏感资料。
+   退出撤销登录，不撤销已提交的AI调用、不删除持久缓存；重新登录需重新建立审阅会话。
+
+**结果是有来源的待复核候选，不是自动签核的变更清单。**
+提取置信度、配对确定性和图形匹配得分含义不同；不同模型输出数量不能直接当作准确率比较。
+需要精确率/召回率时，必须另建经人工标注的参考集。
+
 ## 隐私与前提
 
 - 只向明确授权的现有 Azure 资源上传输入，不使用第三方解析服务。
-  默认仅CU；启用模型比较后还会调用**同一资源、明确配置的现有模型部署**的Azure OpenAI v1接口。
+  仅提取命令只调用CU；当前完整Demo还调用**同一资源、明确配置的现有模型部署**的Azure OpenAI v1接口。
 - **客户 PDF、原文、图片、报告、原始响应、凭据不得提交到 GitHub，包括私有仓库。**
   默认 `output\` 和 `local\` 被忽略。建议将实际结果写在仓库外的持久本地目录。
   `.gitignore` 不是安全边界，提交前必须检查暂存内容。
-- Azure CLI 已 `az login`，当前身份有 CU 数据平面及自定义 analyzer 创建权限。
-  使用内存中的 Entra token，不读取/打印 API key，不保存 token。
+- 本地Azure CLI已`az login`，身份具备所用CU与模型的数据平面权限。
+  首次经批准创建analyzer时还需创建权限；Web只核对并使用已有analyzer，不需要也不会自行创建。
+  云端使用系统托管身份，不要求服务器执行`az login`。token仅在内存中，不读取/打印API key。
 - 先确认资源地域、CU `processing_location`（如 `geography`）和模型部署 SKU 的数据边界。
   **资源在某地域不意味着 GlobalStandard 模型处理仅发生在该地域。**
-- 只创建有 schema hash 名称的自定义 analyzer；不创建 Azure 资源/模型部署，
-  不修改共享 defaults、容量或模型。需在使用前取得该操作的授权。
+- 提取CLI只在经批准的初始化中创建带schema hash名称的analyzer；不创建Azure资源/模型部署，
+  不修改共享defaults、容量或模型。独立部署脚本可以经显式批准创建专用托管资源和分配权限，
+  但同样不创建AI模型或修改共享映射。
 - `config.example.json` 中 deployment_versions 必须记录实际模型版本和 SKU；
   模型升级后更新它，避免误复用缓存。实际配置存 `local\config.json`，不含密钥。
 
@@ -44,9 +134,24 @@ Python CLI 与 Web 审阅台，使用 **Azure Content Understanding GA `2025-11-
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python -m pip install -e .
+.\.venv\Scripts\python -m pip install -e ".[web]"
 New-Item -ItemType Directory -Force local
-Copy-Item config.example.json local\config.json # 填写真实配置
+if (-not (Test-Path local\config.json)) {
+  Copy-Item config.example.json local\config.json
+}
+```
+
+**先编辑`local\config.json`，不要把占位示例直接当作可运行的轻量Web配置：**
+
+1. 填写已批准的AI endpoint、实际部署名称及对应模型版本/SKU；删除未获批准的菜单项。
+2. 保持`extraction_profile: "layout"`，显式将`model_comparison.enabled`和`text_pairing`设为`true`。
+   若要启用当前Demo的非文字高清复核，再将`visual_review`设为`true`，它可能额外计费。
+3. 将`default_model`设为批准列表中的`gpt-6-sol`；未部署该模型时须改成真实可用的批准ID，
+   不能仅修改标签伪装成已部署。`completion_model`与网页模型选择不是同一设置。
+4. 核对CU处理地域与直接模型SKU的数据边界，再进行诊断和已授权的首次提取。
+
+```powershell
+az login
 
 .\.venv\Scripts\python -m cu_diff.cli diagnose --config local\config.json
 
@@ -60,6 +165,11 @@ Copy-Item config.example.json local\config.json # 填写真实配置
   --new C:\local-results\drawing-diff\new.response.json `
   --output C:\local-results\drawing-diff --extraction-profile layout
 ```
+
+上述`compare`只是已提取原文的离线比较，**不等于完整Web流水线**，也不会调用模型做语义配对。
+首次`extract`会核对/按授权创建对应analyzer，并分析两份输入；已有analyzer和有效响应时不要为启动Web重复执行。
+然后按[本地Web启动命令](#本地-web-工程图审阅台不部署)使用同一配置和缓存目录启动审阅台。
+Web默认仍关闭历史缓存；若希望复用刚才提取的结果，须在页面显式开启缓存。
 
 `extract` 保持 OCR 开启，即使 PDF 有少量原生文本；工程图大量文字可能是矢量轮廓。
 同一输入 SHA256 + 完整 analyzer + API + 模型映射/版本 + 处理边界缓存已完成结果。
@@ -131,7 +241,9 @@ CU未返回图形分区时，本地图形通道仍采用已有整页回退并记
 创建 analyzer/上传文件之前停止；不会偷偷换成其它模型。轻量模式不使用completion模型，
 因此不以该模型的支持列表作为OCR提取的前提。
 
-## 模型语义配对与局部复读（可选）
+## 模型语义配对与局部复读
+
+本节链路在当前Demo中已开启；对新示例/旧配置仍需要显式授权启用。
 
 这不是针对某个客户标题、料号或标签的特例。模型读两边全页图像和CU来源目录，按语义提出
 规格表、图框、标注、印字等区域的对应关系；字段名不同、移动、换行不要求用固定字符串配对。
@@ -193,11 +305,14 @@ CU未返回图形分区时，本地图形通道仍采用已有整页回退并记
 图形模型认为未变并不保证视觉差异完整性；图形来源、裁剪映射、实际模型用量和覆盖记录保留在JSON中。
 
 在实际配置中设置 `model_comparison.enabled: true` 才会启用（示例默认关闭，旧配置行为不变）。
-默认复用 `completion_model` 指向的现有部署；也可以同时设置
+未经过Web菜单配置快照、且未指定独立部署时，复用`completion_model`指向的现有部署；也可以同时设置
 `model_comparison.deployment` 与 `model_comparison.deployment_version`，独立指定同一资源上的
 比较模型部署及实际模型版本/SKU。两个字段必须同时填写或同时为空，不自动回退到别的模型。
 这不会改变CU提取模型、CU analyzer或既有CU缓存；只改变语义配对/局部核对模型及其请求缓存。
 界面分别显示CU模型和比较部署。程序不创建或修改资源、分析器或模型部署。
+Web通过`AnalysisOptions`把所选菜单ID转换为本轮的上述两个独立部署字段；
+独立`model-compare` CLI不读取网页菜单默认值，若要使用Sol等模型，须在其配置中明确填入
+`model_comparison.deployment`和`deployment_version`，不能仅依赖`default_model`。
 **直接模型请求遵循该部署的地域/SKU处理边界，不继承CU的 `processing_location` 限制。**
 启用前必须确认两者都获批准；GlobalStandard不能当作区域内处理保证。
 
@@ -235,7 +350,7 @@ usage来自实际模型/CU响应，配置单价时另行提供费用估算。缓
 
 | 文件 | 内容 |
 |---|---|
-| `old.response.json` / `new.response.json` | 完整 CU 字段、OCR、表格、图形、source/confidence、usage |
+| `old.response.json` / `new.response.json` | 所选profile实际返回的完整CU响应、OCR、表格、source/confidence和usage；轻量模式不生成工程字段 |
 | `*.inspection.json` | SHA256、物理页尺寸、原生词/位图/矢量路径数量 |
 | `*.metadata.json` | 输入 hash、analyzer/schema、模型版本、操作地址与实际耗时 |
 | `api-events.json` | 当前运行的 HTTP 状态、请求 ID、延迟；可能含服务错误，按敏感结果保管 |
@@ -246,7 +361,7 @@ usage来自实际模型/CU响应，配置单价时另行提供费用估算。缓
 另有严格限定的例外，见后文。保留原始字符，标准号/料号/尺寸不转数字。
 唯一功能角色键优先配对，其余默认用保守的文字/坐标候选；启用下述 `text_pairing` 后，
 剩余字段/OCR改用LLM来源编号配对，不把变更后的料号作为身份键。
-全量 OCR 是独立遗漏检查通道，不能将其与字段差异计数相加。
+旧工程字段模式中全量OCR是独立遗漏检查通道；轻量模式中它是主文字证据，不能将重叠通道的差异计数相加。
 保留未配对区域、低置信度的“相同”内容和服务警告；高置信度不是正确率保证。
 BOM 先以稳定部件描述而不是位置行号配对，避免行重排造成错配。生成的解释文字
 不同但原文一致时，单列 `interpretation_only`，不计为原文修改。
@@ -280,12 +395,16 @@ CU 负责两份文档各自的提取，不直接给出可信的“旧图对新�
 
 | 阶段 | 实际处理 | 必须保留的证据或约束 |
 |---|---|---|
+| 访问与配置 | 本地回环访问或云端登录；固定本轮模型、缓存策略和文件版本 | 浏览器不可指定任意部署；用户登录与AI身份分开 |
 | 输入与身份 | 显式指定 old/new；检查 PDF、页数、hash，生成即时预览 | 原件只读；不由文件名、料号判断时间顺序 |
 | 坐标准备 | 检查页尺寸和旋转；Web 必要时生成外观保持的分析副本 | 原件 hash 与分析副本 hash 分开记录；不能只凭宽高相同复用坐标 |
-| 全页提取 | 分别对完整 PDF 获取 OCR、layout、表格、图形区域和领域字段 | 优先缓存；保留完整响应、原文、source、confidence 和警告 |
-| 文本配对 | BOM 角色、唯一字段键、受限文字/坐标候选；另做 OCR 行检查 | 提取置信度与配对确定性分开；未配对不自动成为增删 |
-| 列级细化 | 把 BOM 字段关联到同侧实际表格行，按表头角色对齐列 | 列文字须与结构化行文字相符；仅变化列提供差异框 |
-| 非BOM表格 | 结合PDF网格和已有CU文字，核对规格/修订等表格的单元格、列及网格结构 | 对应依据、网格测量与OCR内容分开记录；缺失列不伪造对侧位置 |
+| 分析器准备与全页提取 | 核对已有analyzer；默认双侧并行处理完整PDF，轻量模式只取OCR/layout等原始证据 | Web缓存默认关闭；实际读取/提交/续查及usage均记录，缺失数据不伪装成空结果 |
+| 模型区域配对 | 比较模型查看限页概览和CU来源目录，提出区域对应及疑点 | 只能引用本轮合法来源；预算外保留待核，不截断后假装完整 |
+| 高清局部复读 | 从原PDF裁剪；每个合规区域的两侧CU并行复读，模型再核对局部文字 | 原页/裁剪坐标可追溯；文字差异框来自CU词，不来自模型猜测 |
+| 模型非文字复核 | 当前Demo已开启；双侧子特征复核或单侧对象/对侧搜索 | 独立预算与用量；模型建议须经过本地定位/残差核验，否则保留待核 |
+| 全页文字配对 | 稳定键、BOM角色和已有安全对应之后，模型处理剩余字段/OCR来源 | 轻量模式以OCR为主；提取置信度与配对确定性分开，未配对不自动成为增删 |
+| 旧模式列级细化 | 把生成的BOM字段关联到同侧实际表格行，按表头角色对齐列 | 属于engineering字段通道；轻量BOM走下方表格专项 |
+| 表格专项 | 结合PDF网格和已有CU文字，核对BOM、规格/修订等表格的单元格、列及网格结构 | 轻量模式含BOM；不重新调用CU，缺失列不伪造对侧位置 |
 | 本地图形 | 配对父图形区、拆分子图、跨位置匹配、受约束对齐与残差比较 | 原 PDF 渲染、可追溯坐标；不额外调用生成模型 |
 | 审阅与输出 | 显示两侧实际来源、设计内容候选、未配对与覆盖限制 | 平移/绘图缩放默认隐藏，可分别勾选；可选提示不计内容变更 |
 
@@ -303,7 +422,9 @@ OCR 遗漏仍可能影响文本比较和后续图形中的文字掩膜。
 
 ### 字段、OCR 与 BOM 怎样建立对应
 
-字段同时保留 `RawText`（提取原文）、`Detail`（生成解释）、类别、区域、键和来源。
+本小节的工程字段/BOM角色键首先描述`engineering`兼容路径；
+`layout`不生成这些字段，以OCR主证据、模型语义对应和表格专项实现当前Demo的文字/BOM比较。
+工程字段同时保留`RawText`（提取原文）、`Detail`（生成解释）、类别、区域、键和来源。
 一般字段优先采用两侧唯一的 `region + category + key`；重复键不强行一一对应。
 BOM 更早采用同区域中唯一的部件描述/角色，重复描述可用唯一且完全一致的行内容消歧，
 避免把位置行号或可能变化的料号当成不变的身份。
@@ -367,9 +488,10 @@ Web 因此增加独立的“表格专项证据”通道，默认与字段和图�
   --old C:\local-results\old-analysis.pdf --new C:\local-results\new-analysis.pdf `
   --old-response C:\local-results\old.response.json --old-metadata C:\local-results\old.metadata.json `
   --new-response C:\local-results\new.response.json --new-metadata C:\local-results\new.metadata.json `
-  --output C:\local-results\tables
+  --output C:\local-results\tables --include-bom
 ```
 
+上例包含轻量模式的BOM覆盖；复现旧工程字段模式的非BOM补充通道时省略`--include-bom`。
 本地输出 `tables.json`（完整来源、覆盖诊断）与 `tables.zh.md`（中文证据表）。
 原生文字、矢量轮廓文字和位图的逐区域来源分类仍不是本demo的输出；
 网格检测也不意味着已实现任意版式的通用表格识别。
@@ -478,7 +600,7 @@ CU 的一个 `figure` 可能包含多个视图、局部放大图、引线和文�
 当同一参数的文字框发生位移、数值改变或CU生成了不同字段名时，文字相似度加框重叠阈值可能
 留下两条未配对记录。可在已批准模型部署的 `model_comparison` 中同时设置
 `"enabled": true`、`"text_pairing": true`，启用**语义对应 → 来源校验 → 原文比较 → CU变化词定位**。
-`text_pairing` 默认关闭，不改变旧配置及离线 `compare` 命令；启用时不再使用
+`text_pairing`在示例/旧配置中默认关闭，在当前轻量Demo中已开启，不改变离线`compare`命令；启用时不再使用
 `geometry_text` 来配对变化文字，稳定身份与完全相同文本的已有安全配对仍保留。
 
 每轮至多增加**一个批量模型请求**：发送仍未配对的字段/OCR来源目录、局部上下文和限页预览。
@@ -587,7 +709,8 @@ PDF渲染、裁剪与目录组装仍在协调线程完成，不在线程间并�
 CU分析文件hash。两侧字节相同会在前后端阻止对比，避免无意义CU调用；不同hash仅证明
 文件字节不同，不证明每处画面不同。前端接收结果时核对两侧文件ID和hash，拒绝错源结果。
 
-默认显示结构化字段和图形候选，不把独立OCR辅助通道重复计入。已配对的原文差异、
+轻量模式默认显示模型、OCR主证据、表格和图形候选；旧工程字段模式以字段代替OCR主通道，
+不把辅助OCR重复计入。已配对的原文差异、
 印刷行号变化和图形内容候选使用红框。两个独立复选框默认不勾选：
 “显示平移（含视图交换）”“显示绘图缩放（非实物尺寸）”；选中后可在当前通道/
 复核筛选范围内显示可选条目及黄色视图范围框，取消后同时清除相应列表、框和选中详情。
@@ -606,7 +729,7 @@ CU分析文件hash。两侧字节相同会在前后端阻止对比，避免无�
 并勾选“显示仅解释差异”可查看生成解释；解释不同不计为原文差异。
 低置信度、OCR辅助通道、未配对及覆盖限制需人工审阅，不能宣称完整几何变更检测。
 
-### 导出当前对比到PDF（本地，不重新分析）
+### 导出当前对比到PDF（服务端生成，不重新分析）
 
 完成对比、两侧预览载入后，可点击顶部“导出 PDF”。导出以**点击时**的证据通道、
 复核范围和三个显示开关为准，不会把隐藏候选重新加入，也不会只导出当前选中的一条。
@@ -626,7 +749,8 @@ CU分析文件hash。两侧字节相同会在前后端阻止对比，避免无�
 
 这是已有对比的界面快照，不重新调用CU、模型或重新定位；导出操作不新增上述分析费用。
 下载文件包含客户图纸与提取内容，应按敏感客户产物保管，禁止提交Git。
-服务在本地内存中生成并返回PDF，不覆盖原件，不把任意客户端路径或HTML作为文件/资源加载。
+服务在运行它的主机内存中生成并返回PDF（本地电脑或App Service），不覆盖原件，
+不把任意客户端路径或HTML作为文件/资源加载。
 导出受会话、CSRF、作业、文件版本和ID/hash校验保护；文件更换或结果失效后拒绝旧证据导出。
 上传替换会取消浏览器中的未完成下载；导出过程中切换显示条件不改变已捕获的快照。
 未完成对比、预览未载入时按钮禁用；内容超过导出上限时明确报错，不悄悄删减详情。
@@ -709,14 +833,23 @@ CU分析文件hash。两侧字节相同会在前后端阻止对比，避免无�
 
 | 模块 / 入口 | 负责内容 |
 |---|---|
-| `cu_diff\client.py` | CU 请求、Entra 身份、缓存、异步续查及请求级模型映射 |
+| `cu_diff\appservice.py`、`hosting.py`、`demo_auth.py` | 云端启动、HTTPS/身份边界、Demo登录会话和退出；云端强制系统托管身份 |
+| `cu_diff\schema.py`、`client.py` | profile/analyzer契约、CU请求、Azure CLI或托管身份、缓存、异步续查及请求级模型映射 |
+| `cu_diff\analysis_options.py`、`parallel.py` | 批准模型菜单、本轮配置快照、双侧CU并行与同键去重 |
+| `cu_diff\model_client.py`、`model_compare.py` | 直接模型请求/缓存、全页区域配对、高清CU复读和局部文字核验 |
+| `cu_diff\semantic_text.py` | 剩余字段/OCR的语义配对、引用合法性与变化词定位 |
+| `cu_diff\model_visual.py`、`model_presence.py` | 双侧非文字复核、单侧对象及对侧搜索，区分模型建议与渲染证据 |
 | `cu_diff\compare.py` / `compare_documents` | 字段、BOM 角色和 OCR 对应；原文/解释/格式分类 |
 | `cu_diff\table_diff.py` / `refine_bom` | 从原始 CU 表格细化变化列 |
+| `cu_diff\document_tables.py` | PDF网格与CU文字的表格专项，轻量模式包含BOM |
 | `cu_diff\evidence.py`、`cu_diff\web_evidence.py` | source 解析、限定归一化和 Web 坐标映射 |
 | `cu_diff\graphics.py` / `compare_graphics` | 父图形配对、同尺度渲染、配准、残差、长线规则、覆盖与证据 |
 | `cu_diff\subviews.py` / `extract_subviews`、`pair_subviews`、`order_reversals` | 子图分段、外观唯一配对；内部顺序检查仅辅助独立对齐 |
 | `cu_diff\web.py` / `Store.run_job` | 串联 CU/缓存、文字比较、图形比较，发布结果并记录作业审计 |
+| `cu_diff\timing.py`、`usage.py` | 墙钟阶段计时、本轮/历史用量归属、三分项费用与未知口径 |
+| `cu_diff\pdf_export.py`、`report.py` | 界面快照PDF与CLI证据报告，不新增模型总结调用 |
 | `cu_diff\static\app.js` | 按类别筛选、文档身份/旧结果防护、框与上下文导航 |
+| `deploy\Deploy-AppService.ps1`、`package_appservice.py`、`verify_http.py` | 资源归属检查、源码白名单打包、受保护发布及真实HTTP边界验证 |
 
 图形条目的 `graphics.subview` 记录两侧子图编号、配对得分和领先次佳的差值及绘图大小。
 不以子图顺序反转作为内容结论。可选条目的 `translation_pt={dx,dy}` 是纸面中心位移，
@@ -777,11 +910,11 @@ CLI 默认不输出可选变换条目；追加 `--include-translation`、`--incl
   前后本地渲染像素hash一致（最多200万像素的校验图），才复用其坐标。不是仅凭宽高
   相同判断旋转/裁剪坐标正确。否则CU与预览使用同一零旋转副本，不猜测旋转变换。
   保存副本不生成随机PDF ID，重复上传可复用同一规范化缓存。普通零旋转PDF不改字节。
-- `--cache-dir` 可指向已有 CLI `cache` 目录；命中缓存不会再次提交分析请求。
+- `--cache-dir`可指向已有CLI的`cache`目录；Web还须开启缓存，命中后才不会再次提交分析请求。
   `usage` 是原分析历史用量，不能当作缓存命中时新增计费。
 - 不传 `--allow-azure-upload` 时是**只读缓存模式**：仍需 Entra 对已有 analyzer
   做只读核对；缓存未命中会明确失败，不自动产生计费上传。已提交异步操作可续查。
-- 单个服务进程仍串行处理完整分析作业、最多排队4个；作业内仅两侧CU可并行，
+- 单个服务进程仍串行处理完整分析作业、运行中与排队中合计最多4个；作业内仅两侧CU可并行，
   使用同一客户端的缓存键锁避免重复提交和写入冲突。
   **不要让多个服务进程/CLI并发写同一缓存目录**；当前未实现跨进程锁。
 
@@ -883,6 +1016,7 @@ CU的`input`是否包含`cached-input`也尚未核实：保留原始计数，显
 `model.gpt-5.4.output`。单位为`pages`或`tokens`，金额=`数量×单价÷unit_quantity`；
 相同适用条件的自定义条目覆盖快照对应项。缺失/冲突/无法判定的价格不伪装成零。
 税、汇率、协议折扣和其他资源费用不包含在估算中，实际金额以Azure账单为准。
+App Service B2的持续托管费用也不计入“本轮分析总费用”，空闲时仍可能产生托管账单。
 
 示例配置按2026-09-24用户提供的GPT-6 Sol报价设置以下USD单价，**每项单位均为100万token**：
 
@@ -937,7 +1071,8 @@ CLI `extract`输出本轮`usage-cost.json`，`model-compare`输出`model-usage-c
 ### Azure App Service 托管
 
 `python -m cu_diff.appservice`是专用云端入口，依赖`pip install ".[appservice]"`。
-**准备了部署支持不代表已经部署成功**；实际URL和权限需部署后验证，不能用本地测试代替。
+当前Demo已完成实际部署及登录/权限验证；**另一个环境不能继承此结论**，
+仍须核对自己的实际URL、访问控制和AI权限，不能以本地测试或ARM配置代替运行验证。
 发布步骤和参数见[部署说明](deploy/README.md)。`deploy\Deploy-AppService.ps1`默认仅预览，
 实际执行需要同时传入`-Execute -ApprovePaidResources`；脚本会在云端写操作前检查配额。
 
@@ -954,7 +1089,8 @@ CLI `extract`输出本轮`usage-cost.json`，`model-compare`输出`model-usage-c
   `Cognitive Services OpenAI User`，不更改模型部署、共享映射或创建analyzer。
   缺少托管身份或权限时明确失败，不回退到其他身份。
 - Easy Auth采用专用用户分配身份及Entra联合凭据进行无密钥登录；
-  此登录身份不授予AI权限，也不复用于其他应用。
+  此登录身份不授予AI权限，也不复用于其他应用。当前Demo显式使用应用登录，
+  平台Easy Auth关闭，但所有业务API、文件、预览、导出和应用静态资源仍受应用认证保护。
 - 部署包仅包含代码、静态资源、公开价格快照和依赖声明。
   **不包含`local`、原图、提取结果、报告、缓存、日志或历史审计**。
   资源配置经App Settings传入，不提交Git。上传数据和缓存保存在App Service私有持久目录
@@ -962,14 +1098,14 @@ CLI `extract`输出本轮`usage-cost.json`，`model-compare`输出`model-usage-c
   云端用户新上传的文件会保存在Azure；不是仅浏览器内处理。原本的24小时会话清理及缓存
   长期保留规则仍然适用，上线前须确认客户允许的存储区域和保留策略。
 
-入口必需环境变量：
+入口配置（Demo专用变量仅在该模式必需）：
 
 | 变量 | 含义 |
 |---|---|
 | `CU_CONFIG_JSON` | 已批准的完整运行配置JSON；入口强制`auth.mode=managed_identity` |
 | `CU_PUBLIC_ORIGIN` | 无路径的站点HTTPS地址，必须匹配App Service主机名 |
 | `CU_TENANT_ID` | Entra租户ID |
-| `CU_ALLOWED_PRINCIPALS` | 允许登录的object ID，逗号分隔且不能为空 |
+| `CU_ALLOWED_PRINCIPALS` | Entra允许登录的object ID，逗号分隔且不能为空；Demo仍保留合法配置供切回 |
 | `WEBSITE_HOSTNAME` | App Service提供的站点主机名 |
 | `WEBSITE_AUTH_ENABLED` | Entra模式必须为`true`；未启用时拒绝启动 |
 | `CU_WEB_AUTH_MODE` | 默认`entra`；显式`demo`使用固定账号登录 |
@@ -981,6 +1117,8 @@ CLI `extract`输出本轮`usage-cost.json`，`model-compare`输出`model-usage-c
 服务端App Settings仅保存密码哈希。生成、部署与轮换见[Demo登录说明](deploy/README.md#fixed-account-demo-login)。
 登录会话最长8小时，退出立即撤销；登录后每个浏览器仍有独立的图纸审阅会话，
 不同登录不能借用另一会话Cookie。登录与API都校验CSRF，登录总尝试限制为每分钟10次。
+未登录的表单校验会话最长10分钟，登录记录上限128；审阅会话上限仍为16。
+退出或过期登录会释放闲置的审阅槽位，正在上传/运行的任务保留到完成后再清理。
 重启、重新部署或密码轮换会清空登录会话；退出不会取消已经提交的AI请求或删除持久缓存。
 这是共享账号演示模式，没有实名审计、MFA或分布式防护，不适合生产。
 它只替代网页用户登录，不改变应用访问CU/模型的托管身份与权限。
@@ -988,10 +1126,58 @@ CLI `extract`输出本轮`usage-cost.json`，`model-compare`输出`model-usage-c
 托管模式不改变缓存默认关闭、默认Sol、用户提供的Sol/Luna单价、CU价格或证据校验逻辑。
 本地`cu-diff-web`仍默认仅监听`127.0.0.1`并使用Azure CLI凭据。
 
+#### Demo账号在哪里，如何更新部署
+
+操作员首次生成账号（**已有目录会拒绝覆盖，不要每次发布都重建密码**）：
+
+```powershell
+.\.venv\Scripts\python -m pip install -e ".[appservice]"
+.\.venv\Scripts\python deploy\create_demo_login.py --directory local\demo-login --username demo
+```
+
+| 本机文件 | 用途 | 可以上传到哪里 |
+|---|---|---|
+| `local\demo-login\credentials.json` | 固定用户名和**明文密码**，查看`password`字段；仅交付给获准使用Demo的人 | 不上传Azure配置、Git或部署ZIP |
+| `local\demo-login\settings.json` | 用户名与`scrypt`密码哈希；部署脚本只接受这两个字段 | 仅经部署脚本写入目标应用App Settings，不提交Git |
+| `local\appservice-target.json` | 操作员保存的订阅/资源/归属ID、配置路径、`AuthMode`与`DemoCredentialFile`路径 | 仅本机复用，不打包、不提交Git |
+
+必须限制凭据目录的本机ACL/权限。可在项目根目录执行
+`notepad .\local\demo-login\credentials.json`查看密码，复制值时不包含JSON的双引号。
+不要把密码放在README、聊天截图、命令行参数、日志或`config.example.json`中。
+轮换时生成到另一个忽略目录，再修改部署参数所指向的`settings.json`并重新发布；
+重启将终止现有登录。共享账号没有逐人撤销能力。
+
+首次部署先按照[完整部署说明](deploy/README.md)填写参数并确认资源费用、地域、权限。
+已经保存**自己环境**参数的操作员可复用：
+
+```powershell
+# PowerShell 7.2+；此文件由操作员维护，不随仓库分发。
+$deployment = Get-Content local\appservice-target.json -Raw | ConvertFrom-Json -AsHashtable
+
+# 默认预览，不调用Azure、不部署。
+.\deploy\Deploy-AppService.ps1 @deployment
+
+# 确认目标、归属ID及费用授权后才执行；不要复制其他环境的真实资源标识。
+.\deploy\Deploy-AppService.ps1 @deployment -Execute -ApprovePaidResources
+```
+
+Demo参数中必须包含`AuthMode: "demo"`及`DemoCredentialFile`路径；仅传`Execute`不会发布，
+未指定认证模式则按`entra`处理。复用原`DeploymentId`和资源名称，不创建替代资源来绕过归属检查。
+
+**发布顺序：** 本地检查与源码白名单打包 → 配额/资源归属/现有AI资源检查 →
+专用托管资源与最小AI权限核对 → 网络隔离下配置 → 先保留Entra保护进行代码部署 →
+确认新进程的Demo健康标记 → 关闭平台Entra门禁 → 等待真实登录表单可用并核对匿名拒绝。
+Azure认证配置有传播延迟，ARM写入成功不等于网页已经切换；超过等待上限或验证失败时，
+脚本会尝试关闭该应用公网访问，而不是留下无认证入口。
+
+发布后应确认真实浏览器登录/退出、匿名API拒绝、合成文件上传预览、其他浏览器隔离，
+以及实际系统身份的CU/OpenAI资源级权限。源码包不迁移本机历史图纸、缓存或结果。
+需要切回Entra时显式选择`entra`并移除Demo凭据参数；不得只手动关闭应用登录而公开API。
+
 ### Web 验证
 
 ```powershell
-.\.venv\Scripts\python -m pip install -e ".[web,test]"
+.\.venv\Scripts\python -m pip install -e ".[appservice,test]"
 .\.venv\Scripts\python -m playwright install chromium
 $env:CU_BROWSER_TESTS = "1"
 .\.venv\Scripts\python -m unittest discover -s tests -v
@@ -1003,8 +1189,9 @@ $env:CU_BROWSER_TESTS = "1"
 失败反馈、会话隔离、CSRF/Host校验、上传内容/大小/页数限制和旋转外观保持。
 真实客户文件的浏览器验证截图/记录只能写在忽略目录或会话持久目录，不能提交仓库。
 
-实现提交 `b19fce4` 的历史验证快照为 **138 项测试通过**，包含字段/BOM/日期、
-缓存与后端、图形引擎和 Chromium 回归；这不是每个后续版本自动继承的通过证明。
+登录回归还覆盖错误密码、过期/退出后的Cookie重放、跨登录会话隔离、CSRF、
+限流、审阅容量释放、真实浏览器表单和移动端布局。云端入口拒绝缺失或无效的认证配置，
+原本地与Entra模式均有独立回归。测试数量以当前运行输出为准，不继承历史提交的通过数字。
 子图合成用例覆盖不同视图交换、单个移动、移动同时改形状/文字、重复外观拒绝强配、
 原图不变、统一平移不重复计数、绘图缩放不被抹掉、页面边框/旋转、未覆盖墨迹和候选超限。
 内容优先版本把纯平移/交换作为“零内容差异”负例，并检查随视图移动的不变标签不误报、
@@ -1021,7 +1208,7 @@ $env:CU_BROWSER_TESTS = "1"
 - 核对跨位置对应的是同一外观视图：纯平移/绘图缩放默认隐藏，实际内容变化仍保留；
   勾选对应复选框后才显示可选视图提示/黄色范围框，取消后列表、框和详情一起消失。
 - 在适应宽度、150%、200%及不同 DPR 下量测框与预览；检查换文件后旧框失效。
-- 重上传原件并验证 hash 缓存再次命中；核对当前作业的 analyze POST 和 usage 归属。
+- 显式开启缓存后重上传原件，验证hash缓存命中；核对当前作业的analyze POST和usage归属。
 - 保存剩余不确定项和覆盖限制；没有框不等于无变化，候选数量不等于真实变更数量。
 
 已有授权真实文件验证不等于多客户、多图种评测。若要给出精确率/召回率，需要单独建立
