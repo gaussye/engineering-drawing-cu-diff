@@ -204,45 +204,68 @@
       content.append(el("p", "usage-empty", "暂无用量数据。开始对比后显示本轮记录；旧结果未提供用量时，不推算为零。"));
       return;
     }
-    const summary = usage.summary || {}, current = summary.current || {}, reused = summary.reused || {}, requests = summary.requests || {};
+    const summary = usage.summary || {}, current = summary.current || {}, requests = summary.requests || {};
+    const breakdown = summary.current_breakdown || {};
+    const entries = Array.isArray(usage.entries) ? usage.entries : [];
     const heading = el("div", "usage-heading");
-    heading.append(el("h3", "", "本轮新增用量 / USD 估算"),
-      el("span", "usage-note", `记录状态：${({ complete: "完整", partial: "部分数据 / 估算不完整", unavailable: "不可用" })[usage.status] || "未提供"} · 价格日期：${usageText(usage.price_as_of)}`));
-    const cards = el("div", "usage-cards");
-    function card(id, title, value, note) {
+    heading.append(el("h3", "", "本轮费用估算"),
+      el("span", "usage-note", "USD · 只计算本轮新增费用，不计入历史缓存参考金额"));
+    const total = el("section", "usage-total");
+    total.id = "usage-current-cost";
+    total.append(el("h4", "", "本轮总费用估算"),
+      el("p", "usage-value", usageCost(current.estimated_cost, current.estimated_cost_range, "费用未完整估算")),
+      el("p", "usage-note", "总额 = CU 分析费用 + CU 内部模型费用 + 分析模型费用"));
+    if (!usageNumber(current.estimated_cost)) total.append(el("p", "usage-note",
+      `已知费用小计（不等于完整总额）：${usageNumber(current.known_cost) ? usageMoney(current.known_cost) : "未提供"}${usageRange(current.estimated_cost_range?.min, current.estimated_cost_range?.max)
+        ? " · 显示的是价格/用量场景范围，不是账单上下限" : " · 仍有项目待核，不能当作零费用"}`));
+    const cards = el("div", "usage-cards usage-components");
+    const components = [
+      ["cu_analysis", "usage-current-cu", "CU 分析费用", "文档提取与上下文处理"],
+      ["cu_model", "usage-current-cu-model", "CU 内部模型费用", "CU 内部生成模型（如 GPT-5.4）"],
+      ["analysis_model", "usage-current-model", "分析模型费用", "所选分析模型，不包含 CU 内部模型"],
+    ];
+    for (const [key, id, title, note] of components) {
+      const part = breakdown[key], valid = part && typeof part === "object";
       const node = el("section", "usage-card");
       node.id = id;
-      node.append(el("h4", "", title), el("p", "usage-value", value), el("p", "usage-note", note));
+      node.dataset.component = key;
+      node.append(el("h4", "", title), el("p", "usage-value", valid
+        ? usageCost(part.estimated_cost, part.estimated_cost_range, "待核")
+        : "未提供分项"),
+        el("p", "usage-note", valid ? note : "旧报告未提供此费用拆分，不推算为零。"));
+      if (key !== "cu_analysis" && part?.status !== "not_applicable") {
+        const models = [...new Set(entries.filter((entry) => entry?.service === (key === "cu_model" ? "cu" : "model"))
+          .map((entry) => entry.model).filter((model) => typeof model === "string" && model))];
+        if (models.length) node.append(el("p", "usage-note", `模型：${models.join("、")}`));
+      }
+      if (valid && part.status === "not_applicable") node.append(el("p", "usage-note", "本轮未启用此计费项"));
+      if (valid && typeof part.explanation === "string") node.append(el("p", "usage-note", part.explanation));
+      if (valid && Array.isArray(part.notes)) part.notes.forEach((message) => node.append(el("p", "usage-note", message)));
       cards.append(node);
-      return node;
     }
-    card("usage-current-cost", "本轮新增估算费用",
-      usageCost(current.estimated_cost, current.estimated_cost_range, "费用未完整估算"),
-      `已知费用小计（不等于完整总额）：${usageNumber(current.known_cost) ? usageMoney(current.known_cost) : "未提供"} · 价格待核计量项 ${usageCount(current.unpriced_meters)} · 用量待核调用 ${usageCount(current.unknown_usage_calls)}`);
-    card("usage-current-cu", "CU 页面与上下文",
-      `${usageCount(current.cu_pages)} 页`,
-      `CU 上下文：${usageCount(current.contextualization_tokens)} token`);
-    card("usage-current-model", "模型 token（CU 内部 + 直接对比）",
-      usageCount(current.model_tokens),
-      `输入 ${usageCount(current.input_tokens)} · 其中服务端缓存输入 ${usageCount(current.cached_input_tokens)} · 输出 ${usageCount(current.output_tokens)}${cacheWriteNote(current)}`);
-    card("usage-requests", "调用来源（不是 token 缓存）",
-      `新提交 ${usageCount(requests.new)}`,
-      `本地缓存 ${usageCount(requests.cached)} · 恢复 ${usageCount(requests.resumed)} · 未知 ${usageCount(requests.unknown)}`);
-    content.append(heading, cards,
-      el("p", "usage-note", "仅为估算，不是账单。采用每项注明的公开参考价格或用户配置单价，不代表已核实合同价；未计税费或汇率换算。未知用量或价格意味着总额不完整，已知小计不是总额。"),
-      el("p", "usage-note", "规范化输入 token 包含服务端缓存输入，不重复相加；模型 token = 输入 + 输出，推理 token 已包含在输出内。缓存写入单列，不叠加模型总量。CU 原始输入与缓存输入是否重叠未确认时，规范化总量保持未知，不直接相加原始计数。本地缓存与恢复仅引用历史操作，不计入本轮新增用量或费用。"),
-      el("p", "usage-note", "场景估算区间来自后端假设，不是确定费用或账单上下限；短 / 长上下文适用门槛或 CU 用量语义未确认时，不擅自选择档位，不将候选价格或场景端点相加。价格待核包含已核实单价但适用档位未确认的情况；用量待核包含已返回 API 计数但缓存重叠语义未确认的情况。"));
-    const history = el("section", "usage-history");
-    history.id = "usage-history";
-    history.append(el("h4", "", "历史缓存 / 恢复参考 · 非本轮新增计费"),
-      el("p", "", `历史参考费用：${usageCost(reused.estimated_cost, reused.estimated_cost_range)} · 已知参考小计（非总额）：${usageNumber(reused.known_cost) ? usageMoney(reused.known_cost) : "未提供"}`),
-      el("p", "", "参考费用按当前配置的价格快照重估历史用量，不是原始日期的账单或当时实际支付费用。"),
-      el("p", "", usageMetrics(reused)),
-      el("p", "", `历史价格待核计量项 ${usageCount(reused.unpriced_meters)} · 历史用量待核调用 ${usageCount(reused.unknown_usage_calls)}`));
-    content.append(history);
-    if (Array.isArray(usage.warnings)) usage.warnings.forEach((warning) => content.append(el("p", "usage-warning", warning)));
-    const entries = Array.isArray(usage.entries) ? usage.entries : [];
-    if (!entries.length) content.append(el("p", "usage-note", "逐阶段调用明细：未提供。"));
+    const policy = el("details", "usage-policy");
+    policy.id = "usage-policy";
+    policy.append(el("summary", "", "估算口径与待核事项"),
+      el("p", "usage-note", "仅为估算，不是账单。采用每项注明的公开参考价格或用户配置单价，不代表已核实合同价；单价和价格日期见明细，未计税费或汇率换算。"),
+      el("p", "usage-note", "普通输入计费时扣除已报告的缓存输入，避免重复收费；推理 token 已包含在输出内。缓存写入单列，重叠口径未确认时保留待核。本地缓存复用与恢复历史操作不计入本轮新增费用。"),
+      el("p", "usage-note", "场景范围表示价格档位或用量语义尚未确认，不是账单保证或完整费用上限。费用与拆分均由服务端核算，页面不重新相加计量项。"),
+      el("p", "usage-note", `价格待核计量项 ${usageCount(current.unpriced_meters)} · 用量待核调用 ${usageCount(current.unknown_usage_calls)}。这些是核算提示，不是额外调用或收费次数。`));
+    if (Array.isArray(usage.warnings)) usage.warnings.forEach((warning) => policy.append(el("p", "usage-warning", warning)));
+    if (entries.some((entry) => entry?.model === "gpt-6-astra")) {
+      const official = el("p", "usage-note", "Astra 的 Global Standard 官方参考单价已于 2026-09-24 核对；本轮单价以各计量来源为准。短/长上下文分界未核实，未取得适用依据时显示价格场景范围。官网依据：");
+      official.append(usageSource("https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/provisioned-throughput-sizing#pay-as-you-go-prices-and-token-weights"));
+      policy.append(official);
+    }
+    const detailHeading = el("div", "usage-details-heading"), requestNote = el("p", "usage-note",
+      `本轮新提交 ${usageCount(requests.new)} 次 · 本地缓存 ${usageCount(requests.cached)} · 恢复 ${usageCount(requests.resumed)}（复用均不新增计费） · 来源未知 ${usageCount(requests.unknown)}`);
+    requestNote.id = "usage-requests";
+    detailHeading.append(el("h3", "", "费用细节"), requestNote);
+    const calls = el("div", "usage-current-calls"), reuse = el("details", "usage-reuse-records");
+    reuse.id = "usage-reuse-records";
+    reuse.append(el("summary", "", "未新增费用的复用 / 未提交记录"),
+      el("p", "usage-note", "这些记录不计入上方本轮总额；展开可核对原始用量和参考单价，历史参考费用不是本轮收费。"));
+    content.append(heading, total, cards, policy, detailHeading, calls);
+    if (!entries.length) calls.append(el("p", "usage-note", "逐阶段调用明细：未提供。"));
     entries.forEach((entry, index) => {
       if (!entry || typeof entry !== "object") return;
       const call = el("details", "usage-call");
@@ -324,8 +347,9 @@
         call.append(scroll);
       }
       if (Array.isArray(entry.warnings)) entry.warnings.forEach((warning) => call.append(el("p", "usage-warning", warning)));
-      content.append(call);
+      (["cached", "resumed", "not_submitted"].includes(entry.cache_state) ? reuse : calls).append(call);
     });
+    if (reuse.querySelector(".usage-call")) content.append(reuse);
     for (const id of opened) if ($(id)) $(id).open = true;
     if (focused && $(focused)) $(focused).focus({ preventScroll: true });
     $("usage-panel").scrollTop = scrollTop;

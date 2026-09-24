@@ -74,6 +74,221 @@ def latency_checkpoint():
     }
 
 
+def layout_record(**changes):
+    entry = record("cu", usage={"documentPagesStandard": 1}, **changes)
+    entry["metadata"] = {
+        "extraction_profile": "layout", "model_deployments": {},
+        "deployment_versions": {}, "selected_completion_model": None,
+    }
+    return entry
+
+
+class CurrentBreakdownTests(unittest.TestCase):
+    def pricing(self):
+        pricing = prices()
+        pricing["rates"] += luna_prices()["rates"]
+        return pricing
+
+    def assert_costs_add_up(self, report):
+        def check(total, groups):
+            self.assertEqual(set(groups), {"cu_analysis", "cu_model", "analysis_model"})
+            for field in ("known_cost", "estimated_cost"):
+                amounts = [group[field] for group in groups.values()]
+                if None in amounts:
+                    self.assertIsNone(total[field])
+                else:
+                    self.assertEqual(total[field], sum(amounts))
+            ranges = [group["estimated_cost_range"] for group in groups.values()]
+            if None in ranges:
+                self.assertIsNone(total["estimated_cost_range"])
+            else:
+                self.assertEqual(total["estimated_cost_range"],
+                                 {key: sum(bounds[key] for bounds in ranges) for key in ("min", "max")})
+        check(report["summary"]["current"], report["summary"]["current_breakdown"])
+        for entry in report["entries"]:
+            groups = entry["current_breakdown"]
+            check({"estimated_cost": entry["current_cost"],
+                   "estimated_cost_range": entry["current_cost_range"],
+                   "known_cost": sum(group["known_cost"] for group in groups.values())}, groups)
+
+    def test_ten_layout_pages_and_eight_luna_calls_have_exact_three_part_total(self):
+        entries = [layout_record(key=f"page-{i}") for i in range(10)]
+        entries += [luna_record(key=f"model-{i}") for i in range(8)]
+        original = copy.deepcopy(entries)
+        report = usage_report(entries, self.pricing())
+        current, groups = report["summary"]["current"], report["summary"]["current_breakdown"]
+        self.assertAlmostEqual(current["estimated_cost"], .051528)
+        self.assertEqual(current["cu_pages"], 10)
+        self.assertEqual(current["contextualization_tokens"], 0)
+        self.assertEqual(current["model_tokens"], 8*1200)
+        self.assertAlmostEqual(groups["cu_analysis"]["estimated_cost"], .05)
+        self.assertAlmostEqual(groups["analysis_model"]["estimated_cost"], 8*.000191)
+        self.assertEqual(groups["cu_model"]["estimated_cost"], 0)
+        self.assertEqual(groups["cu_model"]["status"], "not_applicable")
+        self.assertIn("layout", groups["cu_model"]["explanation"])
+        for entry in report["entries"][:10]:
+            self.assertEqual([m["key"] for m in entry["meters"]], ["cu.documentPagesStandard"])
+            self.assertEqual(entry["current_breakdown"]["cu_model"]["status"], "not_applicable")
+        self.assertEqual(entries, original)
+        self.assertEqual([entry["raw_usage"] for entry in report["entries"]], [entry["usage"] for entry in original])
+        self.assert_costs_add_up(report)
+
+    def test_layout_plus_astra_range_has_no_artificial_missing_cu_costs(self):
+        pricing = self.pricing()
+        for tier, values in (("short", (10, 1, 50)), ("long", (20, 2, 75))):
+            for kind, price in zip(("input", "cached_input", "output"), values):
+                pricing["rates"].append({
+                    "key": f"model.gpt-6-astra.{kind}", "price": price, "unit_quantity": 1_000_000,
+                    "unit": "tokens", "currency": "USD", "as_of": "2026-09-24",
+                    "source": "https://example.com/synthetic-astra", "context_tier": tier,
+                })
+        entries = [layout_record(key=f"page-{i}") for i in range(10)]
+        for i in range(8):
+            entry = record(key=f"astra-{i}")
+            entry["metadata"].update(model="gpt-6-astra", deployment_version="gpt-6-astra:1:GlobalStandard")
+            entries.append(entry)
+        report = usage_report(entries, pricing)
+        current, groups = report["summary"]["current"], report["summary"]["current_breakdown"]
+        self.assertIsNone(current["estimated_cost"])
+        self.assertAlmostEqual(current["estimated_cost_range"]["min"], .2028)
+        self.assertAlmostEqual(current["estimated_cost_range"]["max"], .3156)
+        self.assertEqual(groups["cu_model"]["status"], "not_applicable")
+        self.assertEqual(groups["analysis_model"]["status"], "partial")
+        self.assertEqual(groups["analysis_model"]["unpriced_meters"], 24)
+        self.assertEqual(current["unknown_usage_calls"], 0)
+        self.assert_costs_add_up(report)
+
+    def test_legacy_gpt54_internal_model_is_separate_from_selected_analysis_model(self):
+        pricing = self.pricing()
+        pricing["cu_input_includes_cached"] = True
+        for kind, price in (("input", 2.5), ("cached_input", .25), ("output", 15)):
+            pricing["rates"].append({
+                "key": f"model.gpt-5.4.{kind}", "price": price, "unit_quantity": 1_000_000,
+                "unit": "tokens", "currency": "USD", "as_of": "2026-09-24",
+                "source": "https://example.com/synthetic-gpt54",
+            })
+        legacy = record("cu")
+        legacy["usage"]["tokens"] = {
+            "gpt-5.4-input": 1000, "gpt-5.4-cached-input": 100, "gpt-5.4-output": 200,
+        }
+        legacy["metadata"].update(selected_completion_model="gpt-5.4",
+                                  model_deployments={"gpt-5.4": "legacy-cu"},
+                                  deployment_versions={"legacy-cu": "gpt-5.4:2026-03-05:GlobalStandard"})
+        report = usage_report([layout_record(key="layout"), legacy, luna_record()], pricing)
+        groups = report["summary"]["current_breakdown"]
+        self.assertAlmostEqual(groups["cu_analysis"]["estimated_cost"], .011)
+        self.assertAlmostEqual(groups["cu_model"]["estimated_cost"], .005275)
+        self.assertAlmostEqual(groups["analysis_model"]["estimated_cost"], .000191)
+        self.assertEqual(groups["cu_model"]["status"], "complete")
+        self.assertNotIn("explanation", groups["cu_model"])
+        self.assert_costs_add_up(report)
+
+    def test_unverified_or_contradictory_profile_never_implies_model_free(self):
+        for profile in (None, "engineering", "unknown", True, "Layout"):
+            entry = layout_record()
+            entry["metadata"]["extraction_profile"] = profile
+            report = usage_report([entry], self.pricing())
+            self.assertIsNone(report["summary"]["current"]["estimated_cost"])
+            self.assertIsNone(report["summary"]["current_breakdown"]["cu_model"]["estimated_cost"])
+            self.assert_costs_add_up(report)
+        for changes in ({"model_deployments": {"gpt-5.4": "legacy"}},
+                        {"selected_completion_model": "gpt-5.4"},
+                        {"deployment_versions": {"legacy": "gpt-5.4:1:GlobalStandard"}}):
+            entry = layout_record()
+            entry["metadata"].update(changes)
+            self.assertIsNone(usage_report([entry], self.pricing())["summary"]["current"]["estimated_cost"])
+
+    def test_cached_resumed_and_duplicate_references_contribute_no_current_cost(self):
+        entries = [layout_record(state="cached"), luna_record(state="resumed"),
+                   luna_record(state="cached"), layout_record(state="resumed"),
+                   luna_record(state="cached", key="missing", usage=None)]
+        report = usage_report(entries, self.pricing())
+        self.assertEqual(report["summary"]["current"]["estimated_cost"], 0)
+        self.assertGreater(report["summary"]["reused"]["known_cost"], 0)
+        for groups in [report["summary"]["current_breakdown"]] + [
+                entry["current_breakdown"] for entry in report["entries"]]:
+            for group in groups.values():
+                self.assertEqual(group, {
+                    "estimated_cost": 0, "estimated_cost_range": {"min": 0, "max": 0}, "known_cost": 0,
+                    "unknown_usage_calls": 0, "unpriced_meters": 0, "status": "not_used",
+                })
+        self.assertFalse(report["entries"][2]["counted_in_summary"])
+        self.assertFalse(report["entries"][3]["counted_in_summary"])
+        self.assert_costs_add_up(report)
+
+    def test_new_call_plus_duplicate_cache_references_is_charged_once(self):
+        entries = [luna_record(state="cached"), luna_record(), luna_record(state="cached")]
+        report = usage_report(entries, self.pricing())
+        self.assertAlmostEqual(report["summary"]["current_breakdown"]["analysis_model"]["estimated_cost"], .000191)
+        self.assertEqual(report["summary"]["reused"]["estimated_cost"], 0)
+        self.assertEqual([entry["counted_in_summary"] for entry in report["entries"]], [False, True, False])
+        self.assert_costs_add_up(report)
+        # Separate newly submitted calls retain their charges, even with the same cache key.
+        twice = usage_report([luna_record(), luna_record()], self.pricing())
+        self.assertAlmostEqual(twice["summary"]["current_breakdown"]["analysis_model"]["estimated_cost"], 2*.000191)
+
+    def test_unknown_cache_ownership_is_not_assumed_historical(self):
+        for state in ("unknown", "unrecognized", None):
+            report = usage_report([luna_record(state=state, usage=None)], self.pricing())
+            self.assertIsNone(report["summary"]["current"]["estimated_cost"])
+            self.assertIsNone(report["summary"]["current_breakdown"]["analysis_model"]["estimated_cost"])
+            self.assertEqual(report["summary"]["requests"]["unknown"], 1)
+            self.assert_costs_add_up(report)
+
+    def test_missing_failed_or_partial_layout_usage_retains_known_costs_not_fake_zero(self):
+        for changes in ({"usage": None}, {"usage": {}}, {"outcome": "operation_incomplete"},
+                        {"usage_incomplete": True}):
+            entry = layout_record()
+            entry.update(changes)
+            report = usage_report([entry], self.pricing())
+            groups = report["summary"]["current_breakdown"]
+            self.assertIsNone(groups["cu_analysis"]["estimated_cost"])
+            self.assertIsNone(groups["cu_model"]["estimated_cost"])
+            self.assertEqual(groups["cu_model"]["status"], "partial")
+            self.assertEqual(groups["cu_analysis"]["unknown_usage_calls"], 1)
+            if entry["usage"]:
+                self.assertAlmostEqual(groups["cu_analysis"]["known_cost"], .005)
+            self.assertEqual(report["entries"][0]["raw_usage"], entry["usage"])
+            self.assert_costs_add_up(report)
+        report = usage_report([luna_record(outcome="operation_incomplete")], self.pricing())
+        self.assertIsNone(report["summary"]["current_breakdown"]["analysis_model"]["estimated_cost"])
+        self.assertEqual(report["summary"]["current_breakdown"]["cu_analysis"]["status"], "not_used")
+        self.assert_costs_add_up(report)
+
+    def test_layout_never_suppresses_reported_tokens_unknown_meters_or_invalid_pages(self):
+        for extra in ({"tokens": None}, {"tokens": {"unknown-token": 10}},
+                      {"tokens": {"synthetic-input": 1000, "synthetic-output": 200}},
+                      {"documentPagesStandard": -1}, {"newMeter": 10},
+                      {"contextualizationTokens": 1000}):
+            entry = layout_record()
+            entry["usage"].update(extra)
+            report = usage_report([entry], self.pricing())
+            self.assertIsNone(report["summary"]["current"]["estimated_cost"])
+            self.assertNotEqual(report["summary"]["current_breakdown"]["cu_model"]["status"], "not_applicable")
+            self.assertEqual(report["entries"][0]["raw_usage"], entry["usage"])
+            self.assert_costs_add_up(report)
+        entry = layout_record()
+        entry["usage"].update(record("cu")["usage"])
+        entry["metadata"].update(model_deployments={"synthetic": "deployment"},
+                                  deployment_versions={"deployment": "synthetic:1:GlobalStandard"})
+        report = usage_report([entry], dict(self.pricing(), cu_input_includes_cached=True))
+        groups = report["summary"]["current_breakdown"]
+        self.assertAlmostEqual(groups["cu_model"]["estimated_cost"], .00262)
+        self.assertAlmostEqual(groups["cu_analysis"]["estimated_cost"], .006)
+        self.assert_costs_add_up(report)
+
+    def test_missing_journal_all_groups_unknown_but_empty_journal_is_not_used(self):
+        unavailable = usage_report(None, self.pricing())
+        for group in unavailable["summary"]["current_breakdown"].values():
+            self.assertIsNone(group["estimated_cost"])
+            self.assertEqual(group["status"], "partial")
+        self.assert_costs_add_up(unavailable)
+        empty = usage_report([], self.pricing())
+        self.assertTrue(all(group["status"] == "not_used"
+                            for group in empty["summary"]["current_breakdown"].values()))
+        self.assert_costs_add_up(empty)
+
+
 class UserProvidedPricingTests(unittest.TestCase):
     def test_example_has_only_four_luna_prices_with_explicit_user_provenance(self):
         pricing = validate_pricing(luna_prices())
@@ -398,6 +613,30 @@ class TransportJournalTests(unittest.TestCase):
         self.pdf = self.root / "synthetic.pdf"
         self.pdf.write_bytes(b"synthetic fixture")
         self.client = Client(configuration())
+
+    def test_layout_transport_emits_model_free_provenance_and_preserves_cache_identity(self):
+        client = Client(dict(configuration(), extraction_profile="layout"))
+        raw = {"status": "Succeeded", "usage": {"documentPagesStandard": 1},
+               "result": {"contents": [{
+                   "unit": "inch", "pages": [{"pageNumber": 1, "width": 1, "height": 1,
+                                              "lines": [], "words": []}],
+               }]}}
+        with patch.object(client, "request", return_value=({}, {"Operation-Location": "operation"})) as request:
+            with patch.object(client, "poll", return_value=raw):
+                _, submitted = client.analyze(self.pdf, self.root, "layout-test", {})
+            _, cached = client.analyze(self.pdf, self.root, "layout-test", {}, allow_submit=False)
+        self.assertEqual(request.call_count, 1)
+        self.assertNotIn("modelDeployments", request.call_args.args[2])
+        self.assertEqual(submitted["cache_key"], cached["cache_key"])
+        self.assertEqual(client.usage_records[0]["metadata"], {
+            "model_deployments": {}, "selected_completion_model": None,
+            "deployment_versions": {}, "extraction_profile": "layout",
+        })
+        report = usage_report(client.usage_records, prices())
+        self.assertAlmostEqual(report["summary"]["current"]["estimated_cost"], .005)
+        self.assertEqual(report["summary"]["current_breakdown"]["cu_model"]["status"], "not_applicable")
+        self.assertEqual(report["entries"][1]["current_cost"], 0)
+        self.assertFalse(report["entries"][1]["counted_in_summary"])
 
     def test_observer_copies_usage_and_stage(self):
         observations = []

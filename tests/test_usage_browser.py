@@ -42,6 +42,12 @@ def usage_fixture():
                                cached_input_tokens=40, output_tokens=30, model_tokens=150,
                                estimated_cost=.12, known_cost=.12),
             "reused": history,
+            "current_breakdown": {
+                "cu_analysis": metrics(cu_pages=2, contextualization_tokens=100,
+                                       estimated_cost=.03, known_cost=.03),
+                "cu_model": metrics(input_tokens=20, model_tokens=20, estimated_cost=.01, known_cost=.01),
+                "analysis_model": direct,
+            },
         },
         "entries": [
             {"id": "cu-new", "service": "cu", "stage": "全文提取", "region_index": None,
@@ -77,6 +83,11 @@ def scenario_fixture():
     usage["summary"]["reused"].update(
         estimated_cost=None, estimated_cost_range={"min": 7, "max": 12},
         cache_write_tokens=88)
+    usage["summary"]["current_breakdown"] = {
+        "cu_analysis": metrics(estimated_cost=.02, known_cost=.02),
+        "cu_model": metrics(estimated_cost=None, estimated_cost_range={"min": .005, "max": .015}),
+        "analysis_model": metrics(estimated_cost=None, estimated_cost_range={"min": .02, "max": .10}),
+    }
     entry = usage["entries"][0]
     entry.update(current_cost=None, current_cost_range={"min": .03, "max": .09},
                  metrics=metrics(input_tokens=None, model_tokens=None, cache_write_tokens=77),
@@ -148,6 +159,10 @@ class UsageBrowserTests(unittest.TestCase):
         expect(self.page.locator("#usage-panel")).to_be_visible()
 
     def open_call(self, index=0):
+        if self.page.locator(f"#usage-reuse-records #usage-call-{index}").count():
+            reuse = self.page.locator("#usage-reuse-records")
+            if reuse.get_attribute("open") is None:
+                reuse.locator(":scope > summary").click()
         self.page.locator(f"#usage-call-{index} > summary").click()
 
     def test_tab_roles_keyboard_and_original_evidence(self):
@@ -190,13 +205,14 @@ class UsageBrowserTests(unittest.TestCase):
         self.compare()
         self.usage_tab()
         expect(self.page.locator("#usage-current-cost")).to_contain_text("US$0.12345678")
-        expect(self.page.locator("#usage-current-model")).to_contain_text("150")
-        expect(self.page.locator("#usage-current-model")).to_contain_text("输入 120")
-        expect(self.page.locator("#usage-current-model")).to_contain_text("缓存输入 40")
-        expect(self.page.locator("#usage-current-model")).to_contain_text("输出 30")
-        expect(self.page.locator("#usage-current-cu")).to_contain_text("2 页")
-        expect(self.page.locator("#usage-history")).to_contain_text("US$9.50")
-        expect(self.page.locator("#usage-history")).to_contain_text("非本轮新增计费")
+        expect(self.page.locator("#usage-current-cu .usage-value")).to_have_text("US$0.03")
+        expect(self.page.locator("#usage-current-cu-model .usage-value")).to_have_text("US$0.01")
+        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("US$0.08")
+        expect(self.page.locator(".usage-components > section")).to_have_count(3)
+        expect(self.page.locator("#usage-history")).to_have_count(0)
+        expect(self.page.locator("#usage-call-2")).not_to_be_visible()
+        for selector in ("#usage-current-cost", ".usage-components"):
+            self.assertNotIn("US$9.50", self.page.locator(selector).inner_text())
         expect(self.page.locator("#usage-requests")).to_contain_text("本地缓存 1")
         expect(self.page.locator("#usage-content")).to_contain_text("推理 token 已包含在输出内")
         for index in range(3):
@@ -215,9 +231,64 @@ class UsageBrowserTests(unittest.TestCase):
         expect(self.page.locator("#usage-call-0-meter-0")).to_contain_text("synthetic-version")
         expect(self.page.locator("#usage-call-0 .usage-table th[scope=col]")).to_have_count(5)
 
+    def test_total_three_components_and_details_follow_requested_order(self):
+        self.compare()
+        self.usage_tab()
+        expect(self.page.locator(".usage-components h4")).to_have_text(
+            ["CU 分析费用", "CU 内部模型费用", "分析模型费用"])
+        for width in (1600, 900, 390):
+            self.page.set_viewport_size({"width": width, "height": 1050})
+            boxes = [self.page.locator(selector).bounding_box()
+                     for selector in ("#usage-current-cost", ".usage-components", ".usage-details-heading")]
+            self.assertLessEqual(boxes[0]["y"] + boxes[0]["height"], boxes[1]["y"])
+            self.assertLessEqual(boxes[1]["y"] + boxes[1]["height"], boxes[2]["y"])
+            for box in boxes:
+                self.assertGreaterEqual(box["x"], 0)
+                self.assertLessEqual(box["x"] + box["width"], width)
+        expect(self.page.locator("#usage-reuse-records")).not_to_have_attribute("open", "")
+        expect(self.page.locator("#usage-policy")).not_to_have_attribute("open", "")
+
+    def test_model_free_cu_is_explicit_and_astra_official_source_is_available(self):
+        self.usage["summary"]["current_breakdown"]["cu_model"] = metrics(
+            status="not_applicable", explanation="轻量 CU 未启用内部生成模型")
+        self.usage["entries"][1]["model"] = "gpt-6-astra"
+        self.compare()
+        self.usage_tab()
+        expect(self.page.locator("#usage-current-cu-model .usage-value")).to_have_text("US$0.00")
+        expect(self.page.locator("#usage-current-cu-model")).to_contain_text("未启用")
+        expect(self.page.locator("#usage-current-cu-model")).to_contain_text("轻量 CU 未启用内部生成模型")
+        expect(self.page.locator("#usage-current-model")).to_contain_text("gpt-6-astra")
+        self.page.locator("#usage-policy > summary").click()
+        official = self.page.locator("#usage-policy a")
+        expect(official).to_have_attribute("href", "https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/provisioned-throughput-sizing#pay-as-you-go-prices-and-token-weights")
+        expect(official).to_have_attribute("rel", "noopener noreferrer")
+        expect(self.page.locator("#usage-policy")).to_contain_text("分界未核实")
+
+    def test_unknown_cu_usage_does_not_hide_known_analysis_model_cost(self):
+        self.usage["summary"]["current"] = metrics(
+            estimated_cost=None, known_cost=.08, unknown_usage_calls=1)
+        for key in ("cu_analysis", "cu_model"):
+            self.usage["summary"]["current_breakdown"][key] = metrics(
+                estimated_cost=None, unknown_usage_calls=1)
+        self.compare()
+        self.usage_tab()
+        expect(self.page.locator("#usage-current-cost .usage-value")).to_have_text("费用未完整估算")
+        expect(self.page.locator("#usage-current-cu .usage-value")).to_contain_text("待核")
+        expect(self.page.locator("#usage-current-cu-model .usage-value")).to_contain_text("待核")
+        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("US$0.08")
+
+    def test_legacy_totals_are_retained_without_fabricating_missing_components(self):
+        self.usage["summary"].pop("current_breakdown")
+        self.compare()
+        self.usage_tab()
+        expect(self.page.locator("#usage-current-cost .usage-value")).to_have_text("US$0.12")
+        expect(self.page.locator(".usage-components .usage-value")).to_have_text(["未提供分项"] * 3)
+
     def test_all_cache_zero_current_even_when_history_is_partial(self):
         self.usage["status"] = "partial"
         self.usage["summary"]["current"] = metrics()
+        self.usage["summary"]["current_breakdown"] = {
+            key: metrics() for key in ("cu_analysis", "cu_model", "analysis_model")}
         self.usage["summary"]["reused"].update(estimated_cost=None, unpriced_meters=1)
         self.usage["summary"]["requests"] = {"new": 0, "cached": 1, "resumed": 1, "unknown": 0}
         self.usage["entries"] = [self.usage["entries"][2]]
@@ -225,10 +296,10 @@ class UsageBrowserTests(unittest.TestCase):
         self.compare()
         self.usage_tab()
         expect(self.page.locator("#usage-current-cost .usage-value")).to_have_text("US$0.00")
-        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("0")
-        expect(self.page.locator("#usage-history")).to_contain_text("历史参考费用：未知")
-        expect(self.page.locator("#usage-history")).to_contain_text("US$9.50")
+        expect(self.page.locator(".usage-components .usage-value")).to_have_text(["US$0.00"] * 3)
+        expect(self.page.locator("#usage-history")).to_have_count(0)
         expect(self.page.locator("#usage-requests")).to_contain_text("恢复 1")
+        self.open_call()
         expect(self.page.locator("#usage-call-0 > summary")).to_contain_text("恢复历史操作")
 
     def test_user_supplied_luna_rates_are_per_million_and_never_claim_retail_provenance(self):
@@ -260,11 +331,12 @@ class UsageBrowserTests(unittest.TestCase):
         self.usage["entries"][1]["meters"][0].update(rate=None, estimated_cost=None)
         self.usage["entries"][1]["meters"][1].update(quantity=None, estimated_cost=None)
         self.usage["entries"][1].update(usage_status="missing", current_cost=None)
+        self.usage["summary"]["current_breakdown"]["analysis_model"] = metrics(estimated_cost=None)
         self.compare()
         self.usage_tab()
         expect(self.page.locator("#usage-current-cost .usage-value")).to_have_text("费用未完整估算")
         expect(self.page.locator("#usage-current-cost")).to_contain_text("已知费用小计（不等于完整总额）：US$0.04")
-        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("未提供")
+        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("待核")
         self.open_call(1)
         expect(self.page.locator("#usage-call-1")).to_contain_text("单价待配置，无法估算")
         expect(self.page.locator("#usage-call-1")).to_contain_text("用量未提供，无法估算")
@@ -334,7 +406,7 @@ class UsageBrowserTests(unittest.TestCase):
         self.usage = {"status": "unavailable", "entries": [{"service": "cu"}]}
         self.compare()
         expect(self.page.locator("#usage-current-cost")).to_contain_text("费用未完整估算")
-        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("未提供")
+        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("未提供分项")
         self.open_call()
         expect(self.page.locator("#usage-call-0")).to_contain_text("模型 未提供")
         expect(self.page.locator("#usage-call-0")).to_contain_text("计量与价格明细：未提供")
@@ -385,17 +457,12 @@ class UsageBrowserTests(unittest.TestCase):
             "US$0.045 – US$0.135（场景估算）")
         expect(self.page.locator("#usage-current-cost")).to_contain_text(
             "已知费用小计（不等于完整总额）：US$0.02")
-        expect(self.page.locator("#usage-current-cost")).to_contain_text("用量待核调用 1")
-        expect(self.page.locator("#usage-current-cost")).to_contain_text("价格待核计量项 2")
-        expect(self.page.locator(".usage-heading")).to_contain_text("部分数据 / 估算不完整")
-        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("未提供")
-        expect(self.page.locator("#usage-current-model")).to_contain_text("缓存写入 77 token")
-        expect(self.page.locator("#usage-history")).to_contain_text(
-            "历史参考费用：US$7.00 – US$12.00（场景估算）")
-        expect(self.page.locator("#usage-history")).to_contain_text("缓存写入 88 token")
-        expect(self.page.locator("#usage-history")).to_contain_text("按当前配置的价格快照重估历史用量")
-        expect(self.page.locator("#usage-history")).to_contain_text("不是原始日期的账单")
+        expect(self.page.locator("#usage-policy")).to_contain_text("用量待核调用 1")
+        expect(self.page.locator("#usage-policy")).to_contain_text("价格待核计量项 2")
+        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("US$0.02 – US$0.10（场景估算）")
+        expect(self.page.locator("#usage-history")).to_have_count(0)
         self.open_call()
+        expect(self.page.locator("#usage-call-0")).to_contain_text("缓存写入 77 token")
         expect(self.page.locator("#usage-call-0 > summary")).to_contain_text(
             "新增估算 US$0.03 – US$0.09（场景估算）")
         expect(self.page.locator("#usage-call-0 .usage-note").first).to_contain_text(
@@ -417,7 +484,7 @@ class UsageBrowserTests(unittest.TestCase):
         # Neither raw counters, cache writes, meter ranges, nor history alter backend totals.
         expect(self.page.locator("#usage-current-cost .usage-value")).to_have_text(
             "US$0.045 – US$0.135（场景估算）")
-        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("未提供")
+        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("US$0.02 – US$0.10（场景估算）")
 
     def test_candidate_price_tiers_and_individual_provenance_are_accessible(self):
         self.usage = scenario_fixture()
@@ -469,14 +536,15 @@ class UsageBrowserTests(unittest.TestCase):
         self.usage = scenario_fixture()
         self.usage["summary"]["current"] = metrics(
             cache_write_tokens=0, estimated_cost_range={"min": 10, "max": 20})
+        self.usage["summary"]["current_breakdown"] = {
+            key: metrics() for key in ("cu_analysis", "cu_model", "analysis_model")}
         self.usage["summary"]["requests"] = {"new": 0, "cached": 1, "resumed": 0, "unknown": 0}
         self.usage["entries"] = [self.usage["entries"][2]]
         self.compare()
         self.usage_tab()
         expect(self.page.locator("#usage-current-cost .usage-value")).to_have_text("US$0.00")
-        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("0")
-        expect(self.page.locator("#usage-current-model")).to_contain_text("缓存写入 0 token")
-        expect(self.page.locator("#usage-history")).to_contain_text("US$7.00 – US$12.00（场景估算）")
+        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("US$0.00")
+        expect(self.page.locator("#usage-history")).to_have_count(0)
         expect(self.page.locator("#usage-call-0 > summary")).to_contain_text("新增估算 US$0.00")
         self.open_call()
         self.page.locator("#usage-call-0-raw > summary").click()
@@ -489,11 +557,12 @@ class UsageBrowserTests(unittest.TestCase):
         self.usage["entries"][0]["meters"][2]["quantity_range"] = [100, 60]
         self.usage["entries"][0]["meters"][2]["estimated_cost_range"] = {"min": "0", "max": 1}
         self.usage["summary"]["reused"]["estimated_cost_range"] = {"min": 0, "max": 1}
+        self.usage["summary"]["current_breakdown"]["analysis_model"]["estimated_cost_range"] = {"min": 0, "max": 1}
         self.compare()
         self.usage_tab()
         expect(self.page.locator("#usage-current-cost .usage-value")).to_have_text("费用未完整估算")
         expect(self.page.locator("#usage-call-0 > summary")).to_contain_text("新增估算 未知")
-        expect(self.page.locator("#usage-history")).to_contain_text("US$0.00 – US$1.00（场景估算）")
+        expect(self.page.locator("#usage-current-model .usage-value")).to_have_text("US$0.00 – US$1.00（场景估算）")
         self.open_call()
         row = self.page.locator("#usage-call-0 .usage-table tbody tr").nth(2)
         expect(row).to_contain_text("用量未提供，无法估算")

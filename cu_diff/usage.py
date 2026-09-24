@@ -33,6 +33,12 @@ LATENCY_CHECKPOINT_FIELDS = frozenset({
     "engine_tbt_ms", "engine_ttft_ms", "engine_ttlt_ms", "pre_inference_ms",
     "service_tbt_ms", "service_ttft_ms", "service_ttlt_ms", "user_visible_ttft_ms",
 })
+COST_GROUPS = {
+    "cu_analysis": ("cu_extraction", "cu_contextualization"),
+    "cu_model": ("cu_model",),
+    "analysis_model": ("direct_model",),
+}
+LAYOUT_COST_EXPLANATION = "已确认layout纯提取配置及完整页数用量；未使用CU上下文处理或CU内部生成模型。"
 _JOURNAL_INIT_LOCK = threading.RLock()
 
 
@@ -236,6 +242,21 @@ def _rates(pricing, key, unit, *, version=None, sku=None, prompt=None, service=N
     return matches
 
 
+def _model_free_layout(entry):
+    meta, usage = entry["metadata"], entry.get("usage")
+    page_keys = {key for key in CU_METERS if key.startswith("documentPages")}
+    return (
+        entry["service"] == "cu" and meta.get("extraction_profile") == "layout"
+        and not meta.get("model_deployments") and not meta.get("deployment_versions")
+        and meta.get("selected_completion_model") is None
+        and entry.get("outcome") == "response_received" and not entry.get("usage_incomplete")
+        and isinstance(usage, dict) and bool(page_keys & usage.keys())
+        and usage.keys() <= page_keys | {"tokens"}
+        and ("tokens" not in usage or usage["tokens"] == {})
+        and all(_number(value) for key, value in usage.items() if key in page_keys)
+    )
+
+
 def _normalize(entry, pricing):
     metrics = {k: 0 for k in FIELDS}
     meters, warnings = [], []
@@ -271,24 +292,28 @@ def _normalize(entry, pricing):
             metrics[key] = None if service == "cu" or key not in ("cu_pages", "contextualization_tokens") else 0
         meter(service+".unknown", "服务未返回可用用量", None, "unknown",
               "cu_extraction" if service == "cu" else "direct_model")
+        if service == "cu":
+            meter("cu.model.unknown", "CU内部模型用量未确认", None, "tokens", "cu_model")
         notes = ["服务未返回可用用量；不能按零消耗或零费用计算。"]
         if entry.get("outcome") == "previous_pending":
             notes.append("历史模型请求仍待确认，本次已阻止重复提交；没有续发模型请求。")
         return metrics, meters, notes, "missing"
     if service == "cu":
+        model_free = _model_free_layout(entry)
         pages = [k for k in CU_METERS if k.startswith("documentPages") and k in usage]
         contexts = [k for k in CU_METERS if k.endswith("ContextualizationTokens") or k == "contextualizationTokens"]
         metrics["cu_pages"] = sum(usage[k] for k in pages) if pages and all(_number(usage[k]) for k in pages) else None
         present_contexts = [k for k in contexts if k in usage]
         metrics["contextualization_tokens"] = (sum(usage[k] for k in present_contexts)
-            if present_contexts and all(_number(usage[k]) for k in present_contexts) else None)
+            if present_contexts and all(_number(usage[k]) for k in present_contexts)
+            else 0 if model_free else None)
         for key, (label, unit) in CU_METERS.items():
             if key in usage:
                 meter("cu."+key, label, usage[key], unit,
                       "cu_extraction" if unit == "pages" else "cu_contextualization")
         if not pages:
             meter("cu.pages.unknown", "CU页数未提供", None, "pages", "cu_extraction")
-        if not present_contexts:
+        if not present_contexts and not model_free:
             meter("cu.context.unknown", "CU上下文处理用量未提供", None, "tokens", "cu_contextualization")
         tokens = usage.get("tokens")
         grouped = {}
@@ -300,7 +325,7 @@ def _normalize(entry, pricing):
                 else:
                     meter("cu.token."+key, "未识别的CU模型token："+key, value, "tokens", "cu_model")
                     warnings.append("CU返回未识别的模型token计量项，未推测其价格。")
-        if not grouped:
+        if not grouped and not model_free:
             metrics.update(input_tokens=None, cached_input_tokens=None, output_tokens=None, model_tokens=None)
             meter("cu.model.unknown", "CU内部模型token未提供", None, "tokens", "cu_model")
         for model, counts in grouped.items():
@@ -383,14 +408,71 @@ def _normalize(entry, pricing):
     if any(m["quantity"] is None for m in meters):
         warnings.append("部分计量项缺失、无效或口径未核实；合计不是完整用量。")
     if entry.get("outcome") == "operation_incomplete":
-        meter("cu.incomplete", "操作未完成；已返回用量可能不是最终值", None, "unknown", "cu_extraction")
+        meter(service+".incomplete", "操作未完成；已返回用量可能不是最终值", None, "unknown",
+              "cu_extraction" if service == "cu" else "direct_model")
+        if service == "cu":
+            meter("cu.model.incomplete", "CU操作未完成；内部模型用量仍待确认", None, "unknown", "cu_model")
         warnings.append("保留已返回的用量，但操作失败/超时，最终费用仍待核对。")
     if entry.get("usage_incomplete"):
         meter("usage.final_missing", "保留上次返回计数；最终用量未提供", None, "unknown",
               "cu_extraction" if service == "cu" else "direct_model")
+        if service == "cu":
+            meter("cu.model.final_missing", "最终CU内部模型用量未提供", None, "unknown", "cu_model")
         warnings.append("后续响应缺少用量；保留此前计数但不视为完整最终用量。")
     status = "invalid" if any(m["quantity"] is None for m in meters) else "reported"
     return metrics, meters, warnings, status
+
+
+def _cost_summary(meters):
+    known = sum(m["estimated_cost"] for m in meters if m["estimated_cost"] is not None)
+    estimated = known if all(m["estimated_cost"] is not None for m in meters) else None
+    bounds = ({key: sum(m["estimated_cost_range"][key] for m in meters) for key in ("min", "max")}
+              if all(m["estimated_cost_range"] is not None for m in meters) else None)
+    return {
+        "estimated_cost": estimated, "estimated_cost_range": bounds, "known_cost": known,
+        "unpriced_meters": sum(m["reason"] in ("missing_rate", "ambiguous_rate") for m in meters),
+        "unknown_usage_calls": int(any(m["quantity"] is None for m in meters)),
+        "status": "not_used" if not meters else "complete" if estimated is not None else "partial",
+    }
+
+
+def _current_breakdown(entry, meters, current):
+    result = {
+        group: _cost_summary([m for m in meters if m["category"] in categories] if current else [])
+        for group, categories in COST_GROUPS.items()
+    }
+    if current and _model_free_layout(entry):
+        result["cu_model"].update(status="not_applicable", explanation=LAYOUT_COST_EXPLANATION)
+        result["cu_analysis"]["explanation"] = LAYOUT_COST_EXPLANATION
+    return result
+
+
+def _merge_cost_summary(target, source):
+    for key in ("known_cost", "unpriced_meters", "unknown_usage_calls"):
+        target[key] += source[key]
+    target["estimated_cost"] = (target["estimated_cost"] + source["estimated_cost"]
+                               if target["estimated_cost"] is not None and source["estimated_cost"] is not None else None)
+    target["estimated_cost_range"] = (
+        {key: target["estimated_cost_range"][key] + source["estimated_cost_range"][key] for key in ("min", "max")}
+        if target["estimated_cost_range"] is not None and source["estimated_cost_range"] is not None else None)
+    priorities = {"not_used": 0, "not_applicable": 1, "complete": 2, "partial": 3}
+    if priorities[source["status"]] > priorities[target["status"]]:
+        target["status"] = source["status"]
+    if target["status"] == "not_applicable":
+        target["explanation"] = LAYOUT_COST_EXPLANATION
+    else:
+        target.pop("explanation", None)
+
+
+def _total_costs(components):
+    return {
+        "known_cost": sum(c["known_cost"] for c in components),
+        "estimated_cost": (sum(c["estimated_cost"] for c in components)
+                           if all(c["estimated_cost"] is not None for c in components) else None),
+        "estimated_cost_range": (
+            {key: sum(c["estimated_cost_range"][key] for c in components) for key in ("min", "max")}
+            if all(c["estimated_cost_range"] is not None for c in components) else None),
+    }
 
 
 def usage_report(records, pricing=None):
@@ -401,8 +483,10 @@ def usage_report(records, pricing=None):
                       "estimated_cost_range": {"min": 0., "max": 0.},
                       "unpriced_meters": 0, "unknown_usage_calls": 0} for name in ("current", "reused")}
     requests = {"new": 0, "cached": 0, "resumed": 0, "unknown": 0}
+    current_breakdown = {group: _cost_summary([]) for group in COST_GROUPS}
     records = records if journal_available else []
-    new_keys = {(e["service"], e["cache_key"]) for e in records if e["cache_state"] in ("new", "unknown")}
+    new_keys = {(e["service"], e["cache_key"]) for e in records
+                if e["cache_state"] not in ("cached", "resumed", "not_submitted")}
     reused_keys = set()
     for entry in records:
         state = entry["cache_state"]
@@ -410,6 +494,8 @@ def usage_report(records, pricing=None):
             continue
         if state in requests:
             requests[state] += 1
+        else:
+            requests["unknown"] += 1
         metrics, meters, notes, status = _normalize(entry, pricing)
         known = sum(m["estimated_cost"] for m in meters if m["estimated_cost"] is not None)
         complete = all(m["estimated_cost"] is not None for m in meters)
@@ -417,13 +503,18 @@ def usage_report(records, pricing=None):
         bounds = ({"min": sum(m["estimated_cost_range"]["min"] for m in meters),
                    "max": sum(m["estimated_cost_range"]["max"] for m in meters)}
                   if all(m["estimated_cost_range"] is not None for m in meters) else None)
-        current = state in ("new", "unknown")
+        current = state not in ("cached", "resumed")
+        breakdown = _current_breakdown(entry, meters, current)
+        current_costs = _total_costs(list(breakdown.values()))
         identity = entry["service"], entry["cache_key"]
         counted = current or identity not in new_keys | reused_keys
         if not current:
             reused_keys.add(identity)
         bucket = buckets["current" if current else "reused"]
         if counted:
+            if current:
+                for group in COST_GROUPS:
+                    _merge_cost_summary(current_breakdown[group], breakdown[group])
             for key in FIELDS:
                 bucket[key] = bucket[key]+metrics[key] if bucket[key] is not None and metrics[key] is not None else None
             bucket["known_cost"] += known
@@ -440,10 +531,11 @@ def usage_report(records, pricing=None):
             "id": entry["id"], "service": entry["service"], "stage": STAGES.get(entry["stage"], entry["stage"]),
             "region_index": entry.get("region_index"), "cache_state": state, "usage_status": status,
             "outcome": entry.get("outcome"), "model": model, "deployment": deployment,
-            "metrics": metrics, "meters": meters, "current_cost": estimated if current else 0.,
+            "metrics": metrics, "meters": meters, "current_cost": current_costs["estimated_cost"],
+            "current_breakdown": breakdown,
             "raw_usage": _json_usage(entry.get("usage")),
             "reference_cost": estimated, "known_cost": known, "counted_in_summary": counted,
-            "reference_cost_range": bounds, "current_cost_range": bounds if current else {"min": 0., "max": 0.},
+            "reference_cost_range": bounds, "current_cost_range": current_costs["estimated_cost_range"],
             "warnings": notes+([] if counted else ["该缓存用量已在本次其他记录中包含，历史合计不重复计算。"]),
         })
         dates.update(m["rate"]["as_of"] for m in meters if m["rate"] is not None)
@@ -456,7 +548,11 @@ def usage_report(records, pricing=None):
     if not journal_available:
         buckets["current"].update({k: None for k in FIELDS})
         buckets["current"].update(estimated_cost=None, estimated_cost_range=None, unknown_usage_calls=1)
+        for group in current_breakdown.values():
+            group.update(estimated_cost=None, estimated_cost_range=None, unknown_usage_calls=1,
+                         status="partial", explanation="本次调用记录缺失，无法确认该项用量。")
         warnings.append("未提供本次调用记录，无法估算完整用量与费用。")
+    buckets["current"].update(_total_costs(list(current_breakdown.values())))
     warnings.extend([
         "费用为所配置单价的估算，不是Azure账单；不含税、汇率换算、协议折扣或其他资源费用。",
         "本地缓存命中/续接旧操作不新增提交；历史用量仅供参考，不重复计入本次新增费用。",
@@ -471,4 +567,5 @@ def usage_report(records, pricing=None):
     return {"version": VERSION, "currency": pricing["currency"], "status": status,
             "price_as_of": min(dates) if dates else None,
             "price_sources": sources,
-            "summary": {"requests": requests, **buckets}, "entries": entries, "warnings": warnings}
+            "summary": {"requests": requests, **buckets, "current_breakdown": current_breakdown},
+            "entries": entries, "warnings": warnings}
