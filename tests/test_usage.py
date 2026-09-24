@@ -55,7 +55,24 @@ def record(service="model", state="new", key="synthetic", **changes):
 
 def luna_prices():
     example = Path(__file__).resolve().parents[1] / "config.example.json"
-    return json.loads(example.read_text(encoding="utf-8"))["pricing"]
+    pricing = json.loads(example.read_text(encoding="utf-8"))["pricing"]
+    pricing["rates"] = [r for r in pricing["rates"] if r["key"].startswith("model.gpt-6-luna.")]
+    return pricing
+
+
+def sol_prices():
+    example = Path(__file__).resolve().parents[1] / "config.example.json"
+    pricing = json.loads(example.read_text(encoding="utf-8"))["pricing"]
+    pricing["rates"] = [r for r in pricing["rates"] if r["key"].startswith("model.gpt-6-sol.")]
+    return pricing
+
+
+def sol_record(**changes):
+    entry = record(**changes)
+    entry["metadata"].update(model="gpt-6-sol", deployment="synthetic-sol",
+                             deployment_version="gpt-6-sol:2026-09-22:GlobalStandard",
+                             response_model="gpt-6-sol-2026-09-22")
+    return entry
 
 
 def luna_record(**changes):
@@ -290,6 +307,42 @@ class CurrentBreakdownTests(unittest.TestCase):
 
 
 class UserProvidedPricingTests(unittest.TestCase):
+    def test_sol_prices_and_cached_input_are_counted_once_per_million(self):
+        pricing = validate_pricing(sol_prices())
+        self.assertEqual({r["key"]: r["price"] for r in pricing["rates"]}, {
+            "model.gpt-6-sol.input": 2, "model.gpt-6-sol.cached_input": .2,
+            "model.gpt-6-sol.output": 10})
+        for rate in pricing["rates"]:
+            self.assertEqual(rate["unit_quantity"], 1_000_000)
+            self.assertEqual(rate["source_kind"], "user_provided")
+            self.assertIn("not verified Azure retail", rate["source"])
+        entry = sol_record(usage={
+            "prompt_tokens": 2_000_000, "completion_tokens": 1_000_000, "total_tokens": 3_000_000,
+            "prompt_tokens_details": {"cached_tokens": 1_000_000},
+            "completion_tokens_details": {"reasoning_tokens": 500_000}})
+        report = usage_report([entry], pricing)
+        self.assertAlmostEqual(report["summary"]["current"]["estimated_cost"], 12.2)
+        self.assertAlmostEqual(report["summary"]["current_breakdown"]["analysis_model"]["estimated_cost"], 12.2)
+        self.assertEqual(report["entries"][0]["raw_usage"], entry["usage"])
+        self.assertEqual(report["price_sources"][0]["source_kind"], "user_provided")
+        self.assertAlmostEqual(usage_report([sol_record()], pricing)["summary"]["current"]["estimated_cost"], .00382)
+
+    def test_sol_cache_reuse_is_zero_and_unpriced_cache_write_remains_unknown(self):
+        for state in ("cached", "resumed"):
+            self.assertEqual(usage_report([sol_record(state=state)], sol_prices())
+                             ["summary"]["current"]["estimated_cost"], 0)
+        entry = sol_record()
+        entry["usage"]["prompt_tokens_details"]["cache_write_tokens"] = 20
+        report = usage_report([entry], sol_prices())
+        self.assertIsNone(report["summary"]["current"]["estimated_cost"])
+        write = next(m for m in report["entries"][0]["meters"] if m["key"].endswith(".cache_write"))
+        self.assertIsNone(write["estimated_cost"])
+        self.assertIsNone(write.get("rate"))
+        self.assertIsNone(usage_report([sol_record(usage=None)], sol_prices())
+                          ["summary"]["current"]["estimated_cost"])
+        self.assertIsNone(usage_report([luna_record()], sol_prices())
+                          ["summary"]["current"]["estimated_cost"])
+
     def test_example_has_only_four_luna_prices_with_explicit_user_provenance(self):
         pricing = validate_pricing(luna_prices())
         self.assertEqual({r["key"]: r["price"] for r in pricing["rates"]}, {

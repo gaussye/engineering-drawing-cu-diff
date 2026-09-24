@@ -23,6 +23,36 @@
     "cu_input_includes_cached": null,
     "rates": [
       {
+        "key": "model.gpt-6-sol.input",
+        "price": 2,
+        "unit_quantity": 1000000,
+        "unit": "tokens",
+        "currency": "USD",
+        "as_of": "2026-09-24",
+        "source_kind": "user_provided",
+        "source": "User-provided GPT-6 Sol rates; not verified Azure retail pricing"
+      },
+      {
+        "key": "model.gpt-6-sol.cached_input",
+        "price": 0.20,
+        "unit_quantity": 1000000,
+        "unit": "tokens",
+        "currency": "USD",
+        "as_of": "2026-09-24",
+        "source_kind": "user_provided",
+        "source": "User-provided GPT-6 Sol rates; not verified Azure retail pricing"
+      },
+      {
+        "key": "model.gpt-6-sol.output",
+        "price": 10,
+        "unit_quantity": 1000000,
+        "unit": "tokens",
+        "currency": "USD",
+        "as_of": "2026-09-24",
+        "source_kind": "user_provided",
+        "source": "User-provided GPT-6 Sol rates; not verified Azure retail pricing"
+      },
+      {
         "key": "model.gpt-6-luna.input",
         "price": 0.10,
         "unit_quantity": 1000000,

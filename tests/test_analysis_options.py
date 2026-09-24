@@ -133,6 +133,9 @@ class OptionTests(WorkspaceTest):
             if model == "gpt-6-luna":
                 self.assertAlmostEqual(current["estimated_cost"], .000002)
                 self.assertEqual(report["price_sources"][0]["source_kind"], "user_provided")
+            elif model == "gpt-6-sol":
+                self.assertAlmostEqual(current["estimated_cost"], .00004)
+                self.assertEqual(report["price_sources"][0]["source_kind"], "user_provided")
             else:
                 self.assertIsNone(current["estimated_cost"])
                 self.assertEqual(report["price_sources"], [])
