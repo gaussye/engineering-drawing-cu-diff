@@ -202,6 +202,42 @@ class ModelBrowserTests(unittest.TestCase):
             expect(self.page.locator(f"#{side}-evidence-note")).to_contain_text("不画整行变化框")
         expect(self.page.locator(".semantic-word-summary")).to_contain_text("CU词未完整对应")
 
+    def test_unsafe_semantic_group_stays_review_only_without_hiding_other_results(self):
+        supported = semantic_text_item(channel="schema")
+        rows = [supported]
+        for identifier, side in (("D901", "old"), ("D902", "new")):
+            row = semantic_text_item(identifier, channel="schema")
+            row["change"] = f"unpaired_{side}"
+            row["old" if side == "new" else "new"] = None
+            row.pop("text_comparison")
+            row["semantic_pairing"].update(status="uncertain", rationale="候选组跨越独立文字区域，不能安全合并")
+            row["semantic_pairing"].update(model_assessment="supported", model_rationale="模型提议两行对应一行",
+                                            validation_issues=["合成文字间距超过安全范围"])
+            row["review_reasons"] = ["文字组不能可靠合并，保留原始来源逐项复核"]
+            rows.append(row)
+        self.result["items"] = rows
+        self.result["coverage"]["semantic_text"] = {
+            "status": "partial", "paired_groups": 1, "uncertain_groups": 1}
+        self.compare()
+        self.assertEqual(self.visible_ids(), ["D900"])
+        self.select("D900")
+        expect(self.page.locator('#old-stage rect[data-id="D900"]')).to_have_class("evidence-box selected")
+        self.page.locator("#review-filter").select_option("unpaired")
+        self.assertEqual(self.visible_ids(), ["D901", "D902"])
+        for identifier, side in (("D901", "old"), ("D902", "new")):
+            self.select(identifier)
+            opposite = "old" if side == "new" else "new"
+            expect(self.page.locator(f'#{side}-stage rect[data-id="{identifier}"]')).to_have_class(
+                "evidence-box review-evidence selected")
+            expect(self.page.locator(f'#{opposite}-stage rect[data-id="{identifier}"]')).to_have_count(0)
+            expect(self.page.locator("#detail-content")).to_contain_text("不能安全合并")
+            expect(self.page.locator("#detail-content")).to_contain_text("本地来源校验")
+            expect(self.page.locator("#detail-content")).to_contain_text("模型提议两行对应一行")
+            expect(self.page.locator("#detail-content")).to_contain_text("合成文字间距超过安全范围")
+            expect(self.page.locator("#detail-content")).to_contain_text("保留原始来源逐项复核")
+            expect(self.page.locator(f"#{side}-evidence-note")).to_contain_text("不确认新增或删除")
+        self.assertEqual(self.compare_requests, 1)
+
     def test_visual_coverage_distinguishes_budget_deferred_features_and_direct_usage(self):
         attack = '<img src=x onerror="window.modelXss=1">'
         self.result["model_coverage"]["visual"] = {

@@ -126,6 +126,20 @@ class SemanticTextEvidenceTests(unittest.TestCase):
             self.assertIn("5.75", text)
             self.assertIn("Same printed parameter", text)
 
+    def test_report_separates_model_proposal_from_local_group_validation(self):
+        self.record["semantic_pairing"].update(
+            status="uncertain", model_rationale="MODEL_ONLY", rationale="COMBINED_REASON",
+            validation_issues=["LOCAL_ONLY"])
+        self.record.update(change="unpaired_old", new=None)
+        self.record.pop("text_comparison")
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "report.md"
+            write_report(self.report, target)
+            text = target.read_text(encoding="utf-8")
+        self.assertIn("MODEL_ONLY", text)
+        self.assertIn("LOCAL_ONLY", text)
+        self.assertNotIn("COMBINED_REASON", text)
+
 
 if __name__ == "__main__":
     unittest.main()

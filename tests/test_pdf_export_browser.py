@@ -195,6 +195,26 @@ class PdfExportBrowserTests(unittest.TestCase):
             self.assertAlmostEqual(frame["width"], 40)
             self.assertEqual(frame["kind"], "change")
 
+    def test_unsafe_semantic_group_export_keeps_local_warning_and_yellow_source_only(self):
+        row = model.semantic_text_item(channel="schema")
+        row.update(change="unpaired_old", new=None)
+        row.pop("text_comparison")
+        row["semantic_pairing"].update(
+            status="uncertain", model_assessment="supported", model_rationale="合成模型提议",
+            validation_issues=["合成文字组超过安全间距"])
+        self.result["items"] = [row]
+        self.compare()
+        self.page.locator("#review-filter").select_option("unpaired")
+        self.select("D900")
+        payload = self.download()
+        item, = payload["items"]
+        self.assertIn("本地来源校验", item["blocks"][0]["text"])
+        self.assertIn("合成文字组超过安全间距", item["blocks"][0]["text"])
+        self.assertNotIn("模型理由", item["blocks"][0]["text"])
+        frame, = payload["panes"]["old"]["rects"]
+        self.assertEqual(frame["kind"], "review")
+        self.assertEqual(payload["panes"]["new"]["rects"], [])
+
     def test_service_error_or_invalid_pdf_does_not_clear_comparison(self):
         self.compare()
         self.select("M001")

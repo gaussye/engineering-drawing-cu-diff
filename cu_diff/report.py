@@ -255,8 +255,9 @@ def write_report(result: dict, path: Path) -> None:
             pairing, words = diff["semantic_pairing"], diff.get("text_comparison", {})
             lines.append("| " + " | ".join(cell(value) for value in (
                 diff.get("key"), pairing.get("status"),
-                words.get("changed_text", "未可靠定位"), pairing.get("rationale"),
+                words.get("changed_text", "未可靠定位"), pairing.get("model_rationale", pairing.get("rationale")),
                 {"word_status": words.get("status"), "issues": words.get("issues", []),
+                 "group_validation_issues": pairing.get("validation_issues", []),
                  "limitations": pairing.get("limitations", [])},
             )) + " |")
     lines.extend([

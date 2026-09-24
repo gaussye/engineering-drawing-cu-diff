@@ -947,9 +947,11 @@
       meta.textContent = `${item.id} · ${changes[item.change] || item.change} · LLM语义配对 + CU原文证据（对应仍需复核）`;
       const section = el("section", "semantic-text-detail");
       section.append(el("h3", "", "字段 / OCR 语义对应"),
-        el("p", "", `模型理由（非原文证据）：${text(pairing.rationale) || "未提供"}`),
+        el("p", "", `模型理由（非原文证据）：${text(pairing.model_rationale || pairing.rationale) || "未提供"}`),
         el("p", "", pairing.status === "supported"
           ? "对应关系由模型提出，程序校验已有来源编号；数值及坐标来自CU，不以文字框重叠作为配对门槛。"
+          : pairing.validation_issues?.length
+          ? `本地来源校验：文字组不能安全合并，仍保留为未配对待核；不影响其他可靠结果。${text(pairing.validation_issues)}`
           : "模型未能建立可靠对应，仍保留为未配对待核；不强行合并或推断增删。"),
         el("p", "semantic-word-summary", words?.status === "complete"
           ? `CU变化词：${words.changed_text?.old?.join(" ") || "（无变化词）"} → ${words.changed_text?.new?.join(" ") || "（无变化词）"}。只框不同的CU词，不把整行和未变标注一并高亮。`
@@ -1264,7 +1266,10 @@
   function exportBrief(item) {
     const sentence = (value) => typeof value === "string" ? value.trim() : "";
     if (item.semantic_pairing) {
-      const words = item.text_comparison;
+      const words = item.text_comparison, pairing = item.semantic_pairing;
+      if (pairing.validation_issues?.length) {
+        return `本地来源校验：文字组不能安全合并，保留未配对待核。${text(pairing.validation_issues)}`;
+      }
       return words?.status === "complete"
         ? `CU变化词：${words.changed_text?.old?.join(" ") || "（无变化词）"} → ${words.changed_text?.new?.join(" ") || "（无变化词）"}；LLM语义对应仍需复核，完整原文见网页。`
         : `模型理由（非原文证据）：${sentence(item.semantic_pairing.rationale) || "未提供"}；${item.semantic_pairing.status === "supported" ? "已建立候选对应，变化词定位不足" : "对应关系尚未明确"}，需复核。`;

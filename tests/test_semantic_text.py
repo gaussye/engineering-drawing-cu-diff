@@ -368,18 +368,89 @@ class SemanticTextTests(unittest.TestCase):
             self.assertEqual(result["coverage"][channel]["matched_new"], 1)
             self.assertEqual(result["coverage"][channel]["unpaired_old"], 0)
 
-    def test_group_out_of_order_or_distant_columns_rejected(self):
+    def test_safe_reversed_group_is_canonicalized_without_mutation(self):
         self.split_old()
         comparison = unpaired(self.responses["old"], self.responses["new"])
         self.output["pairs"][0]["old_ids"].reverse()
-        with self.assertRaises(CUError):
-            self.run_pairing(comparison)
-        self.output["pairs"][0]["old_ids"].reverse()
+        original, proposed = copy.deepcopy(comparison), copy.deepcopy(self.output)
+        result = self.run_pairing(comparison)
+        record, = result["differences"]
+        self.assertEqual(record["semantic_pairing"]["status"], "supported")
+        self.assertEqual(record["semantic_pairing"]["old_ids"], ["old:item:0:0", "old:item:0:1"])
+        self.assertEqual(record["semantic_pairing"]["source_order"]["proposed_ids"]["old"],
+                         ["old:item:0:1", "old:item:0:0"])
+        self.assertEqual(record["old"]["schema_item_ids"], ["old:item:0:0", "old:item:0:1"])
+        self.assertEqual(record["text_comparison"]["changed_text"], {"old": ["72"], "new": ["86"]})
+        self.assertEqual(result["coverage"]["semantic_text"]["reordered_groups"], 1)
+        self.assertEqual(result["coverage"]["semantic_text"]["unsafe_groups"], 0)
+        self.assertEqual(comparison, original)
+        self.assertEqual(self.output, proposed)
+
+    def test_noncompact_group_stays_uncertain_while_valid_channel_resolves(self):
+        self.split_old()
+        second = self.responses["old"]["result"]["contents"][0]["fields"]["Items"]["valueArray"][1]
+        for source in ("D(1,2,1,1,.2)", "D(1,8,1,1.2,.2)"):
+            with self.subTest(source=source):
+                second["valueObject"]["RawText"]["source"] = source
+                comparison = unpaired(self.responses["old"], self.responses["new"])
+                result = self.run_pairing(comparison)
+                self.assertEqual(len(result["differences"]), 3)
+                for before, record in zip(comparison["differences"], result["differences"]):
+                    self.assertEqual(record["change"], before["change"])
+                    self.assertEqual(record["old"], before["old"])
+                    self.assertEqual(record["new"], before["new"])
+                    self.assertEqual(record["semantic_pairing"]["status"], "uncertain")
+                    self.assertEqual(record["semantic_pairing"]["model_assessment"], "supported")
+                    self.assertIn("not spatially compact", record["semantic_pairing"]["validation_issues"][0])
+                    self.assertNotIn("text_comparison", record)
+                self.assertEqual(result["ocr_differences"][0]["text_comparison"]["status"], "complete")
+                self.assertEqual(result["coverage"]["schema"]["unpaired_old"], 2)
+                coverage = result["coverage"]["semantic_text"]
+                self.assertEqual(coverage["paired_groups"], 1)
+                self.assertEqual(coverage["uncertain_groups"], 1)
+                self.assertEqual(coverage["unsafe_groups"], 1)
+                self.assertEqual(len(coverage["group_validation_issues"]), 1)
+                self.assertEqual(coverage["status"], "partial")
+                self.assertEqual(result["coverage"]["changed_text_pairing"], "semantic_partial")
+                self.assertEqual(coverage["unreferenced_ids"], {"old": [], "new": []})
+
+    def test_interleaved_group_is_not_merged_even_when_geometry_is_compact(self):
+        self.split_old()
+        entries = self.responses["old"]["result"]["contents"][0]["fields"]["Items"]["valueArray"]
+        interleaved = copy.deepcopy(entries[0])
+        interleaved["valueObject"]["RawText"].update(valueString="Separate note", source="D(1,5,5,1,.2)")
+        entries.insert(1, interleaved)
+        self.output["pairs"][0]["old_ids"] = ["old:item:0:2", "old:item:0:0"]
+        comparison = unpaired(self.responses["old"], self.responses["new"])
+        result = self.run_pairing(comparison)
+        self.assertTrue(all(r["change"].startswith("unpaired") for r in result["differences"]))
+        uncertain = [r for r in result["differences"] if r.get("semantic_pairing")]
+        self.assertEqual(len(uncertain), 3)
+        self.assertTrue(all(r["semantic_pairing"]["status"] == "uncertain" for r in uncertain))
+        self.assertTrue(all("interleaved sources" in r["semantic_pairing"]["validation_issues"][0]
+                            for r in uncertain))
+        self.assertTrue(all("text_comparison" not in r for r in uncertain))
+        coverage = result["coverage"]["semantic_text"]
+        self.assertEqual(coverage["unreferenced_ids"]["old"], ["old:item:0:1"])
+        self.assertEqual(coverage["reordered_groups"], 0)
+        self.assertEqual(coverage["unsafe_groups"], 1)
+        self.assertEqual(result["coverage"]["schema"]["matched_old"], 0)
+        self.assertEqual(result["coverage"]["ocr"]["matched_old"], 2)
+
+    def test_unsafe_group_does_not_relax_atomic_protocol_or_source_validation(self):
+        self.split_old()
         second = self.responses["old"]["result"]["contents"][0]["fields"]["Items"]["valueArray"][1]
         second["valueObject"]["RawText"]["source"] = "D(1,8,1,1.2,.2)"
         comparison = unpaired(self.responses["old"], self.responses["new"])
-        with self.assertRaises(CUError):
-            self.run_pairing(comparison)
+        original = copy.deepcopy(comparison)
+        unsafe = copy.deepcopy(self.output["pairs"][0])
+        for invalid in (pairing(old=["old:unknown"]), pairing(), pairing("ocr", new=["new:item:0:0"]),
+                        dict(pairing("ocr"), rationale=123)):
+            with self.subTest(invalid=invalid):
+                self.output["pairs"] = [unsafe, invalid]
+                with self.assertRaises(CUError):
+                    self.run_pairing(comparison)
+                self.assertEqual(comparison, original)
 
     def test_groups_cannot_cross_pages_or_contents(self):
         self.make_pdfs(2)
@@ -388,15 +459,19 @@ class SemanticTextTests(unittest.TestCase):
         old["pages"].append({"pageNumber": 2, "width": 10, "height": 10, "unit": "inch", "lines": [], "words": []})
         second = old["fields"]["Items"]["valueArray"][1]
         second["valueObject"]["RawText"]["source"] = "D(2,1.8,1,1.2,.2)"
-        with self.assertRaises(CUError):
-            self.run_pairing(unpaired(self.responses["old"], self.responses["new"]))
+        result = self.run_pairing(unpaired(self.responses["old"], self.responses["new"]))
+        self.assertTrue(all(r["semantic_pairing"]["status"] == "uncertain" for r in result["differences"]))
+        self.assertTrue(all("text_comparison" not in r for r in result["differences"]))
+        self.assertIn("different pages/contents",
+                      result["coverage"]["semantic_text"]["group_validation_issues"][0]["issues"][0])
         second["valueObject"]["RawText"]["source"] = "D(1,1.8,1,1.2,.2)"
         extra = copy.deepcopy(old)
         extra["fields"]["Items"]["valueArray"] = [old["fields"]["Items"]["valueArray"].pop()]
         self.responses["old"]["result"]["contents"].append(extra)
         self.output["pairs"] = [pairing(old=["old:item:0:0", "old:item:1:0"])]
-        with self.assertRaises(CUError):
-            self.run_pairing(unpaired(self.responses["old"], self.responses["new"]))
+        result = self.run_pairing(unpaired(self.responses["old"], self.responses["new"]))
+        self.assertEqual(result["coverage"]["semantic_text"]["unsafe_groups"], 1)
+        self.assertTrue(all(r["change"].startswith("unpaired") for r in result["differences"]))
 
     def test_duplicate_parameter_names_no_numeric_only_fallback(self):
         for side in ("old", "new"):

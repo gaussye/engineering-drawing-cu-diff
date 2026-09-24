@@ -216,7 +216,8 @@ def _validate(output, catalogs):
     if len(output["limitations"]) > 32:
         raise CUError("Text pairing exceeded 32 limitations")
     seen, validated = {side: set() for side in SIDES}, []
-    for pair in output["pairs"]:
+    for proposed in output["pairs"]:
+        pair = deepcopy(proposed)
         selected = {}
         for side in SIDES:
             ids = pair[f"{side}_ids"]
@@ -227,11 +228,38 @@ def _validate(output, catalogs):
             if seen[side].intersection(ids):
                 raise CUError("Text pairing reuses a source ID")
             selected[side] = [catalogs[side][identifier] for identifier in ids]
-            if not _compact(selected[side]):
-                raise CUError("Text pairing group is out of reading order or not spatially compact")
             seen[side].update(ids)
         if len({v["channel"] for values in selected.values() for v in values}) != 1:
             raise CUError("Text pairing cannot cross schema/OCR channels")
+        ordered = {side: sorted(selected[side], key=lambda v: v["rank"]) for side in SIDES}
+        issues = []
+        for side, candidates in ordered.items():
+            if _compact(candidates):
+                continue
+            if len({(v["entry"]["content_index"], v["locations"][0]["page"]) for v in candidates}) != 1:
+                reason = "来源跨越不同物理页或CU内容（different pages/contents）"
+            elif [v["rank"] for v in candidates] != list(
+                    range(candidates[0]["rank"], candidates[0]["rank"] + len(candidates))):
+                reason = "CU阅读顺序不连续，夹有其他来源（interleaved sources）"
+            else:
+                reason = "来源不满足既有空间紧凑界限（not spatially compact）"
+            issues.append(f"{side}: {reason}")
+        if issues:
+            pair.update(assessment="uncertain", model_assessment=proposed["assessment"],
+                        model_rationale=proposed["rationale"], validation_issues=issues,
+                        rationale=proposed["rationale"] + "；本地安全分组核验未通过，保留原始未配对来源："
+                        + "；".join(issues))
+        else:
+            reordered = [side for side in SIDES if
+                         pair[f"{side}_ids"] != [v["entry"]["id"] for v in ordered[side]]]
+            if reordered:
+                pair["source_order"] = {
+                    "reordered_sides": reordered,
+                    "proposed_ids": {side: pair[f"{side}_ids"] for side in SIDES},
+                }
+            selected = ordered
+            for side in SIDES:
+                pair[f"{side}_ids"] = [v["entry"]["id"] for v in selected[side]]
         validated.append((pair, selected))
     return validated, seen
 
@@ -380,8 +408,10 @@ def resolve_text_pairing(comparison, responses, paths, *, client, cache,
                          allow_submit=False, pdf_lock=None, progress=None):
     """Return a new comparison with one bounded, cache-aware model reconciliation.
 
-    Only unpaired original CU endpoints are eligible. Validation of the entire
-    model response precedes application; a malformed reference raises CUError.
+    Only unpaired original CU endpoints are eligible. Protocol and reference
+    validation of the entire response precedes application; malformed references
+    raise CUError. Valid references with unsafe grouping remain unpaired/uncertain.
+    Benign reversed IDs are reordered only when the resulting group is safe.
     Neither response operations nor the caller's comparison are modified.
     ``coverage.changed_text_pairing`` becomes ``semantic_completed`` or
     ``semantic_partial`` after a model response; skipped requests are explicitly
@@ -404,6 +434,7 @@ def resolve_text_pairing(comparison, responses, paths, *, client, cache,
         "submitted_ids": {side: [] for side in SIDES}, "omitted": {side: 0 for side in SIDES},
         "omitted_ids": {side: [] for side in SIDES}, "omissions": {side: [] for side in SIDES},
         "paired_groups": 0, "uncertain_groups": 0, "unreferenced_ids": {side: [] for side in SIDES},
+        "unsafe_groups": 0, "reordered_groups": 0, "group_validation_issues": [],
         "model": None, "policy": deepcopy(POLICY), "limitations": [],
     }
     result.setdefault("coverage", {})["semantic_text"] = coverage
@@ -466,6 +497,17 @@ def resolve_text_pairing(comparison, responses, paths, *, client, cache,
             "status": pair["assessment"], "old_ids": pair["old_ids"], "new_ids": pair["new_ids"],
             "rationale": pair["rationale"], "model": metadata, "limitations": output["limitations"],
         }
+        for key in ("validation_issues", "model_assessment", "model_rationale", "source_order"):
+            if key in pair:
+                semantic[key] = deepcopy(pair[key])
+        if pair.get("validation_issues"):
+            coverage["unsafe_groups"] += 1
+            coverage["group_validation_issues"].append({
+                "old_ids": pair["old_ids"], "new_ids": pair["new_ids"],
+                "issues": deepcopy(pair["validation_issues"]),
+            })
+        if pair.get("source_order"):
+            coverage["reordered_groups"] += 1
         if pair["assessment"] == "uncertain":
             coverage["uncertain_groups"] += 1
             for candidates in selected.values():
@@ -503,6 +545,9 @@ def resolve_text_pairing(comparison, responses, paths, *, client, cache,
     result.setdefault("warnings", []).append(
         "模型文字对应仅为人工复核候选；schema/OCR独立处理，遗漏及未配对来源不证明新增或删除。")
     result["warnings"].extend(output["limitations"])
+    for group in coverage["group_validation_issues"]:
+        result["warnings"].append("模型来源分组未安全合并，保留未配对证据："
+                                  + "；".join(group["issues"]))
     return result
 
 
