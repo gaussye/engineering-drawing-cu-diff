@@ -221,9 +221,37 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
         expect(self.page.locator("#timing-total")).to_have_text("5.00 秒")
         expect(self.page.locator(".timing-stage-time")).to_have_text("5.00 秒")
         expect(self.page.locator(".timing-execution")).to_have_text("两侧并行 · 子耗时不相加")
-        expect(self.page.locator('[data-step-id="cu_full_old"]')).to_contain_text("3.00 秒 · 失败")
-        expect(self.page.locator('[data-step-id="cu_full_new"]')).to_contain_text("5.00 秒 · 已完成")
+        expect(self.page.locator('[data-step-id="cu_full_old"] .timing-substep-time')).to_have_text("3.00 秒")
+        expect(self.page.locator('[data-step-id="cu_full_old"]')).to_contain_text("失败")
+        expect(self.page.locator('[data-step-id="cu_full_new"] .timing-substep-time')).to_have_text("5.00 秒")
+        expect(self.page.locator('[data-step-id="cu_full_new"]')).to_contain_text("已完成")
+        expect(self.page.locator(".timing-table tbody .timing-order")).to_have_text(["1", "1.1", "1.2"])
         expect(self.page.locator("#timing-content img")).to_have_count(0)
+
+    def test_timing_table_columns_order_values_and_narrow_layout(self):
+        self.compare()
+        self.page.get_by_role("tab", name="分析耗时").click()
+        table = self.page.get_by_role("table", name="分析步骤耗时")
+        expect(table.get_by_role("columnheader")).to_have_text(["步骤序号", "步骤", "耗时"])
+        expect(table.locator("tbody .timing-order")).to_have_text(["1", "2"])
+        expect(table.locator(".timing-stage-label")).to_have_text(["旧版 CU 提取", "模型区域对比"])
+        expect(table.locator(".timing-stage-time")).to_have_text(["0.125 秒", "1 分 2.5 秒"])
+        expect(self.page.locator("#usage-panel .timing-table")).to_have_count(0)
+        for width in (1600, 1024, 390):
+            self.page.set_viewport_size({"width": width, "height": 1000})
+            bounds = table.bounding_box()
+            self.assertGreaterEqual(bounds["x"], 0)
+            self.assertLessEqual(bounds["x"] + bounds["width"], width)
+            for row in table.locator("tr").all():
+                self.assertEqual(row.locator(":scope > th, :scope > td").count(), 3)
+
+    def test_empty_timing_steps_have_explicit_three_column_empty_state(self):
+        self.job_timing = {"total_seconds": 0, "queue_seconds": 0, "stages": []}
+        self.compare()
+        self.page.get_by_role("tab", name="分析耗时").click()
+        expect(self.page.locator(".timing-table thead th")).to_have_count(3)
+        expect(self.page.locator(".timing-table tbody td")).to_have_attribute("colspan", "3")
+        expect(self.page.locator(".timing-table tbody")).to_contain_text("暂无已记录的步骤")
 
     def test_result_only_timing_unknown_values_and_untrusted_labels(self):
         self.result_only_timing = True

@@ -89,33 +89,51 @@
     if (!timing || typeof timing !== "object") {
       content.append(el("p", "timing-empty", "暂无耗时数据。开始对比后显示本轮实际耗时，不使用缓存中的历史耗时。"));
     } else {
-      const list = el("ol", "timing-stages");
+      const table = el("table", "timing-table"), head = el("thead"), header = el("tr");
+      const body = el("tbody");
+      table.append(el("caption", "visually-hidden", "分析步骤耗时"));
+      for (const [index, label] of ["步骤序号", "步骤", "耗时"].entries()) {
+        const cell = el("th", ["timing-order", "timing-description", "timing-duration"][index], label);
+        cell.scope = "col";
+        header.append(cell);
+      }
+      head.append(header);
+      table.append(head, body);
+      function appendStep(entry, number, substep = false) {
+        const prefix = substep ? "timing-substep" : "timing-stage", row = el("tr", prefix);
+        row.dataset[substep ? "stepId" : "stageId"] = typeof entry.id === "string" ? entry.id : "";
+        row.dataset.status = ["running", "completed", "failed"].includes(entry.status) ? entry.status : "unknown";
+        const order = el("th", "timing-order", number), description = el("td", "timing-description");
+        order.scope = "row";
+        description.append(el("span", `${prefix}-label`, text(entry.label) || "未命名步骤"),
+          el("span", "timing-stage-state", ({
+            running: "进行中", completed: "已完成", failed: "失败，保留已耗时间"
+          })[entry.status] || "状态未提供"));
+        row.append(order, description, el("td", `${prefix}-time timing-duration`, duration(entry.elapsed_seconds)));
+        body.append(row);
+        return description;
+      }
+      let number = 0;
       for (const stage of Array.isArray(timing.stages) ? timing.stages : []) {
         if (!stage || typeof stage !== "object") continue;
-        const row = el("li", "timing-stage");
-        row.dataset.stageId = typeof stage.id === "string" ? stage.id : "";
-        row.dataset.status = ["running", "completed", "failed"].includes(stage.status) ? stage.status : "unknown";
-        row.append(el("span", "timing-stage-label", text(stage.label) || "未命名步骤"),
-          el("span", "timing-stage-time", duration(stage.elapsed_seconds)),
-          el("span", "timing-stage-state", ({ running: "进行中", completed: "已完成", failed: "失败，保留已耗时间" })[stage.status] || "状态未提供"));
+        const description = appendStep(stage, ++number);
         if (Array.isArray(stage.steps)) {
-          const steps = el("ul", "timing-substeps");
+          description.append(el("span", "timing-execution", stage.execution === "parallel"
+            ? "两侧并行 · 子耗时不相加" : "子步骤耗时已包含在本阶段"));
+          let subnumber = 0;
           for (const step of stage.steps) {
             if (!step || typeof step !== "object") continue;
-            const child = el("li", "timing-substep");
-            child.dataset.stepId = typeof step.id === "string" ? step.id : "";
-            child.dataset.status = ["running", "completed", "failed"].includes(step.status) ? step.status : "unknown";
-            child.textContent = `${text(step.label) || "未命名步骤"} · ${duration(step.elapsed_seconds)} · ${({
-              running: "进行中", completed: "已完成", failed: "失败"
-            })[step.status] || "状态未提供"}`;
-            steps.append(child);
+            appendStep(step, `${number}.${++subnumber}`, true);
           }
-          row.append(el("span", "timing-execution", stage.execution === "parallel"
-            ? "两侧并行 · 子耗时不相加" : "子步骤耗时已包含在本阶段"), steps);
         }
-        list.append(row);
       }
-      content.append(list, el("p", "timing-meta",
+      if (!number) {
+        const row = el("tr"), cell = el("td", "timing-empty", "暂无已记录的步骤。");
+        cell.colSpan = 3;
+        row.append(cell);
+        body.append(row);
+      }
+      content.append(table, el("p", "timing-meta",
         "本轮服务端实际耗时，含排队；步骤按实际执行记录，不将缓存里的历史服务耗时累计为本轮耗时。"));
     }
     $("timing-panel").scrollTop = scrollTop;

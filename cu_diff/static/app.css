@@ -154,18 +154,18 @@ body.resizing-review, .resizing-review * { cursor: row-resize !important; user-s
 .timing-heading h3 { font-size: 12px; }
 .timing-total { font: 600 18px/1.3 Consolas, "Courier New", Courier, monospace; color: var(--cp-text); }
 .timing-meta { color: var(--cp-text-muted); font-size: 11px; }
-.timing-stages { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 6px 14px; margin: 8px 0 0; padding: 0; list-style: none; }
-.timing-stage { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; border-left: 2px solid var(--cp-border); padding-left: 8px; min-width: 0; }
-.timing-stage-label { overflow-wrap: anywhere; }
-.timing-stage-time { font-variant-numeric: tabular-nums; white-space: nowrap; }
-.timing-stage-state { color: var(--cp-text-muted); font-size: 10px; }
-.timing-stage[data-status="running"] { border-left-color: var(--cp-accent); }
-.timing-stage[data-status="failed"] { border-left-color: var(--cp-danger); }
-.timing-stage[data-status="failed"] .timing-stage-state { color: var(--cp-danger); }
-.timing-execution, .timing-substeps { grid-column: 1 / -1; font-size: 10px; color: var(--cp-text-muted); }
-.timing-substeps { list-style: none; padding: 0; margin: 0; overflow-wrap: anywhere; }
-.timing-substep[data-status="running"] { color: var(--cp-accent); }
-.timing-substep[data-status="failed"] { color: var(--cp-danger); }
+.timing-table { width: 100%; table-layout: fixed; border-collapse: collapse; margin: 10px 0; font-variant-numeric: tabular-nums; }
+.timing-table th, .timing-table td { padding: 8px 10px; border: 1px solid var(--cp-border); text-align: left; vertical-align: top; }
+.timing-table thead th { position: sticky; top: 0; z-index: 1; background: var(--cp-surface-soft); font-weight: 600; }
+.timing-table .timing-order { width: 76px; text-align: center; font-weight: 500; }
+.timing-table .timing-duration { width: 120px; text-align: right; white-space: nowrap; }
+.timing-description { overflow-wrap: anywhere; }
+.timing-stage-state, .timing-execution { display: block; color: var(--cp-text-muted); font-size: 10px; margin-top: 3px; }
+.timing-table [data-status="running"] .timing-stage-state { color: var(--cp-accent); }
+.timing-table [data-status="failed"] .timing-stage-state { color: var(--cp-danger); }
+.timing-substep { background: var(--cp-surface-soft); }
+.timing-substep .timing-description { padding-left: 24px; }
+.timing-substep .timing-order { color: var(--cp-text-muted); }
 .usage-content { padding: 12px 20px 18px; min-width: 0; font-size: 11px; overflow-wrap: anywhere; }
 .usage-empty { color: var(--cp-text-muted); padding: 22px 0; text-align: center; }
 .usage-heading { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: baseline; margin-bottom: 8px; }
@@ -202,6 +202,8 @@ body.resizing-review, .resizing-review * { cursor: row-resize !important; user-s
 @media (max-width: 480px) {
   .usage-content { padding-inline: 12px; }
   .timing-content { margin-inline: 12px; }
+  .timing-table .timing-order { width: 64px; }
+  .timing-table .timing-duration { width: 108px; }
   .analysis-controls { flex-basis: 100%; justify-content: space-between; border-right: 0; border-bottom: 1px solid var(--cp-chrome-border); padding: 0 0 8px; }
   .header-actions { width: 100%; }
   .header-actions > button { flex: 1; }
