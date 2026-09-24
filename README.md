@@ -944,10 +944,10 @@ CLI `extract`输出本轮`usage-cost.json`，`model-compare`输出`model-usage-c
 - Linux Python 3.11、Waitress单进程、单实例，启用Always On。作业和浏览器会话仍在内存，
   **重启后须刷新并重新上传，正在执行的任务不能保证完成**。不要开启多worker或横向扩容；
   需要扩容时先实现共享会话、持久作业队列及重复计费保护。
-- 公网入口仅允许HTTPS，启用App Service **Easy Auth / Microsoft Entra单租户认证**，
+- 公网入口仅允许HTTPS，默认启用App Service **Easy Auth / Microsoft Entra单租户认证**，
   并配置明确的用户object ID白名单。应用同时验证Easy Auth注入的租户/用户声明，
   将会话绑定到用户，保留CSRF检查，并使用Secure/HttpOnly/SameSite Cookie。
-  `/api/health`仅暴露无敏感信息的存活状态。不能绕开Easy Auth直接公开容器端口，
+  `/api/health`仅暴露无敏感信息的存活状态。Entra模式不能绕开Easy Auth直接公开容器端口，
   也不能在普通反向代理上信任客户端自行提供的`X-MS-CLIENT-PRINCIPAL`。
 - CU和直接模型调用使用**系统分配托管身份**，不依赖Azure CLI登录或API key。
   只在目标AI资源授予`Cognitive Services Content Understanding Reader`和
@@ -971,7 +971,19 @@ CLI `extract`输出本轮`usage-cost.json`，`model-compare`输出`model-usage-c
 | `CU_TENANT_ID` | Entra租户ID |
 | `CU_ALLOWED_PRINCIPALS` | 允许登录的object ID，逗号分隔且不能为空 |
 | `WEBSITE_HOSTNAME` | App Service提供的站点主机名 |
-| `WEBSITE_AUTH_ENABLED` | Easy Auth必须为`true`；未启用时拒绝启动 |
+| `WEBSITE_AUTH_ENABLED` | Entra模式必须为`true`；未启用时拒绝启动 |
+| `CU_WEB_AUTH_MODE` | 默认`entra`；显式`demo`使用固定账号登录 |
+| `CU_DEMO_USERNAME` | Demo固定用户名；仅Demo模式读取 |
+| `CU_DEMO_PASSWORD_HASH` | Werkzeug `scrypt:32768:8:1`密码哈希；不接受明文 |
+
+**简化Demo登录：** 显式选择`-AuthMode demo`后，访问站点显示中文用户名/密码表单，
+不再跳转Microsoft登录。使用生成的强固定密码，凭据只保存在忽略的本机目录，
+服务端App Settings仅保存密码哈希。生成、部署与轮换见[Demo登录说明](deploy/README.md#fixed-account-demo-login)。
+登录会话最长8小时，退出立即撤销；登录后每个浏览器仍有独立的图纸审阅会话，
+不同登录不能借用另一会话Cookie。登录与API都校验CSRF，登录总尝试限制为每分钟10次。
+重启、重新部署或密码轮换会清空登录会话；退出不会取消已经提交的AI请求或删除持久缓存。
+这是共享账号演示模式，没有实名审计、MFA或分布式防护，不适合生产。
+它只替代网页用户登录，不改变应用访问CU/模型的托管身份与权限。
 
 托管模式不改变缓存默认关闭、默认Sol、用户提供的Sol/Luna单价、CU价格或证据校验逻辑。
 本地`cu-diff-web`仍默认仅监听`127.0.0.1`并使用Azure CLI凭据。

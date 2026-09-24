@@ -2,6 +2,32 @@
 
 Status: Deployed
 
+## Current change: demo login
+User requested fixed username/password login for this demo on 2026-09-24.
+Keep the existing West US 2 app/plan and system managed identity unchanged.
+Add explicit opt-in demo authentication with a generated fixed account, password
+hash in App Settings, opaque server-side sessions, CSRF, expiry, and login limits.
+Credentials stay in ignored operator-local files; never package or commit them.
+Deploy protected application code before disabling platform Entra enforcement;
+the application must fail closed without valid demo credential configuration.
+Retain the Entra mode for later production use. Verify real browser login/logout,
+wrong-password denial, anonymous API rejection, and existing application defaults.
+Preparation complete: explicit demo mode, salted scrypt hash, login/logout UI,
+eight-hour opaque sessions, ten attempts/minute limit, bounded challenge storage,
+and per-login review ownership. Real loopback-TLS Chromium login/logout passes.
+The native form needs Referrer-Policy same-origin on /login; no-referrer sends
+Origin null in Chromium, so retaining the strict Origin check required this fix.
+Source-only packager includes the new auth module/form and excludes credentials.
+Deployment retains the Entra gate until new-process demo health is observed.
+An existing Windows Set-Acl privilege issue was resolved with an access-only
+icacls restriction plus explicit read-back; fresh-directory protection verified.
+Existing target/subscription/region/system identity rechecked read-only.
+No new capacity or AI model changes; exact target and fixed demo credentials remain
+in ignored operator-only local files.
+Final lifecycle refinement: retired/expired logins release unused review slots,
+without interrupting in-flight uploads or AI jobs. Completed retired sessions are
+removed from memory on subsequent cleanup; persisted files retain normal TTL.
+
 ## 1. Objective
 Deploy the existing engineering drawing review application to Azure App Service
 with a public HTTPS URL, protected access, and managed identity access to the
@@ -55,6 +81,48 @@ Verify with synthetic fixtures and minimal AI smoke calls, never customer docume
 - [x] Verify HTTPS, protected access, and managed identity authorization
 
 ## 7. Validation Proof
+### Final demo lifecycle/recovery validation, 2026-09-24 19:49+08:00
+- Reinvoked azure-validate after final lifecycle refinement.
+- Same affected suite including Chromium: 89 tests, 29.898s, OK (5 Windows
+  symlink privilege skips); wheel build and diff check passed.
+- Deployment HTTP/package suite after adding bounded gateway-propagation waits:
+  23 tests, OK (5 skips). Tests reject missing demo process marker, wrong forms,
+  anonymous API access, and exhausted waits; transient login-gateway denial retries.
+- Initial rollout reached demo-process health but failed its immediate login-form
+  check after gateway switch; failure correctly disabled public networking.
+  ARM read-back confirms demo mode, HTTPS enabled, EasyAuth disabled, app Running.
+  The verifier now waits for the actual form before checking protected routes;
+  deployment success still requires live verification, not ARM configuration alone.
+- Deployment parameters, owned resources, subscription/region, AI role scope, and
+  source-only artifact boundaries are unchanged from the prior validation.
+
+### Demo authentication update, 2026-09-24 19:39+08:00
+All validation checks pass under azure-validate:
+- [x] Azure CLI 2.81.0 and authenticated subscription/tenant confirmed.
+- [x] Existing app is Running, HTTPS-only, West US 2; system identity unchanged.
+- [x] PowerShell AST parses; demo-mode preview makes no Azure calls.
+- [x] Actual Protect-Directory helper creates a verified operator-only Windows ACL.
+- [x] Applicable resource-group/inherited policy query returned no assignments.
+- [x] Static role verification: unchanged CU Reader + OpenAI User at AI account,
+  bound to system identity, not demo user or login identity.
+- [x] Bicep/template what-if/Docker: not applicable to existing imperative AZCLI
+  source deployment; no new infrastructure template or capacity changes.
+- [x] `CU_BROWSER_TESTS=1 python -m unittest tests.test_demo_browser
+  tests.test_demo_auth tests.test_hosting tests.test_deployment_http
+  tests.test_deployment_package tests.test_web tests.test_pdf_export_web
+  tests.test_web_browser -q`: 88 tests, 34.343s, OK; 5 Windows symlink privilege
+  skips, with mocked reparse/link rejection also exercised.
+- [x] Chromium against actual loopback TLS: wrong password denied, correct login,
+  Secure cookie continuity, protected bootstrap, logout, mobile form layout.
+- [x] `node --check cu_diff/static/app.js` and `git diff --check` passed.
+- [x] `python -m pip wheel . --no-deps --wheel-dir local/demo-wheel --quiet`
+  passed using declared isolated build dependencies. The initial no-build-isolation
+  probe lacked setuptools; normal isolated build resolved that dependency.
+- [x] Real source package: 34 allowlisted files, including login form/module.
+  Wheel includes login form. Credential files are ignored and operator-only.
+Live browser authentication and post-switch authorization remain required before
+claiming deployment success. No customer files or billed AI requests used here.
+
 ### Approved execution preflight, 2026-09-24 18:25+08:00 onward
 - Azure CLI 2.81.0 authenticated to the approved subscription and tenant.
 - `az quota show` / `az quota usage show` reconfirmed West US 2 B2 limit 10, usage 0.
@@ -105,6 +173,33 @@ Actual Oryx build, target glibc ABI, Entra sign-in, managed identity token issua
 AI role propagation, and public HTTPS must still be tested after approved deployment.
 
 ## 8. Deployment Results
+### Fixed-account demo update, 2026-09-24 19:58+08:00
+Successfully published to the same owned West US 2 App Service and B2 instance.
+Final OneDeploy status 4, complete=true, active=true. Exact deployment ID and
+target mode are recorded in ignored operator-local state.
+
+- Public `/` redirects to the Chinese `/login` form; Microsoft sign-in is no
+  longer required. Anonymous and forged-identity protected API/static requests
+  return 401. The login form became available after seven readiness probes
+  following gateway change, confirming a real propagation delay.
+- Real Chromium: wrong password returns 401; correct fixed credentials enter
+  the application. The secure host-only HttpOnly/SameSite cookie works.
+- Authenticated bootstrap is 200; default Sol/cache OFF remain unchanged.
+- A generated synthetic PDF uploaded and rendered successfully. A separately
+  authenticated browser using the same account cannot access its preview (404).
+- Logout succeeds; protected bootstrap and replay of the revoked login cookie
+  both return 401. Mobile login layout and browser JavaScript checks passed.
+- System identity is unchanged. Live role assignments are still CU Reader and
+  OpenAI User, scoped only to the existing AI account. No model/analyzer changes,
+  no new AI calls, and no customer files uploaded during this login verification.
+- Credentials are fixed and retained in an ignored operator-only local directory.
+  Only the salted password hash is in App Settings; neither password nor hash
+  is in Git or the source-only deployment ZIP.
+- Local verification summary and login screenshot remain ignored. Shared demo
+  access has no MFA or individual attribution; Entra configuration is retained
+  for a future explicit switch back.
+
+### Original Entra deployment
 2026-09-24: deployment completed in West US 2. Dedicated Linux B2, one instance,
 one app, Python 3.11.15. Final OneDeploy status 4, complete=true, active=true.
 Actual endpoint/resource identifiers are in ignored local deployment state and

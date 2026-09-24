@@ -12,6 +12,38 @@ LOGIN = (302, f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/authorize
 
 
 class DeploymentHttpTests(unittest.TestCase):
+    def test_demo_readiness_requires_new_process_marker_before_disabling_entra(self):
+        demo_health = (200, "", b'{"local_only":false,"status":"ok","auth_mode":"demo"}')
+        with patch("deploy.verify_http.fetch", return_value=HEALTH):
+            with self.assertRaisesRegex(RuntimeError, "health did not pass"):
+                verify(ORIGIN, TENANT, attempts=1, auth_mode="demo", health_only=True)
+        with patch("deploy.verify_http.fetch", return_value=demo_health) as fetch:
+            self.assertEqual(verify(ORIGIN, TENANT, auth_mode="demo", health_only=True), {"health": 200})
+            fetch.assert_called_once()
+        form = (200, "", b'<input name="csrf"><input type="password">')
+        with patch("deploy.verify_http.fetch", side_effect=[demo_health, form, (303, "/login", b""), DENIED]):
+            self.assertEqual(verify(ORIGIN, TENANT, auth_mode="demo")["demo_login"], 200)
+        with patch("deploy.verify_http.fetch",
+                   side_effect=[demo_health, form, (303, "/login", b""), (302, "/login", b"")]):
+            with self.assertRaises(RuntimeError):
+                verify(ORIGIN, TENANT, auth_mode="demo")
+
+    def test_demo_gateway_propagation_retries_without_accepting_anonymous_api_access(self):
+        health = (200, "", b'{"local_only":false,"status":"ok","auth_mode":"demo"}')
+        form = (200, "", b'<input name="csrf"><input type="password">')
+        with patch("deploy.verify_http.fetch", side_effect=[health, DENIED, form, (303, "/login", b""), DENIED]), \
+                patch("deploy.verify_http.time.sleep"):
+            self.assertEqual(verify(ORIGIN, TENANT, auth_mode="demo", attempts=2)["demo_login_attempts"], 2)
+        with patch("deploy.verify_http.fetch", side_effect=[health, DENIED]):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 401"):
+                verify(ORIGIN, TENANT, auth_mode="demo", attempts=1)
+        with patch("deploy.verify_http.fetch", side_effect=[health, (200, "", b"wrong form")]):
+            with self.assertRaisesRegex(RuntimeError, "without the expected form"):
+                verify(ORIGIN, TENANT, auth_mode="demo", attempts=1)
+        with patch("deploy.verify_http.fetch", side_effect=[health, form, (303, "/login", b""), (200, "", b"")]):
+            with self.assertRaisesRegex(RuntimeError, "not protected"):
+                verify(ORIGIN, TENANT, auth_mode="demo", attempts=1)
+
     def test_real_health_and_protected_login_are_all_required(self):
         with patch("deploy.verify_http.fetch", side_effect=[HEALTH, DENIED, DENIED, LOGIN]):
             self.assertEqual(verify(ORIGIN, TENANT, attempts=1),

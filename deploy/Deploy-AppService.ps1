@@ -20,6 +20,8 @@ param(
     [Parameter(Mandatory)][guid]$DeploymentId,
     [string]$ConfigFile = 'local\config.json',
     [string]$Python = 'python',
+    [ValidateSet('entra', 'demo')][string]$AuthMode = 'entra',
+    [string]$DemoCredentialFile,
     [switch]$Execute,
     [switch]$ApprovePaidResources
 )
@@ -45,6 +47,7 @@ if (-not $Execute) {
     Write-Host "Dedicated Linux B2 plan: $PlanName; one instance; app: $AppName"
     Write-Host "AI role scope: $AiResourceId"
     Write-Host "Single tenant: $TenantId; permitted operator: $OperatorObjectId"
+    Write-Host "Application authentication mode: $AuthMode"
     Write-Host "Ownership marker: $owner"
     Write-Host "Execution requires BOTH -Execute and -ApprovePaidResources."
     return
@@ -116,13 +119,14 @@ function Protect-Directory([string]$Path) {
     $null = New-Item -ItemType Directory -Path $Path
     if ($IsWindows) {
         $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-        $acl = [Security.AccessControl.DirectorySecurity]::new()
-        $acl.SetOwner($sid)
-        $acl.SetAccessRuleProtection($true, $false)
-        $rule = [Security.AccessControl.FileSystemAccessRule]::new(
-            $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-        $acl.AddAccessRule($rule)
-        Set-Acl -LiteralPath $Path -AclObject $acl
+        # Set-Acl can demand SeSecurityPrivilege even for an access-only update.
+        & icacls $Path /inheritance:r /grant:r "*$($sid.Value):(OI)(CI)F" /q >$null
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot restrict deployment directory access.' }
+        $acl = Get-Acl -LiteralPath $Path
+        if (-not $acl.AreAccessRulesProtected -or @($acl.Access).Count -ne 1 -or
+            $acl.Access[0].IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) {
+            throw 'Deployment directory owner-only ACL verification failed.'
+        }
     } else {
         [IO.File]::SetUnixFileMode($Path, [IO.UnixFileMode]::UserRead -bor
             [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
@@ -158,6 +162,24 @@ try {
         }
     }
     Assert-NoSecrets $config
+    $demoCredentials = $null
+    if ($AuthMode -eq 'demo') {
+        if (-not $DemoCredentialFile) { throw 'Demo mode requires DemoCredentialFile containing username and password_hash.' }
+        $credentialPath = if ([IO.Path]::IsPathRooted($DemoCredentialFile)) { $DemoCredentialFile } else { Join-Path $root $DemoCredentialFile }
+        try {
+            $demoCredentials = Get-Content -LiteralPath $credentialPath -Raw | ConvertFrom-Json -AsHashtable
+        } catch {
+            throw 'Cannot read demo credential settings. Contents suppressed.'
+        }
+        if ($demoCredentials -isnot [System.Collections.IDictionary] -or
+            $demoCredentials.Count -ne 2 -or
+            $demoCredentials['username'] -cnotmatch '^[A-Za-z0-9_.-]{1,64}$' -or
+            $demoCredentials['password_hash'] -cnotmatch '^scrypt:32768:8:1\$[A-Za-z0-9]{16}\$[a-f0-9]{128}$') {
+            throw 'Demo credentials must contain only username and a supported password_hash, never a plaintext password.'
+        }
+    } elseif ($DemoCredentialFile) {
+        throw 'DemoCredentialFile is only permitted with AuthMode demo.'
+    }
     $local = Join-Path $root 'local'
     if (-not (Test-Path -LiteralPath $local)) { $null = New-Item -ItemType Directory -Path $local }
     $ancestor = Get-Item -LiteralPath $local
@@ -335,10 +357,15 @@ try {
         CU_CONFIG_JSON = ($config | ConvertTo-Json -Depth 40 -Compress)
         CU_PUBLIC_ORIGIN = $origin; CU_TENANT_ID = "$TenantId"; CU_ALLOWED_PRINCIPALS = "$OperatorObjectId"
         CU_DATA_DIR = '/home/cu-review/data'; CU_CACHE_DIR = '/home/cu-review/cache'
+        CU_WEB_AUTH_MODE = $AuthMode
         OVERRIDE_USE_MI_FIC_ASSERTION_CLIENTID = $identity.properties.clientId
         WEBSITE_AUTH_AAD_ALLOWED_TENANTS = "$TenantId"
         SCM_DO_BUILD_DURING_DEPLOYMENT = 'true'; ENABLE_ORYX_BUILD = 'true'
         WEBSITES_ENABLE_APP_SERVICE_STORAGE = 'true'; PYTHONUNBUFFERED = '1'
+    }
+    if ($AuthMode -eq 'demo') {
+        $settings.CU_DEMO_USERNAME = $demoCredentials.username
+        $settings.CU_DEMO_PASSWORD_HASH = $demoCredentials.password_hash
     }
     $null = Invoke-Json 'PUT' "$arm${siteId}/config/appsettings?api-version=$webVersion" @{ properties = $settings }
     $null = Invoke-Json 'PUT' "$arm${siteId}/config/slotConfigNames?api-version=$webVersion" @{
@@ -390,10 +417,23 @@ try {
         '--timeout', '1800000', '--track-status', 'false')
     # CLI Linux startup tracking can fail after a successful Oryx build. Verify
     # actual HTTPS health and authentication instead of trusting that poller.
-    & $Python (Join-Path $PSScriptRoot 'verify_http.py') --origin $origin --tenant "$TenantId"
+    if ($AuthMode -eq 'demo') {
+        # Keep the Entra gate until the NEW process proves demo auth initialized.
+        & $Python (Join-Path $PSScriptRoot 'verify_http.py') --origin $origin --tenant "$TenantId" --auth-mode demo --health-only
+        if ($LASTEXITCODE -ne 0) { throw 'Demo application readiness failed; Entra gate remains enforced.' }
+        $auth.platform.enabled = $false
+        $auth.globalValidation.requireAuthentication = $false
+        $auth.globalValidation.unauthenticatedClientAction = 'AllowAnonymous'
+        $null = Invoke-Json 'PUT' "$arm${siteId}/config/authsettingsV2?api-version=$webVersion" @{ properties = $auth }
+        $verified = (Invoke-Json 'GET' "$arm${siteId}/config/authsettingsV2?api-version=$webVersion").properties
+        if ($verified.platform.enabled -or -not $verified.httpSettings.requireHttps) {
+            throw 'Demo gateway configuration verification failed.'
+        }
+    }
+    & $Python (Join-Path $PSScriptRoot 'verify_http.py') --origin $origin --tenant "$TenantId" --auth-mode $AuthMode
     if ($LASTEXITCODE -ne 0) { throw 'Deployed endpoint verification failed.' }
     Write-Host "Deployment completed: $origin"
-    Write-Host 'Verify approved and unapproved tenant users, anonymous redirects, and /api/health before sharing.'
+    Write-Host "Verify authorized login/logout, anonymous denial, and /api/health before sharing ($AuthMode mode)."
     Write-Host 'Never scale beyond one instance. Jobs and review sessions are in memory.'
 } catch {
     if ($siteTouched -and $work) {

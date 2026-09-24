@@ -14,13 +14,14 @@ import time
 from urllib.parse import unquote
 import uuid
 
-from flask import Flask, Response, g, jsonify, request, send_file
+from flask import Flask, Response, g, jsonify, redirect, render_template_string, request, send_file
 import pymupdf
 from werkzeug.exceptions import HTTPException
 
 from .analysis_options import AnalysisOptions
 from .client import CacheMiss, Client, CUError, digest, save_json
 from .compare import compare_responses
+from .demo_auth import COOKIE as DEMO_COOKIE, CHALLENGE_TTL, LOGIN_TTL, DemoAuth, DemoAuthError
 from .hosting import CloudBoundary
 from .parallel import cu_workers, parallel_cu_enabled, run_cu_pair
 from .schema import extraction_profile
@@ -67,6 +68,7 @@ class Session:
     documents: dict[str, Document] = field(default_factory=dict)
     revision: int = 0
     last_used: float = field(default_factory=time.time)
+    retired: bool = False
     job_id: str | None = None
     uploading: bool = False
     principal: str | None = None
@@ -103,7 +105,7 @@ class Store:
         now = time.time()
         with self.lock:
             expired = [sid for sid, s in self.sessions.items()
-                       if now - s.last_used > SESSION_TTL and not s.uploading
+                       if (s.retired or now - s.last_used > SESSION_TTL) and not s.uploading
                        and not self.active(s)]
             for sid in expired:
                 session = self.sessions.pop(sid)
@@ -485,7 +487,9 @@ class Store:
 
 def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 8765,
                allow_azure: bool = False, client_factory=Client,
-               cloud: CloudBoundary | None = None) -> Flask:
+               cloud: CloudBoundary | None = None, demo_auth: DemoAuth | None = None) -> Flask:
+    if demo_auth is not None and cloud is None:
+        raise ValueError("Demo login requires explicit HTTPS cloud hosting")
     app = Flask(__name__, static_folder=None)
     app.config.update(MAX_CONTENT_LENGTH=MAX_BYTES, JSON_AS_ASCII=False)
     app.json.ensure_ascii = False
@@ -505,12 +509,23 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
         if request.headers.get("Sec-Fetch-Site") == "cross-site":
             raise WebError("拒绝跨站请求。", 403)
         principal = None
-        if cloud and request.path != "/api/health":
+        if demo_auth and request.path not in ("/api/health", "/login"):
+            principal = demo_auth.principal(request.cookies.get(DEMO_COOKIE))
+            if principal is None:
+                if request.path == "/" and request.method == "GET":
+                    return redirect("/login", code=303)
+                raise WebError("请先登录；会话过期后请刷新页面重新登录。", 401)
+        elif cloud and not demo_auth and request.path != "/api/health":
             try:
                 principal = cloud.authenticate(request.headers.get("X-MS-CLIENT-PRINCIPAL"))
             except ValueError as error:
                 raise WebError("云端身份验证失败或账号未获授权，请使用已批准的Microsoft账号登录。", 403) from error
         if request.path.startswith("/api/") and request.path != "/api/health":
+            if demo_auth and request.path == "/api/bootstrap":
+                with store.lock:
+                    for session in store.sessions.values():
+                        if session.principal and not demo_auth.principal(session.principal.removeprefix("demo:")):
+                            session.retired = True
             g.review_session, g.new_session = store.session(
                 request.cookies.get(cookie_name), create=request.path == "/api/bootstrap",
                 principal=principal)
@@ -523,11 +538,15 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
     def headers(response):
         response.headers.update({
             "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
-            "Referrer-Policy": "no-referrer", "X-Frame-Options": "SAMEORIGIN",
+            # A no-referrer form submits Origin: null in Chromium. Keep the
+            # same-origin login POST check without disclosing referrers off-site.
+            "Referrer-Policy": "same-origin" if demo_auth and request.path == "/login" else "no-referrer",
+            "X-Frame-Options": "SAMEORIGIN",
             "Content-Security-Policy": (
                 "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
                 "img-src 'self' blob: data:; connect-src 'self'; font-src 'self'; "
-                "object-src 'none'; base-uri 'none'; frame-ancestors 'self'; form-action 'none'"
+                "object-src 'none'; base-uri 'none'; frame-ancestors 'self'; form-action "
+                + ("'self'" if demo_auth else "'none'")
             ),
         })
         if getattr(g, "new_session", False):
@@ -555,6 +574,54 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
     def index():
         return send_file(assets / "index.html")
 
+    if demo_auth:
+        @app.route("/login", methods=["GET", "POST"])
+        def demo_login():
+            cookie = request.cookies.get(DEMO_COOKIE)
+            session = demo_auth.get(cookie)
+            if request.method == "GET" and session and session.authenticated:
+                return redirect("/", code=303)
+            message, status_code = "", 200
+            try:
+                if request.method == "POST":
+                    if request.content_length is None or request.content_length > 4096:
+                        raise DemoAuthError("登录请求过大或不完整。", 413)
+                    token, _ = demo_auth.login(cookie, request.form.get("csrf"),
+                                              request.form.get("username", ""), request.form.get("password", ""))
+                    response = redirect("/", code=303)
+                    response.set_cookie(DEMO_COOKIE, token, secure=True, httponly=True,
+                                        samesite="Strict", max_age=LOGIN_TTL)
+                    response.delete_cookie(cookie_name, secure=True, httponly=True, samesite="Strict")
+                    return response
+            except DemoAuthError as error:
+                message, status_code = str(error), error.status
+            new_session = not session or session.authenticated
+            if new_session:
+                try:
+                    cookie, session = demo_auth.issue()
+                except DemoAuthError as error:
+                    raise WebError(str(error), error.status) from error
+            response = Response(render_template_string((assets / "login.html").read_text(encoding="utf-8"),
+                                                       csrf=session.csrf, error=message),
+                                status=status_code, content_type="text/html; charset=utf-8")
+            if new_session:
+                response.set_cookie(DEMO_COOKIE, cookie, secure=True, httponly=True,
+                                    samesite="Strict", max_age=CHALLENGE_TTL)
+            if status_code == 429:
+                response.headers["Retry-After"] = "60"
+            return response
+
+        @app.post("/api/logout")
+        def demo_logout():
+            demo_auth.logout(request.cookies.get(DEMO_COOKIE))
+            with store.lock:
+                g.review_session.retired = True
+            store.cleanup()
+            response = jsonify(logged_out=True)
+            response.delete_cookie(DEMO_COOKIE, secure=True, httponly=True, samesite="Strict")
+            response.delete_cookie(cookie_name, secure=True, httponly=True, samesite="Strict")
+            return response
+
     @app.get("/favicon.ico")
     def favicon():
         return Response(status=204)
@@ -567,13 +634,14 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
 
     @app.get("/api/health")
     def health():
-        return jsonify(status="ok", local_only=cloud is None)
+        return jsonify(status="ok", local_only=cloud is None, **({"auth_mode": "demo"} if demo_auth else {}))
 
     @app.get("/api/bootstrap")
     def bootstrap():
         session = g.review_session
         with store.lock:
             return jsonify(
+                auth_mode="demo" if demo_auth else "entra" if cloud else "local",
                 csrf_token=session.csrf, revision=session.revision,
                 limits={"max_bytes": MAX_BYTES, "max_pages": MAX_PAGES,
                         "session_ttl_hours": SESSION_TTL},
@@ -587,7 +655,8 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
                     config.get("model_deployments", {}).get(config.get("completion_model"))),
                 documents={role: session.documents[role].public() if role in session.documents else None
                            for role in ("old", "new")},
-                storage_notice="文件仅存本地；会话闲置24小时后于后续请求/启动时清理。CU缓存单独保留，清理说明见README。",
+                storage_notice=("文件保存在Azure私有目录；" if cloud else "文件仅存本地；")
+                + "会话闲置24小时后于后续请求/启动时清理。CU缓存单独保留，清理说明见README。",
             )
 
     @app.put("/api/documents/<role>")

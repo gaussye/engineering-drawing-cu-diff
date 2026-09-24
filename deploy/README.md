@@ -17,10 +17,12 @@ charge and the operator has reviewed the target IDs.
   cache uses `/home/cu-review/cache`, never the deployed `wwwroot`.
 - Existing AI resource and model deployments are reused. The script does not
   create analyzers, configure default models, or mutate AI model deployments.
-- Entra EasyAuth requires the specified tenant and operator **object ID**.
+- Default Entra EasyAuth requires the specified tenant and operator **object ID**.
   The only anonymous route is `/api/health`. All other unauthenticated requests
   redirect browsers to Entra login or return 401/403 to API clients.
   Application authorization remains a second boundary.
+  Explicit demo mode replaces that gateway with application-managed fixed-account
+  login; `/login` and `/api/health` alone are public. See the demo section below.
 - The app's **system-assigned** identity receives only these two assignments,
   at the **AI account resource scope**, not the resource group/subscription:
   Content Understanding Reader (`379c52cb-64de-498c-8b5b-c6170d6c49d4`) and
@@ -77,7 +79,8 @@ Run from the repository root. Required parameters:
 | `DeploymentId` | Operator-generated GUID used as the persistent ownership marker |
 
 Optional parameters: `ConfigFile` (default `local\config.json`, relative to repository
-root), `Python` (default `python`), `Execute`, and `ApprovePaidResources`.
+root), `Python` (default `python`), `AuthMode` (`entra` by default), `DemoCredentialFile`
+(hash-only JSON, required for `demo`), `Execute`, and `ApprovePaidResources`.
 Keep `DeploymentId` and all resource names for later reruns. Losing them is not a
 reason to adopt or delete a resource automatically.
 
@@ -126,6 +129,67 @@ $deployment = @{
 rerun, so a missing resource cannot silently create a new billable replacement.
 No Azure execution is part of local unit testing.
 
+## Fixed-account demo login
+
+This is an explicit, lower-accountability demo option, not production identity.
+It retains HTTPS, managed identity and the existing AI roles. No additional hosting
+capacity is needed. The existing Entra app/identity are preserved for reversion.
+
+```powershell
+# Generate once into a NEW ignored local directory; never print or commit contents.
+python .\deploy\create_demo_login.py --directory .\local\demo-login --username demo
+
+# Same previously approved deployment parameters and ownership ID.
+.\deploy\Deploy-AppService.ps1 @deployment -AuthMode demo `
+  -DemoCredentialFile local\demo-login\settings.json -Execute -ApprovePaidResources
+```
+
+`credentials.json` is the operator's **plaintext private handoff** file. Read it
+locally and share only with intended demo participants through a trusted channel.
+`settings.json` contains only username and a salted Werkzeug scrypt password hash;
+only these values are sent as `CU_DEMO_USERNAME` and `CU_DEMO_PASSWORD_HASH` App
+Settings. The plaintext password never goes into Azure configuration, source,
+the deployment ZIP, or tool output. Restrict the generated directory to the current
+operator (owner-only Windows ACL, or mode 0700 on Unix); the generator creates
+files with mode 0600 where supported. Never use a public output directory.
+
+The deployment keeps Entra enforced during package build. Only after live health
+reports the new `auth_mode=demo` process does it disable platform EasyAuth and
+verify the application's login form and anonymous API denial. The application
+refuses startup if credentials are missing/malformed. Unknown auth modes fail
+closed. Do not manually disable the gateway before the new application is ready.
+
+The login cookie is opaque, Secure, HttpOnly, SameSite Strict and host-only.
+Server-side sessions expire after **8 hours** (absolute), with a **10-minute**
+pre-login CSRF challenge. Successful login rotates its identifier; logout revokes
+it and removes the review cookie. Each login has a distinct review principal even
+though the account is shared. The login and protected API both enforce CSRF.
+Retired/expired logins release idle review slots; running uploads/jobs keep their
+slot until finished, so repeated sign-in/out does not exhaust the 16-review limit.
+All login attempts share a **10/minute** single-process rate limit, independent
+of proxy-supplied IP addresses; it also counts successful attempts. Login records
+are bounded at 128 and expire rather than growing indefinitely. This is modest
+brute-force protection, not a distributed denial-of-service defense.
+
+Keep one process/instance. Restart/redeploy clears login sessions. Logging out
+does not cancel already submitted AI requests, erase persisted files, or purge
+CU/model caches. Everyone given the shared password can incur AI costs; there
+is no MFA, per-person attribution, or individual revocation.
+
+To rotate, generate into a **different ignored directory** and redeploy with that
+new `settings.json`; existing sessions end on restart. To return to Entra, rerun
+with `-AuthMode entra` and omit `DemoCredentialFile`. Demo settings are removed
+from the owned app configuration. Keep the original tenant/operator parameters.
+
+Non-billed public verification:
+
+```powershell
+python .\deploy\verify_http.py --origin https://<hostname> --tenant <tenant-guid> --auth-mode demo
+```
+
+Additionally verify correct/wrong password, a fresh browser, authenticated upload/
+preview with synthetic files, logout and denial after logout before sharing.
+
 ## Execution, isolation, and recovery
 
 Before writing to Azure, the script validates the package/config, verifies the
@@ -170,7 +234,7 @@ Runtime settings are `CU_CONFIG_JSON`, `CU_PUBLIC_ORIGIN`, `CU_TENANT_ID`,
 `CU_ALLOWED_PRINCIPALS` (a comma-separated OID list; this script supplies one),
 `CU_DATA_DIR`, and `CU_CACHE_DIR`. `WEBSITE_HOSTNAME` is provided by App Service
 and must match `CU_PUBLIC_ORIGIN` in the fail-closed entrypoint.
-The entrypoint also requires the platform-provided `WEBSITE_AUTH_ENABLED=true`;
+In default Entra mode the entrypoint also requires platform-provided `WEBSITE_AUTH_ENABLED=true`;
 the script enables EasyAuth itself rather than faking this marker in app settings.
 The script replaces the owned site's app settings with its managed settings.
 Do not use it to preserve unrelated custom settings.

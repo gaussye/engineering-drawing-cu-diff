@@ -534,6 +534,7 @@
     try {
       const data = await request("/api/bootstrap");
       state.csrf = data.csrf_token;
+      $("logout-button").hidden = data.auth_mode !== "demo";
       state.revision = data.revision;
       state.limits = data.limits;
       state.azure = Boolean(data.azure_enabled);
@@ -1687,6 +1688,14 @@
   $("export-button").addEventListener("click", exportPdf);
   $("dismiss-error").addEventListener("click", clearError);
   $("retry-bootstrap").addEventListener("click", bootstrap);
+  $("logout-button").addEventListener("click", async () => {
+    try {
+      await request("/api/logout", { method: "POST" });
+      window.location.assign("/login");
+    } catch (err) {
+      error(err.message);
+    }
+  });
   const splitter = $("review-splitter"), reviewArea = splitter.parentElement;
   let detailHeight = null, splitDrag = null;
   function splitLimits() {
