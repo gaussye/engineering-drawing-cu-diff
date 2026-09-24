@@ -12,6 +12,9 @@
   },
   "processing_location": "geography",
   "timeout_seconds": 1800,
+  "performance": {
+    "cu_workers": 2
+  },
   "pricing": {
     "currency": "USD",
     "region": null,

@@ -95,6 +95,21 @@
         row.append(el("span", "timing-stage-label", text(stage.label) || "未命名步骤"),
           el("span", "timing-stage-time", duration(stage.elapsed_seconds)),
           el("span", "timing-stage-state", ({ running: "进行中", completed: "已完成", failed: "失败，保留已耗时间" })[stage.status] || "状态未提供"));
+        if (Array.isArray(stage.steps)) {
+          const steps = el("ul", "timing-substeps");
+          for (const step of stage.steps) {
+            if (!step || typeof step !== "object") continue;
+            const child = el("li", "timing-substep");
+            child.dataset.stepId = typeof step.id === "string" ? step.id : "";
+            child.dataset.status = ["running", "completed", "failed"].includes(step.status) ? step.status : "unknown";
+            child.textContent = `${text(step.label) || "未命名步骤"} · ${duration(step.elapsed_seconds)} · ${({
+              running: "进行中", completed: "已完成", failed: "失败"
+            })[step.status] || "状态未提供"}`;
+            steps.append(child);
+          }
+          row.append(el("span", "timing-execution", stage.execution === "parallel"
+            ? "两侧并行 · 子耗时不相加" : "子步骤耗时已包含在本阶段"), steps);
+        }
         list.append(row);
       }
       content.append(list, el("p", "timing-meta",

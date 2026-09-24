@@ -21,7 +21,7 @@ from cu_diff.web import create_app
 
 BASE = "http://127.0.0.1:8765"
 SYNTHETIC_STAGES = [
-    "analyzer_preparation", "cu_full_old", "cu_full_new", "model_coarse",
+    "analyzer_preparation", "cu_full_pair", "model_coarse",
     "cu_crop_old", "cu_crop_new", "semantic_text_pairing",
     "local_table_comparison", "local_graphics_comparison", "result_preparation",
 ]
@@ -190,6 +190,47 @@ class OptionTests(WorkspaceTest):
 
 
 class TimingTests(unittest.TestCase):
+    def test_parallel_children_overlap_without_inflating_top_level_wall_clock(self):
+        now = [0.]
+        timing = JobTiming(lambda: now[0])
+        timing.start()
+        timing.stage("cu_full_pair", execution="parallel")
+        timing.step("cu_full_old", "running")
+        timing.step("cu_full_new", "running")
+        now[0] = 3.
+        timing.step("cu_full_new", "completed")
+        now[0] = 5.
+        live = timing.snapshot()["stages"][0]
+        self.assertEqual([s["elapsed_seconds"] for s in live["steps"]], [5., 3.])
+        self.assertEqual([s["status"] for s in live["steps"]], ["running", "completed"])
+        timing.step("cu_full_old", "completed")
+        timing.stage("model_coarse")
+        now[0] = 7.
+        timing.finish()
+        snapshot = timing.snapshot()
+        self.assertEqual(snapshot["total_seconds"], 7.)
+        self.assertEqual(sum(s["elapsed_seconds"] for s in snapshot["stages"]), 7.)
+        self.assertEqual(snapshot["stages"][0]["elapsed_seconds"], 5.)
+        self.assertEqual(snapshot["stages"][0]["execution"], "parallel")
+
+    def test_failed_parallel_stage_preserves_finished_sibling_duration(self):
+        now = [0.]
+        timing = JobTiming(lambda: now[0])
+        timing.start()
+        timing.stage("cu_crop_pair", execution="parallel")
+        timing.step("cu_crop_old", "running")
+        timing.step("cu_crop_new", "running")
+        now[0] = 2.
+        timing.step("cu_crop_old", "failed")
+        now[0] = 4.
+        timing.step("cu_crop_new", "completed")
+        timing.finish(failed=True)
+        stage = timing.snapshot()["stages"][0]
+        self.assertEqual(stage["status"], "failed")
+        self.assertEqual([s["status"] for s in stage["steps"]], ["failed", "completed"])
+        self.assertEqual([s["elapsed_seconds"] for s in stage["steps"]], [2., 4.])
+        self.assertEqual(stage["elapsed_seconds"], 4.)
+
     def test_repeated_substeps_are_unique_and_nonoverlapping(self):
         now = [0.]
         timing = JobTiming(lambda: now[0])
@@ -335,6 +376,52 @@ class JobOptionTests(WorkspaceTest):
         for instance in SyntheticClient.instances:
             self.assertEqual(instance.config["completion_model"], "gpt-5.4")
             self.assertNotIn("gpt-6-luna", instance.config["deployment_versions"])
+
+    def test_full_cu_requests_overlap_and_keep_per_side_usage_and_child_timing(self):
+        rendezvous = threading.Barrier(2)
+        original = SyntheticClient.poll
+
+        def poll(client, *args, **kwargs):
+            if client.usage_context.get("stage", "").startswith("cu_full_"):
+                rendezvous.wait(timeout=5)
+            return original(client, *args, **kwargs)
+
+        with patch.object(SyntheticClient, "poll", poll):
+            job = self.run_job()
+        group = next(s for s in job["timing"]["stages"] if s["id"] == "cu_full_pair")
+        self.assertEqual(group["execution"], "parallel")
+        self.assertEqual([s["id"] for s in group["steps"]], ["cu_full_old", "cu_full_new"])
+        self.assertTrue(all(s["status"] == "completed" for s in group["steps"]))
+        audit = json.loads(next((self.root / "data").glob("web-session-*/*.json")).read_text(encoding="utf-8"))
+        full = [r for r in audit["usage_records"] if r["stage"].startswith("cu_full_")]
+        self.assertEqual({r["stage"] for r in full}, {"cu_full_old", "cu_full_new"})
+        self.assertEqual(len({r["id"] for r in full}), 2)
+
+    def test_parallel_full_failure_drains_other_side_without_partial_result(self):
+        rendezvous = threading.Barrier(2)
+        original = SyntheticClient.poll
+        completed = threading.Event()
+
+        def poll(client, *args, **kwargs):
+            rendezvous.wait(timeout=5)
+            if client.usage_context["stage"] == "cu_full_old":
+                raise CUError("Synthetic old extraction failed")
+            time.sleep(.02)
+            result = original(client, *args, **kwargs)
+            completed.set()
+            return result
+
+        with patch.object(SyntheticClient, "poll", poll):
+            started = self.submit()
+            job = self.wait(started.get_json()["job_id"])
+        self.assertEqual(job["status"], "failed")
+        self.assertNotIn("result", job)
+        self.assertTrue(completed.is_set())
+        group = job["timing"]["stages"][-1]
+        self.assertEqual(group["id"], "cu_full_pair")
+        self.assertEqual(group["status"], "failed")
+        self.assertEqual([s["status"] for s in group["steps"]], ["failed", "completed"])
+        self.assertEqual(len(SyntheticClient.calls), 2)
 
     def test_cache_off_isolated_durable_namespace_preserves_shared_cache_and_guards(self):
         self.run_job()

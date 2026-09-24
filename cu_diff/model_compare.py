@@ -406,7 +406,7 @@ def _visual_placeholder(pair, selected, reason, *, route, status, change):
 
 def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, cache,
                        analyzer_id, analyzer, allow_submit=False, pdf_lock=None, progress=None,
-                       stage_progress=None):
+                       stage_progress=None, step_progress=None):
     """Add model hypotheses without suppressing existing full-document comparison channels."""
     opts = options(client.config)
     if not opts["enabled"]:
@@ -416,6 +416,9 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
     cache = Path(cache)
     progress = progress or (lambda message: None)
     stage_progress = stage_progress or (lambda identifier: None)
+    step_progress = step_progress or (lambda identifier, status: None)
+    from .parallel import cu_workers, run_cu_pair
+    cu_workers(client.config)
     catalogs, coverage, images, full_words, mask_coverage = {}, {}, [], {}, {}
     stage_progress("model_coarse")
     progress("模型语义配对：准备全页图像与CU来源目录")
@@ -491,13 +494,22 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
             continue
         used += 1
         progress(f"模型候选局部复读 {used}/{opts['max_regions']}：CU高清提取与来源核验")
+        stage_progress("cu_crop_pair")
+
+        def crop_progress(side, status):
+            if status == "running":
+                progress(f"局部复读 {used}/{opts['max_regions']}：{side} CU来源提取")
+            step_progress(f"cu_crop_{side}", status)
+
+        extracted = run_cu_pair(
+            client, {side: lambda side=side: client.analyze(
+                crops[side][0], cache, analyzer_id, analyzer, allow_submit=allow_submit)
+                for side in SIDES},
+            contexts={side: {"stage": f"cu_crop_{side}", "region_index": used} for side in SIDES},
+            progress=crop_progress)
         for side in SIDES:
-            stage_progress(f"cu_crop_{side}")
-            progress(f"局部复读 {used}/{opts['max_regions']}：{side} CU来源提取")
-            client.usage_context = {"stage": f"cu_crop_{side}", "region_index": used}
             path, image, mapping = crops[side]
-            response, crop_meta[side] = client.analyze(
-                path, cache, analyzer_id, analyzer, allow_submit=allow_submit)
+            response, crop_meta[side] = extracted[side]
             with pdf_lock or nullcontext():
                 crop_pages = _pages(path)
             word_catalogs[side], word_coverage[side] = _catalog(

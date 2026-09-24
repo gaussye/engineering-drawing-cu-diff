@@ -94,8 +94,8 @@ class ModelComparisonTests(unittest.TestCase):
         before = [digest(path.read_bytes()) for path in self.paths]
         stages = []
         result = self.run_comparison(stage_progress=stages.append)
-        self.assertEqual(stages, ["model_coarse", "cu_crop_preparation", "cu_crop_old",
-                                  "cu_crop_new", "model_fine"])
+        self.assertEqual(stages, ["model_coarse", "cu_crop_preparation", "cu_crop_pair",
+                                  "model_fine"])
         self.assertEqual(len(self.client.calls), 2)
         self.assertTrue(all(not submit for _, submit in self.client.calls))
         self.assertEqual(self.chat.call_count, 2)
@@ -113,6 +113,13 @@ class ModelComparisonTests(unittest.TestCase):
             self.assertEqual(box["page"], 1)
         self.assertEqual(result["coverage"]["catalog"]["unreferenced_ids"]["old"], ["old:e2"])
         self.assertEqual(before, [digest(path.read_bytes()) for path in self.paths])
+
+    def test_invalid_concurrency_rejected_before_any_model_or_cu_request(self):
+        self.client.config["performance"] = {"cu_workers": 3}
+        with self.assertRaises(ValueError):
+            self.run_comparison()
+        self.chat.assert_not_called()
+        self.assertEqual(self.client.calls, [])
 
     def test_insertion_does_not_color_unchanged_anchor_as_difference(self):
         self.client.old_words, self.client.new_words = ["SYN", "END"], ["SYN", "NEW", "END"]
@@ -327,8 +334,8 @@ class ModelComparisonTests(unittest.TestCase):
         }]
         stages = []
         result = self.run_comparison(stage_progress=stages.append)
-        self.assertEqual(stages, ["model_coarse", "cu_crop_preparation", "cu_crop_old",
-                                  "cu_crop_new", "model_fine", "model_visual"])
+        self.assertEqual(stages, ["model_coarse", "cu_crop_preparation", "cu_crop_pair",
+                                  "model_fine", "model_visual"])
         self.assertEqual(len(self.client.calls), 2)
         self.assertEqual(self.chat.call_count, 3)
         self.assertEqual(self.chat.call_args_list[-1].args[2]["model"], "synthetic-next")

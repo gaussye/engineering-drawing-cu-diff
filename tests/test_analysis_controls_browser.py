@@ -148,6 +148,26 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
         expect(self.page.locator("#analysis-model")).to_be_enabled()
         self.assertGreaterEqual(self.polls, 2)
 
+    def test_parallel_timing_shows_wall_clock_and_safe_per_side_status(self):
+        self.job_timing = {"total_seconds": 5, "queue_seconds": 0, "stages": [
+            {"id": "cu_full_pair", "label": "双图CU全页提取", "status": "failed",
+             "elapsed_seconds": 5, "execution": "parallel", "steps": [
+                 {"id": "cu_full_old", "label": "原图", "status": "failed", "elapsed_seconds": 3},
+                 {"id": "cu_full_new", "label": '<img src=x onerror="alert(1)">',
+                  "status": "completed", "elapsed_seconds": 5},
+             ]},
+        ]}
+        self.job_status = "failed"
+        self.page.locator("#compare-button").click()
+        expect(self.page.locator("#error-message")).to_have_text("Synthetic analysis failure")
+        self.page.get_by_role("tab", name="用量与费用").click()
+        expect(self.page.locator("#timing-total")).to_have_text("5.00 秒")
+        expect(self.page.locator(".timing-stage-time")).to_have_text("5.00 秒")
+        expect(self.page.locator(".timing-execution")).to_have_text("两侧并行 · 子耗时不相加")
+        expect(self.page.locator('[data-step-id="cu_full_old"]')).to_contain_text("3.00 秒 · 失败")
+        expect(self.page.locator('[data-step-id="cu_full_new"]')).to_contain_text("5.00 秒 · 已完成")
+        expect(self.page.locator("#timing-content img")).to_have_count(0)
+
     def test_result_only_timing_unknown_values_and_untrusted_labels(self):
         self.result_only_timing = True
         self.job_timing = {"total_seconds": -3, "queue_seconds": None, "stages": [

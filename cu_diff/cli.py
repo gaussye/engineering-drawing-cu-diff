@@ -28,10 +28,12 @@ def inspect_pdf(path: Path) -> dict:
 
 
 def extract(args: argparse.Namespace) -> None:
+    from .parallel import cu_workers, run_cu_pair
     from .usage import usage_report, validate_pricing
     if not args.allow_azure_upload:
         raise ValueError("Upload requires --allow-azure-upload after resource/data-boundary approval")
     config = read_json(args.config)
+    cu_workers(config)
     pricing = validate_pricing(config.get("pricing"))
     client = Client(config)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -39,11 +41,15 @@ def extract(args: argparse.Namespace) -> None:
         analyzer_id, analyzer = client.ensure_analyzer()
         save_json(args.output / "analyzer.json", analyzer)
         for role in ("old", "new"):
-            client.usage_context = {"stage": f"cu_full_{role}"}
             path = getattr(args, role)
             inspection = inspect_pdf(path)
             save_json(args.output / f"{role}.inspection.json", inspection)
-            response, metadata = client.analyze(path, args.output / "cache", analyzer_id, analyzer)
+        extracted = run_cu_pair(
+            client, {role: lambda role=role: client.analyze(
+                getattr(args, role), args.output / "cache", analyzer_id, analyzer)
+                for role in ("old", "new")},
+            contexts={role: {"stage": f"cu_full_{role}"} for role in ("old", "new")})
+        for role, (response, metadata) in extracted.items():
             save_json(args.output / f"{role}.response.json", response)
             save_json(args.output / f"{role}.metadata.json", metadata)
             print(f"{role}: Succeeded; cache_hit={metadata['cache_hit']}", flush=True)

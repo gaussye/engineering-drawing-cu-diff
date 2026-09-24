@@ -1,10 +1,13 @@
 """GA REST client; Entra via Azure CLI, no shared default mutations."""
 
 import base64
+from contextlib import contextmanager
+from copy import deepcopy
 import hashlib
 import json
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -47,6 +50,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Client:
+    supports_parallel_cu = True
+
     def __init__(self, config: dict):
         self.config = config
         self.endpoint = config["endpoint"].rstrip("/")
@@ -64,12 +69,22 @@ class Client:
             raise ValueError("Record actual deployment model versions/SKUs for cache provenance")
         self.events: list[dict] = []
         self.usage_records: list[dict] = []
+        self._usage_local = threading.local()
         self.usage_context: dict = {}
         self.usage_observer = None
+        self._usage_lock = threading.RLock()
+        self._auth_lock = threading.RLock()
+        self._cu_locks_lock = threading.RLock()
+        self._cu_locks = {}
+        self._cu_unknown = set()
         self._token = ""
         self._token_at = 0.0
 
     def _authenticate(self) -> str:
+        with self._auth_lock:
+            return self._authenticate_locked()
+
+    def _authenticate_locked(self) -> str:
         if time.monotonic() - self._token_at > 2400 or not self._token:
             az = shutil.which("az")
             if not az:
@@ -84,6 +99,23 @@ class Client:
             self._token = proc.stdout.strip()
             self._token_at = time.monotonic()
         return self._token
+
+    @property
+    def usage_context(self):
+        return getattr(self._usage_local, "context", {})
+
+    @usage_context.setter
+    def usage_context(self, context):
+        self._usage_local.context = deepcopy(context)
+
+    @contextmanager
+    def usage_scope(self, context):
+        previous = self.usage_context
+        self.usage_context = context
+        try:
+            yield
+        finally:
+            self.usage_context = previous
 
     def url(self, path: str) -> str:
         return f"{self.endpoint}/contentunderstanding/{path}?api-version={self.api_version}"
@@ -177,8 +209,6 @@ class Client:
 
     def analyze(self, path: Path, cache: Path, analyzer_id: str,
                 analyzer: dict, *, allow_submit: bool = True) -> tuple[dict, dict]:
-        from .usage import begin_usage, finish_usage
-
         binary = path.read_bytes()
         deployments = dict(self.config["model_deployments"])
         deployments["prebuilt-analyzer-completion"] = deployments[self.config["completion_model"]]
@@ -192,6 +222,17 @@ class Client:
             "processing_location": self.config["processing_location"],
         }
         key = digest(canonical(provenance))
+        identity = (cache.resolve(), key)
+        with self._cu_locks_lock:
+            lock = self._cu_locks.setdefault(identity, threading.RLock())
+        with lock:
+            return self._analyze_cached(
+                binary, cache, analyzer_id, deployments, provenance, key, allow_submit)
+
+    def _analyze_cached(self, binary, cache, analyzer_id, deployments, provenance, key,
+                        allow_submit):
+        from .usage import begin_usage, finish_usage
+
         raw_path = cache / f"{key}.response.json"
         meta_path = cache / f"{key}.metadata.json"
         pending_path = cache / f"{key}.operation.json"
@@ -217,6 +258,11 @@ class Client:
                     "No matching CU cache. This local server is cache-only; restart with "
                     "--allow-azure-upload only after approving the configured Azure processing boundary."
                 )
+            identity = (cache.resolve(), key)
+            with self._cu_locks_lock:
+                if identity in self._cu_unknown:
+                    raise CUError("CU submission outcome unknown in this client; "
+                                  "inspect the earlier operation before resubmitting")
             started_at = datetime.now(timezone.utc).isoformat()
             body = {
                 "inputs": [{"data": base64.b64encode(binary).decode("ascii"),
@@ -227,6 +273,8 @@ class Client:
             url += "&processingLocation=" + urllib.parse.quote(self.config["processing_location"])
             usage_entry = begin_usage(self, "cu", key, "new", usage_metadata)
             received = False
+            with self._cu_locks_lock:
+                self._cu_unknown.add(identity)
             try:
                 _, headers = self.request("POST", url, body)
                 received = True
@@ -237,6 +285,8 @@ class Client:
             if not location:
                 raise CUError("Accepted operation did not provide Operation-Location")
             save_json(pending_path, {"operation_location": location, "started_at": started_at})
+            with self._cu_locks_lock:
+                self._cu_unknown.discard(identity)
         completed = False
         try:
             raw = self.poll(location, usage_entry=usage_entry)

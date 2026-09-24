@@ -1,10 +1,13 @@
 """Per-run consumption journal and explicit, provenance-bearing retail estimates."""
 
 from copy import deepcopy
+from collections import deque
 from decimal import Decimal
 from importlib.resources import files
+from inspect import getattr_static
 import json
 import math
+import threading
 from urllib.parse import urlsplit
 
 
@@ -26,45 +29,96 @@ CU_METERS = {
     "contextualizationTokens": ("CU标准上下文处理", "tokens"),
     "advancedContextualizationTokens": ("CU高级上下文处理", "tokens"),
 }
+_JOURNAL_INIT_LOCK = threading.RLock()
+
+
+def _journal_lock(client):
+    # Duck-typed serial clients also use this journal; initialize their lock once.
+    with _JOURNAL_INIT_LOCK:
+        if getattr_static(client, "_usage_lock", None) is None:
+            client._usage_lock = threading.RLock()
+        if getattr_static(client, "_usage_notifications", None) is None:
+            client._usage_notifications = deque()
+            client._usage_notifying = False
+        return client._usage_lock
+
+
+def _queue_notification(client):
+    """Called under the journal lock; one caller drains detached snapshots."""
+    observer = (getattr(client, "usage_observer")
+                if getattr_static(client, "usage_observer", None) is not None else None)
+    if not callable(observer):
+        return False
+    client._usage_notifications.append((observer, deepcopy(client.usage_records)))
+    if client._usage_notifying:
+        return False
+    client._usage_notifying = True
+    return True
+
+
+def _drain_notifications(client, lock):
+    try:
+        while True:
+            with lock:
+                if not client._usage_notifications:
+                    client._usage_notifying = False
+                    return
+                observer, snapshot = client._usage_notifications.popleft()
+            # Never acquire the Store callback lock while holding a journal lock.
+            observer(snapshot)
+    except BaseException:
+        with lock:
+            client._usage_notifying = False
+        raise
 
 
 def _notify(client):
-    observer = getattr(client, "usage_observer", None)
-    if callable(observer):
-        observer(client.usage_records)
+    lock = _journal_lock(client)
+    with lock:
+        drain = _queue_notification(client)
+    if drain:
+        _drain_notifications(client, lock)
 
 
 def begin_usage(client, service, key, cache_state, metadata):
-    if not isinstance(getattr(client, "usage_records", None), list):
-        client.usage_records = []
-    context = getattr(client, "usage_context", {})
-    entry = {
-        "id": f"U{len(client.usage_records)+1:03d}", "service": service, "cache_key": key,
-        "cache_state": cache_state, "outcome": "pending", "usage": None,
-        "stage": context.get("stage", service), "region_index": context.get("region_index"),
-        "metadata": deepcopy(metadata),
-    }
-    client.usage_records.append(entry)
-    _notify(client)
+    lock = _journal_lock(client)
+    with lock:
+        if not isinstance(getattr(client, "usage_records", None), list):
+            client.usage_records = []
+        context = getattr(client, "usage_context", {})
+        entry = {
+            "id": f"U{len(client.usage_records)+1:03d}", "service": service, "cache_key": key,
+            "cache_state": cache_state, "outcome": "pending", "usage": None,
+            "stage": context.get("stage", service), "region_index": context.get("region_index"),
+            "metadata": deepcopy(metadata),
+        }
+        client.usage_records.append(entry)
+        drain = _queue_notification(client)
+    if drain:
+        _drain_notifications(client, lock)
     return entry
 
 
 def finish_usage(client, entry, raw=None, *, outcome="response_received", cache_state=None):
-    entry["outcome"] = outcome
-    if cache_state:
-        entry["cache_state"] = cache_state
-    if isinstance(raw, dict):
-        latest = raw.get("usage")
-        if isinstance(latest, dict) and latest:
-            entry["usage"] = deepcopy(latest)
-            entry["usage_incomplete"] = False
-        elif entry.get("usage") is not None:
-            entry["usage_incomplete"] = True
-        else:
-            entry["usage"] = deepcopy(latest)
-        if isinstance(raw.get("model"), str):
-            entry["metadata"]["response_model"] = raw["model"]
-    _notify(client)
+    lock = _journal_lock(client)
+    with lock:
+        entry["outcome"] = outcome
+        if cache_state:
+            entry["cache_state"] = cache_state
+        if isinstance(raw, dict):
+            latest = raw.get("usage")
+            if isinstance(latest, dict) and latest:
+                entry["usage"] = deepcopy(latest)
+                entry["usage_incomplete"] = False
+            elif entry.get("usage") is not None:
+                entry["usage_incomplete"] = True
+            else:
+                entry["usage"] = deepcopy(latest)
+            if isinstance(raw.get("model"), str):
+                entry["metadata"]["response_model"] = raw["model"]
+        drain = _queue_notification(client)
+    if drain:
+        _drain_notifications(client, lock)
 
 
 def _number(value):

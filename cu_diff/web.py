@@ -21,6 +21,7 @@ from werkzeug.exceptions import HTTPException
 from .analysis_options import AnalysisOptions
 from .client import CacheMiss, Client, CUError, digest, save_json
 from .compare import compare_responses
+from .parallel import cu_workers, parallel_cu_enabled, run_cu_pair
 from .timing import JobTiming, STAGES
 from .web_evidence import response_geometry_matches, web_result
 
@@ -76,6 +77,7 @@ class Store:
         default_config, _ = self.analysis_options.snapshot()
         self.model_options = options(default_config)
         self.pricing = validate_pricing(config.get("pricing"))
+        cu_workers(config)
         self.config, self.root, self.cache = config, root.resolve(), cache.resolve()
         self.allow_azure, self.client_factory = allow_azure, client_factory
         self.lock = threading.RLock()
@@ -302,13 +304,23 @@ class Store:
         def stage(identifier, message):
             with self.lock:
                 phase(message)
-                timing.stage(identifier)
+                execution = None
+                if identifier in ("cu_full_pair", "cu_crop_pair"):
+                    execution = "parallel" if parallel_cu_enabled(client) else "sequential"
+                timing.stage(identifier, execution=execution)
                 job["timing"] = timing.snapshot()
 
         def model_stage(identifier):
             with self.lock:
                 if identifier != "model_coarse" or timing.active_stage != identifier:
                     stage(identifier, STAGES[identifier])
+
+        def cu_step(identifier, status):
+            with self.lock:
+                if status == "running" and job["invalidated"]:
+                    raise WebError("文件已更换，此作业结果已失效。", 409)
+                timing.step(identifier, status)
+                job["timing"] = timing.snapshot()
 
         try:
             with self.lock:
@@ -319,17 +331,23 @@ class Store:
             usage_changed(getattr(client, "usage_records", None))
             # Web requests may use only an existing analyzer; never create one.
             analyzer_id, analyzer = client.ensure_analyzer(allow_create=False)
-            responses, metadata = {}, {}
-            for role, label in (("old", "原图"), ("new", "调整图")):
-                policy = "优先复用缓存" if use_cache else "不复用历史缓存"
-                stage(f"cu_full_{role}", f"正在提取{label}（{policy}，请勿关闭服务）")
-                client.usage_context = {"stage": f"cu_full_{role}"}
-                response, meta = self.analyze_document(
+            policy = "优先复用缓存" if use_cache else "不复用历史缓存"
+            stage("cu_full_pair", f"正在提取双图（{policy}，请勿关闭服务）")
+
+            def extract(role):
+                result = self.analyze_document(
                     client, documents[role], analyzer_id, analyzer, cache=cache,
                     use_cache=use_cache)
-                if response.get("status", "").lower() != "succeeded":
+                if result[0].get("status", "").lower() != "succeeded":
                     raise CUError("CU未成功，不能生成无差异结果。")
-                responses[role], metadata[role] = response, meta
+                return result
+
+            extracted = run_cu_pair(
+                client, {role: lambda role=role: extract(role) for role in ("old", "new")},
+                contexts={role: {"stage": f"cu_full_{role}"} for role in ("old", "new")},
+                progress=lambda role, status: cu_step(f"cu_full_{role}", status))
+            responses = {role: value[0] for role, value in extracted.items()}
+            metadata = {role: value[1] for role, value in extracted.items()}
             semantic = None
             if model_options["enabled"]:
                 from .model_compare import compare_with_model
@@ -338,7 +356,8 @@ class Store:
                     documents["old"].analysis_path, documents["new"].analysis_path,
                     responses["old"], responses["new"], client=client, cache=cache,
                     analyzer_id=analyzer_id, analyzer=analyzer, allow_submit=self.allow_azure,
-                    pdf_lock=PDF_LOCK, progress=phase, stage_progress=model_stage)
+                    pdf_lock=PDF_LOCK, progress=phase, stage_progress=model_stage,
+                    step_progress=cu_step)
             stage("semantic_text_pairing", "配对BOM、字段和OCR证据")
             text_pairing = model_options["enabled"] and model_options["text_pairing"]
             comparison = compare_responses(
