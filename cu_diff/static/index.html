@@ -117,7 +117,7 @@
     </aside>
     <section class="review-area" aria-label="图纸对照工作区">
       <div id="file-identity-status" class="file-identity-status" role="status">上传后显示文件 SHA256，核对是否为同一份文件。</div>
-      <div class="drawing-grid">
+      <div id="drawing-grid" class="drawing-grid">
         <section class="drawing-panel" aria-labelledby="old-heading">
           <header class="document-header"><span class="side-badge">A</span><div class="document-title"><h2 id="old-heading">旧版图纸 <span>OLD / 基准</span></h2><p id="old-filename">未上传文件</p><p id="old-identity"></p></div><button id="old-replace" class="quiet" disabled>替换</button><button id="old-remove" class="quiet" aria-label="移除旧版图纸" disabled>×</button></header>
           <div class="page-toolbar"><label for="old-page">页码</label><select id="old-page" disabled><option>— / —</option></select><div class="toolbar-spacer"></div><label for="old-zoom">缩放</label><select id="old-zoom" disabled><option value="fit">适宽</option><option value="50">50%</option><option value="75">75%</option><option value="100">100%</option><option value="125">125%</option><option value="150">150%</option><option value="200">200%</option></select><button id="old-fit" disabled>适合宽度</button></div>
@@ -139,17 +139,28 @@
           <input id="new-upload" class="file-input" type="file" accept=".pdf,application/pdf" aria-label="上传新版 PDF" disabled>
         </section>
       </div>
-      <section class="detail-panel" aria-label="证据与用量">
+      <div id="review-splitter" class="review-splitter" role="separator" tabindex="0"
+           aria-orientation="horizontal" aria-controls="drawing-grid detail-panel"
+           aria-label="调整图纸与详情面板高度" aria-describedby="splitter-help"
+           aria-valuemin="120" aria-valuemax="120" aria-valuenow="120"
+           title="按住拖动调整上下高度；双击恢复默认">
+        <span class="splitter-grip" aria-hidden="true"></span>
+        <span id="splitter-help" class="visually-hidden">上下拖动调整面板；方向键微调，Home 最小化详情高度，End 最大化详情高度，双击恢复默认，Escape 取消拖动。</span>
+      </div>
+      <section id="detail-panel" class="detail-panel" aria-label="证据、耗时与用量">
         <header>
           <div class="detail-tabs" role="tablist" aria-label="复核详情">
             <button id="evidence-tab" role="tab" aria-selected="true" aria-controls="evidence-panel" tabindex="0"><span id="detail-heading">证据详情</span></button>
+            <button id="timing-tab" role="tab" aria-selected="false" aria-controls="timing-panel" tabindex="-1">分析耗时</button>
             <button id="usage-tab" role="tab" aria-selected="false" aria-controls="usage-panel" tabindex="-1">用量与费用</button>
           </div>
           <span id="detail-meta">选择索引或证据框，联动定位两侧证据</span>
         </header>
         <div id="evidence-panel" role="tabpanel" aria-labelledby="evidence-tab" tabindex="0"><div id="detail-content" class="detail-content"><p class="detail-placeholder">保留原文 · 核对外观 · 不推测缺失证据</p></div></div>
-        <div id="usage-panel" role="tabpanel" aria-labelledby="usage-tab" tabindex="0" hidden>
+        <div id="timing-panel" role="tabpanel" aria-labelledby="timing-tab" tabindex="0" hidden>
           <section id="timing-content" class="timing-content" aria-label="本轮分析耗时"><p class="timing-empty">暂无耗时数据。开始对比后显示本轮实际耗时，不使用缓存中的历史耗时。</p></section>
+        </div>
+        <div id="usage-panel" role="tabpanel" aria-labelledby="usage-tab" tabindex="0" hidden>
           <div id="usage-content" class="usage-content"><p class="usage-empty">暂无用量数据。开始对比后显示本轮记录；旧结果未提供用量时，不推算为零。</p></div>
         </div>
       </section>

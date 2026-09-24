@@ -93,7 +93,14 @@ input[type="checkbox"] { accent-color: var(--cp-evidence); width: 15px; height: 
 summary { cursor: pointer; }
 #coverage-content { padding-top: 10px; color: var(--cp-chrome-muted); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .storage-notice { border-top: 1px solid var(--cp-chrome-border); padding: 12px 20px; color: var(--cp-chrome-muted); font-size: 10px; overflow-wrap: anywhere; }
-.review-area { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.review-area { --review-detail-default: 206px; display: flex; flex-direction: column; min-width: 0; min-height: 400px; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.review-splitter { flex: 0 0 10px; display: flex; justify-content: center; align-items: center; position: relative; cursor: row-resize; touch-action: none; user-select: none; background: var(--cp-bg-elevated); border-block: 1px solid var(--cp-border); }
+.splitter-grip { width: 40px; height: 3px; border-radius: 2px; background: var(--cp-border-strong); pointer-events: none; }
+.review-splitter:hover, .review-splitter:focus-visible, .resizing-review .review-splitter { background: var(--cp-accent-soft); }
+.review-splitter:focus-visible { outline-offset: -2px; z-index: 1; }
+.review-splitter:hover .splitter-grip, .review-splitter:focus-visible .splitter-grip, .resizing-review .splitter-grip { background: var(--cp-accent); }
+body.resizing-review, .resizing-review * { cursor: row-resize !important; user-select: none !important; }
 .file-identity-status { padding: 7px 16px; font-size: 11px; color: var(--cp-text-muted); background: var(--cp-bg-elevated); border-bottom: 1px solid var(--cp-border); }
 .file-identity-status.identical { color: var(--cp-danger); }
 .drawing-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); flex: 1; min-height: 220px; gap: 1px; background: var(--cp-paper-border); }
@@ -133,15 +140,15 @@ summary { cursor: pointer; }
 .upload-limit { font-size: 10px; }
 .evidence-note { min-height: 32px; padding: 7px 16px; font-size: 11px; color: var(--cp-paper-muted); background: var(--cp-paper); border-top: 1px solid var(--cp-paper-border); overflow-wrap: anywhere; }
 .file-input { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; clip-path: inset(50%); }
-.detail-panel { flex: 0 0 206px; min-height: 0; display: flex; flex-direction: column; border-top: 1px solid var(--cp-border); background: var(--cp-bg-elevated); }
+.detail-panel { flex: 0 0 var(--review-detail-height, var(--review-detail-default)); min-height: 0; display: flex; flex-direction: column; background: var(--cp-bg-elevated); }
 .detail-panel > header { display: flex; align-items: center; gap: 20px; padding: 10px 20px; border-bottom: 1px solid var(--cp-border); }
 .detail-panel h2 { font-size: 13px; font-weight: 600; white-space: nowrap; }
 .detail-tabs { display: flex; gap: 6px; flex-shrink: 0; }
 .detail-tabs button { border-color: transparent; background: transparent; border-radius: 6px; font-weight: 600; white-space: nowrap; }
 .detail-tabs button[aria-selected="true"] { border-color: var(--cp-border); background: var(--cp-surface); box-shadow: inset 0 -2px var(--cp-accent); }
 #evidence-panel { display: flex; flex: 1; min-height: 0; }
-#usage-panel { flex: 1; min-height: 0; overflow: auto; }
-.timing-content { margin: 12px 20px 0; padding-bottom: 10px; border-bottom: 1px solid var(--cp-border); font-size: 11px; }
+#usage-panel, #timing-panel { flex: 1; min-height: 0; overflow: auto; }
+.timing-content { margin: 12px 20px 0; padding-bottom: 18px; font-size: 11px; }
 .timing-empty { color: var(--cp-text-muted); }
 .timing-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 18px; }
 .timing-heading h3 { font-size: 12px; }
@@ -275,9 +282,8 @@ summary { cursor: pointer; }
   .list-empty { padding: 12px; }
   .list-empty > span, .list-empty p { display: none; }
   .coverage-panel, .storage-notice { padding: 8px 16px; }
-  .drawing-grid { grid-template-columns: 1fr; }
-  .drawing-panel { height: 560px; }
-  .detail-panel { flex-basis: 250px; }
+  .review-area { --review-detail-default: 250px; flex: none; height: max(1400px, 160dvh); min-height: 0; }
+  .drawing-grid { grid-template-columns: 1fr; grid-template-rows: repeat(2, minmax(0, 1fr)); min-height: 520px; }
   .detail-panel > header { align-items: flex-start; gap: 12px; }
 }
 @media (prefers-reduced-motion: reduce) { button { transition: none; } }

@@ -68,7 +68,7 @@ Copy-Item config.example.json local\config.json # 填写真实配置
 
 旧工程字段模式每次请求显式传 `modelDeployments`；轻量模式不配置completion模型，
 也不发送该覆盖参数，两者都不修改资源默认映射。响应中的真实 usage、
-延迟和 HTTP 状态本地保存；不凭 token 估算金额。CU 提取、contextualization 和
+延迟和 HTTP 状态本地保存；只按实际报告用量与有来源的单价估算费用。CU 提取、contextualization 和
 Foundry 模型分别计费，最终金额需以 Azure 账单为准。
 
 旧工程字段模式的CU在创建 analyzer 阶段会验证模型默认映射，早于请求级 override。
@@ -207,7 +207,7 @@ CLI支持以已有全页CU响应进行同样的模型流程，输入PDF必须已
 ```
 
 `model-comparison.json`/`.zh.md`保留分阶段证据与覆盖，`model-api-events.json`保留真实HTTP记录；
-usage来自实际模型/CU响应，不估算金额。缓存新增 `model-comparison\`（模型请求哈希、响应和元数据）
+usage来自实际模型/CU响应，配置单价时另行提供费用估算。缓存新增 `model-comparison\`（模型请求哈希、响应和元数据）
 及 `model-crops\`（局部PDF与原页坐标映射），均属于客户敏感数据，仅本地保存。
 模型缓存键包含请求、图像、schema、提示词、现有部署版本及endpoint；原PDF与裁剪映射也有哈希。
 模型失败、拒答、无效引用或截断不能变成“比较成功/无差异”。不自动重发可能已经计费的模型请求；
@@ -526,6 +526,11 @@ Hanwha 案例仅可借鉴“领域提取 + 证据关联 + 人工复核”理念�
 现有 CU/缓存/配对及本地图形流水线，展示排队、提取、配对、图形比较、成功或失败状态。
 Web依赖包含NumPy和OpenCV headless，建议使用独立 `.venv`，不要改动共享Python环境。
 
+**上下窗口大小：** 按住图纸与详情之间的横向调节条上下拖动，可调整图纸和下方面板的高度，
+适用于证据、耗时和费用三个标签页。上下两区保留可用的最小高度；窗口变小时自动限制范围，
+不改变证据坐标或触发分析。支持触控拖动，键盘上下方向键微调，Shift 加大步长，
+Home/End 调至详情最小/最大高度；Escape 取消本次拖动，双击调节条恢复默认高度。
+
 **右上角分析设置：**
 - **缓存默认开启**：优先复用本地CU与模型响应。关闭后，本轮不读取历史分析缓存，
   可能重新产生CU及模型费用；不会删除旧缓存或绕过未决请求的防重复计费保护。
@@ -540,7 +545,8 @@ Web依赖包含NumPy和OpenCV headless，建议使用独立 `.venv`，不要改�
 `{id, label, deployment, deployment_version}`，用 `model_comparison.default_model` 指定默认ID。
 部署版本必须填写已核实的 `模型名:版本:SKU`；浏览器只提交允许的ID，不能指定任意部署或版本。
 旧配置未提供列表时保留原部署行为。新增可选部署不会改变CU缓存身份，Astra原有响应缓存仍可复用。
-GPT-6 Luna 未匹配到经核实的单价时保留真实Token并显示费用未知，不套用GPT-5.6 Luna或Astra价格。
+GPT-6 Luna 可使用明确标记来源的用户配置单价；示例已提供下述用户报价。
+未配置适用价格时保留真实Token并显示费用未知，不套用GPT-5.6 Luna或Astra价格。
 
 关闭缓存的任务将新响应、裁剪及防重复提交标记写入独立的
 `cache\uncached-jobs\<job_id>`，只在本轮内复用完全相同的请求。
@@ -774,8 +780,8 @@ CLI 默认不输出可选变换条目；追加 `--include-translation`、`--incl
 
 ### 每轮用量与费用
 
-图片下方的“证据详情 / 用量与费用”标签页按**当前作业**统计，不是订阅账单。
-同一标签页顶部显示**本轮分析耗时**：总耗时、其中的排队时间，以及关键步骤的实际执行时间、
+图片下方分为“证据详情 / 分析耗时 / 用量与费用”三个独立标签页，可用左右方向键切换。
+“分析耗时”显示**本轮分析耗时**：总耗时、其中的排队时间，以及关键步骤的实际执行时间、
 进行中/完成/失败状态。使用服务端单调时钟，运行中随任务查询刷新；失败也保留已经耗费的时间。
 步骤包括分析器准备、两侧全页CU、全页模型配对、高清裁剪、两侧局部CU、细粒度文字核对、
 图形模型复核、文本语义配对、本地表格/图形对比和结果整理。重复步骤分段记录，不与父阶段重复累计。
@@ -785,6 +791,7 @@ CLI 默认不输出可选变换条目；追加 `--include-translation`、`--incl
 没有计时字段的旧结果显示无数据或“未提供”，不猜测为零；更换文件或开始下一轮会清空上一轮统计。
 全页CU、局部CU、全页模型配对、词级核对、图形复核逐次列出，运行中更新；
 后续步骤失败也保留此前用量。更换文件会清空界面中的旧统计，本地作业审计仍保留记录。
+“用量与费用”仅显示当前作业的用量和金额估算，不再混入耗时内容，也不是订阅账单。
 
 费用分为CU文档提取、CU上下文处理、CU内部Foundry模型token、直接模型调用四部分。
 本次新增与本地缓存中的历史参考用量分开；同一缓存引用不重复计入历史合计。
@@ -816,13 +823,29 @@ CU的`input`是否包含`cached-input`也尚未核实：保留原始计数，显
 只有取得适用依据后才设置`cu_input_includes_cached`为`true`或`false`；
 没有依据时保留`null`。区间不是账单保证或完整费用上限，缺少适用单价时仍为未知。
 
-`rates` 可提供其他已核实价格，每项需要 `key`、`price`、`unit_quantity`、`unit`、
-`currency`、HTTPS `source` 和 `as_of`，可限定 `region`、`sku`、`model_version`、
+`rates` 可提供其他参考价格，每项需要 `key`、`price`、`unit_quantity`、`unit`、
+`currency`、`source` 和 `as_of`。默认参考价格的 `source` 必须为HTTPS来源；
+显式指定 `source_kind: "user_provided"` 时可使用非空文字描述，页面注明“用户提供”，
+不把它标成经核实的Azure公开零售价。可限定 `region`、`sku`、`model_version`、
 `min_input_tokens`、`max_input_tokens`。计量键示例：`cu.documentPagesStandard`、
 `cu.contextualizationTokens`、`model.gpt-5.4.input`、`model.gpt-5.4.cached_input`、
 `model.gpt-5.4.output`。单位为`pages`或`tokens`，金额=`数量×单价÷unit_quantity`；
 相同适用条件的自定义条目覆盖快照对应项。缺失/冲突/无法判定的价格不伪装成零。
 税、汇率、协议折扣和其他资源费用不包含在估算中，实际金额以Azure账单为准。
+
+示例配置按2026-09-24用户提供的GPT-6 Luna报价设置以下USD单价，**每项单位均为100万token**：
+
+| 计量项 | 单价 |
+|---|---:|
+| Input | $0.10 |
+| Cached Input | $0.01 |
+| Cache Write | $0.125 |
+| Output | $0.50 |
+
+这些条目仅适用于GPT-6 Luna，不改写Astra/GPT-5.4的公开价格快照。
+普通输入费用扣除已报告的缓存读取token；缓存写入单列计价。
+若缓存写入与输入的重叠口径未能确认，仍保留用量/总额待核状态，不能重复相加或编造完整金额。
+修改价格后生成的报告使用新配置；已保存报告仍保留原价格依据，不改写历史审计。
 
 Web作业审计保存`usage_records`和`usage_cost`，终态结果也带`usage_cost`。
 CLI `extract`输出本轮`usage-cost.json`，`model-compare`输出`model-usage-cost.json`；

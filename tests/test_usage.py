@@ -53,6 +53,195 @@ def record(service="model", state="new", key="synthetic", **changes):
                  "usage": usage, "outcome": "response_received"}, **changes)
 
 
+def luna_prices():
+    example = Path(__file__).resolve().parents[1] / "config.example.json"
+    return json.loads(example.read_text(encoding="utf-8"))["pricing"]
+
+
+def luna_record(**changes):
+    entry = record(**changes)
+    entry["metadata"].update(model="gpt-6-luna", deployment="synthetic-luna",
+                             deployment_version="gpt-6-luna:2026-09-22:GlobalStandard",
+                             response_model="gpt-6-luna-2026-09-22")
+    return entry
+
+
+def latency_checkpoint():
+    return {
+        "engine_tbt_ms": 5, "engine_ttft_ms": 397, "engine_ttlt_ms": 21156,
+        "pre_inference_ms": 726, "service_tbt_ms": 5, "service_ttft_ms": 1299,
+        "service_ttlt_ms": 21993, "user_visible_ttft_ms": 572,
+    }
+
+
+class UserProvidedPricingTests(unittest.TestCase):
+    def test_example_has_only_four_luna_prices_with_explicit_user_provenance(self):
+        pricing = validate_pricing(luna_prices())
+        self.assertEqual({r["key"]: r["price"] for r in pricing["rates"]}, {
+            "model.gpt-6-luna.input": .10, "model.gpt-6-luna.cached_input": .01,
+            "model.gpt-6-luna.cache_write": .125, "model.gpt-6-luna.output": .50,
+        })
+        for rate in pricing["rates"]:
+            self.assertEqual(rate["unit_quantity"], 1_000_000)
+            self.assertEqual(rate["unit"], "tokens")
+            self.assertEqual(rate["currency"], "USD")
+            self.assertEqual(rate["source_kind"], "user_provided")
+            self.assertIn("not verified Azure retail", rate["source"])
+
+    def test_million_token_prices_and_cached_split_preserve_raw_counts(self):
+        entry = luna_record(usage={
+            "prompt_tokens": 2_000_000, "completion_tokens": 1_000_000,
+            "total_tokens": 3_000_000,
+            "prompt_tokens_details": {"cached_tokens": 1_000_000},
+            "completion_tokens_details": {"reasoning_tokens": 500_000},
+        })
+        report = usage_report([entry], luna_prices())
+        current = report["summary"]["current"]
+        self.assertEqual(current["input_tokens"], 2_000_000)
+        self.assertEqual(current["model_tokens"], 3_000_000)
+        self.assertAlmostEqual(current["estimated_cost"], .61)
+        meters = {m["key"].rsplit(".", 1)[1]: m for m in report["entries"][0]["meters"]}
+        for kind, cost in (("input", .10), ("cached_input", .01), ("output", .50)):
+            self.assertEqual(meters[kind]["quantity"], 1_000_000)
+            self.assertAlmostEqual(meters[kind]["estimated_cost"], cost)
+            self.assertEqual(meters[kind]["rate"]["source_kind"], "user_provided")
+        self.assertEqual(report["entries"][0]["raw_usage"], entry["usage"])
+        self.assertEqual(report["price_sources"], [{
+            "source_kind": "user_provided", "as_of": "2026-09-24",
+            "source": "User-provided GPT-6 Luna rates; not verified Azure retail pricing",
+        }])
+
+    def test_small_usage_uses_per_million_not_per_thousand(self):
+        report = usage_report([luna_record()], luna_prices())
+        self.assertAlmostEqual(report["summary"]["current"]["estimated_cost"], .000191)
+
+    def test_valid_latency_diagnostics_preserve_exact_cost_and_raw_values(self):
+        entry = luna_record()
+        entry["usage"]["latency_checkpoint"] = latency_checkpoint()
+        original = copy.deepcopy(entry)
+        report = usage_report([entry], luna_prices())
+        current = report["summary"]["current"]
+        self.assertEqual(report["status"], "complete")
+        self.assertAlmostEqual(current["estimated_cost"], .000191)
+        self.assertAlmostEqual(report["entries"][0]["current_cost"], .000191)
+        self.assertEqual(current["model_tokens"], 1200)
+        self.assertEqual(current["unknown_usage_calls"], 0)
+        self.assertEqual(report["entries"][0]["raw_usage"], original["usage"])
+        self.assertEqual(len(report["entries"][0]["meters"]), 3)
+        self.assertEqual(entry, original)
+
+    def test_invalid_latency_schema_is_explicit_not_silently_discarded(self):
+        valid = latency_checkpoint()
+        invalid = [None, [], "timing", 10, {}, dict(valid, unknown_tokens=10),
+                   {key: value for key, value in valid.items() if key != "engine_tbt_ms"}]
+        invalid.extend(dict(valid, engine_tbt_ms=value)
+                       for value in (-1, True, "5", None, {}, float("nan"), float("inf"), 2**53))
+        for latency in invalid:
+            with self.subTest(latency=latency):
+                entry = luna_record()
+                entry["usage"]["latency_checkpoint"] = latency
+                report = usage_report([entry], luna_prices())
+                self.assertIsNone(report["summary"]["current"]["estimated_cost"])
+                self.assertIsNone(report["entries"][0]["current_cost"])
+                self.assertIn("latency_checkpoint", report["entries"][0]["raw_usage"])
+                meter = next(m for m in report["entries"][0]["meters"]
+                             if m["key"] == "model.unknown.latency_checkpoint")
+                self.assertEqual(meter["reason"], "missing_usage")
+                json.dumps(report, allow_nan=False)
+
+    def test_valid_latency_does_not_hide_unknown_or_invalid_token_meters(self):
+        for mutate in (
+            lambda usage: usage.update(unknown_tokens=10),
+            lambda usage: usage["prompt_tokens_details"].update(unknown_cache_tokens=10),
+            lambda usage: usage["prompt_tokens_details"].update(cached_tokens=-1),
+            lambda usage: usage.update(completion_tokens=None),
+        ):
+            entry = luna_record()
+            entry["usage"]["latency_checkpoint"] = latency_checkpoint()
+            mutate(entry["usage"])
+            report = usage_report([entry], luna_prices())
+            self.assertIsNone(report["summary"]["current"]["estimated_cost"])
+            self.assertEqual(report["entries"][0]["raw_usage"], entry["usage"])
+            self.assertFalse(any(m["key"] == "model.unknown.latency_checkpoint"
+                                 for m in report["entries"][0]["meters"]))
+
+    def test_cache_write_price_does_not_invent_prompt_overlap_semantics(self):
+        entry = luna_record(usage={
+            "prompt_tokens": 1_000_000, "completion_tokens": 0, "total_tokens": 1_000_000,
+            "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 1_000_000},
+        })
+        report = usage_report([entry], luna_prices())
+        current = report["summary"]["current"]
+        write = next(m for m in report["entries"][0]["meters"] if m["key"].endswith(".cache_write"))
+        self.assertEqual(current["cache_write_tokens"], 1_000_000)
+        self.assertEqual(current["model_tokens"], 1_000_000)
+        self.assertAlmostEqual(write["estimated_cost"], .125)
+        self.assertAlmostEqual(current["known_cost"], .125)
+        self.assertIsNone(current["estimated_cost"])
+        self.assertEqual(report["entries"][0]["raw_usage"], entry["usage"])
+
+    def test_response_cache_replay_is_free_with_historical_price_reference(self):
+        entries = [luna_record(state="cached"), luna_record(state="cached")]
+        report = usage_report(entries, luna_prices())
+        self.assertEqual(report["summary"]["current"]["estimated_cost"], 0)
+        self.assertAlmostEqual(report["summary"]["reused"]["estimated_cost"], .000191)
+        self.assertTrue(all(entry["current_cost"] == 0 for entry in report["entries"]))
+        self.assertFalse(report["entries"][1]["counted_in_summary"])
+
+    def test_missing_malformed_and_unknown_usage_are_not_zero(self):
+        for usage in (None, {}, {"prompt_tokens": 1000},
+                      {"prompt_tokens": 1000, "completion_tokens": 200, "new_meter": 10},
+                      {"prompt_tokens": 1000, "completion_tokens": 200, "prompt_tokens_details": []},
+                      {"prompt_tokens": 1000, "completion_tokens": 200,
+                       "prompt_tokens_details": {"unknown_cache_tokens": 10}}):
+            with self.subTest(usage=usage):
+                report = usage_report([luna_record(usage=usage)], luna_prices())
+                self.assertIsNone(report["summary"]["current"]["estimated_cost"])
+                self.assertEqual(report["entries"][0]["raw_usage"], usage)
+
+    def test_no_luna_price_leaks_to_other_models_or_mismatched_response(self):
+        for model in ("gpt-6-astra", "gpt-5.4", "unpriced-model"):
+            entry = record()
+            entry["metadata"].update(model=model, deployment_version=f"{model}:1:GlobalStandard")
+            with self.subTest(model=model):
+                self.assertIsNone(usage_report([entry], luna_prices())["summary"]["current"]["estimated_cost"])
+                mismatch = luna_record()
+                mismatch["metadata"]["response_model"] = model
+                report = usage_report([mismatch], luna_prices())
+                self.assertIsNone(report["summary"]["current"]["estimated_cost"])
+                self.assertTrue(all(m["rate"] is None for m in report["entries"][0]["meters"]))
+
+    def test_official_snapshot_rates_remain_unchanged_with_user_rates(self):
+        official = {"snapshot": "azure-retail-westus-2026-09-23", "region": "westus"}
+        combined = dict(official, rates=luna_prices()["rates"])
+        baseline = validate_pricing(official)["rates"]
+        self.assertEqual(validate_pricing(combined)["rates"][:len(baseline)], baseline)
+        self.assertEqual(len(validate_pricing(combined)["rates"]), len(baseline)+4)
+        for model, version in (("gpt-6-astra", "2026-09-03"), ("gpt-5.4", "2026-03-05")):
+            entry = record()
+            entry["metadata"].update(model=model, deployment_version=f"{model}:{version}:GlobalStandard")
+            self.assertEqual(usage_report([entry], combined), usage_report([entry], official))
+        self.assertAlmostEqual(usage_report([luna_record()], combined)["summary"]["current"]["estimated_cost"],
+                               .000191)
+
+    def test_reference_sources_still_require_https_and_user_source_is_explicit(self):
+        for changes in ({"source_kind": "azure_retail"}, {"source_kind": None}, {"source": ""},
+                        {"source": "   "}, {"source": None}):
+            pricing = luna_prices()
+            pricing["rates"][0].update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                validate_pricing(pricing)
+        pricing = luna_prices()
+        del pricing["rates"][0]["source_kind"]
+        with self.assertRaises(ValueError):
+            validate_pricing(pricing)
+        for source in ("user supplied", "http://example.com", "https://user:password@example.com"):
+            pricing = prices()
+            pricing["rates"][0]["source"] = source
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                validate_pricing(pricing)
+
+
 class AccountingTests(unittest.TestCase):
     def test_semantic_pairing_has_named_usage_and_cache_replay_does_not_rebill(self):
         report = usage_report([record(stage="model_text_pairing")], prices())

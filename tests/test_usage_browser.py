@@ -152,20 +152,25 @@ class UsageBrowserTests(unittest.TestCase):
 
     def test_tab_roles_keyboard_and_original_evidence(self):
         evidence = self.page.get_by_role("tab", name="证据详情")
+        timing = self.page.get_by_role("tab", name="分析耗时")
         usage = self.page.get_by_role("tab", name="用量与费用")
         expect(evidence).to_have_attribute("aria-controls", "evidence-panel")
         expect(usage).to_have_attribute("aria-controls", "usage-panel")
         expect(evidence).to_have_attribute("aria-selected", "true")
         expect(usage).to_have_attribute("tabindex", "-1")
         evidence.focus()
-        for key, selected in [("ArrowRight", usage), ("ArrowRight", evidence),
-                              ("ArrowLeft", usage), ("Home", evidence), ("End", usage)]:
+        for key, selected in [("ArrowRight", timing), ("ArrowRight", usage),
+                              ("ArrowRight", evidence), ("ArrowLeft", usage),
+                              ("ArrowLeft", timing), ("Home", evidence), ("End", usage)]:
             self.page.keyboard.press(key)
             expect(selected).to_be_focused()
             expect(selected).to_have_attribute("aria-selected", "true")
             expect(selected).to_have_attribute("tabindex", "0")
         expect(self.page.get_by_role("tabpanel", name="用量与费用")).to_be_visible()
         expect(self.page.locator("#evidence-panel")).to_be_hidden()
+        expect(self.page.locator("#timing-panel")).to_be_hidden()
+        expect(self.page.locator("#usage-panel #timing-content")).to_have_count(0)
+        expect(self.page.locator("#timing-panel #usage-content")).to_have_count(0)
         expect(self.page.locator("#detail-meta")).to_be_hidden()
         self.compare()
         expect(usage).to_have_attribute("aria-selected", "true")
@@ -225,6 +230,27 @@ class UsageBrowserTests(unittest.TestCase):
         expect(self.page.locator("#usage-history")).to_contain_text("US$9.50")
         expect(self.page.locator("#usage-requests")).to_contain_text("恢复 1")
         expect(self.page.locator("#usage-call-0 > summary")).to_contain_text("恢复历史操作")
+
+    def test_user_supplied_luna_rates_are_per_million_and_never_claim_retail_provenance(self):
+        entry = self.usage["entries"][1]
+        entry["model"] = "gpt-6-luna"
+        entry["meters"] = [meter("direct_model", label, 1000000, price, unit_quantity=1000000)
+                           for label, price in (("输入", .10), ("缓存输入", .01),
+                                                ("缓存写入", .125), ("输出", .50))]
+        for item in entry["meters"]:
+            item["rate"].update(source_kind="user_provided", as_of="2026-09-24",
+                                source='User rate <img src=x onerror="alert(1)">')
+        self.compare()
+        self.usage_tab()
+        self.open_call(1)
+        for index, price in enumerate(("0.10", "0.01", "0.125", "0.50")):
+            row = self.page.locator("#usage-call-1 tbody tr").nth(index)
+            expect(row).to_contain_text(f"US${price} / 1,000,000 token")
+            row.locator("details > summary").click()
+            expect(row).to_contain_text("用户提供")
+            expect(row).to_contain_text("未按公开零售价核验")
+            expect(row.locator("a, img, script")).to_have_count(0)
+        expect(self.page.locator("#usage-content")).to_contain_text("用户配置单价")
 
     def test_unknown_price_and_usage_preserve_known_subtotal(self):
         self.usage["status"] = "partial"

@@ -45,8 +45,9 @@
     if (content != null) node.textContent = text(content);
     return node;
   };
+  const detailTabs = ["evidence", "timing", "usage"];
   function selectDetailTab(name, focus = false) {
-    for (const key of ["evidence", "usage"]) {
+    for (const key of detailTabs) {
       const selected = key === name, tab = $(`${key}-tab`);
       tab.setAttribute("aria-selected", String(selected));
       tab.tabIndex = selected ? 0 : -1;
@@ -55,13 +56,14 @@
     }
     $("detail-meta").hidden = name !== "evidence";
   }
-  for (const [index, name] of ["evidence", "usage"].entries()) {
+  for (const [index, name] of detailTabs.entries()) {
     $(`${name}-tab`).addEventListener("click", () => selectDetailTab(name));
     $(`${name}-tab`).addEventListener("keydown", (event) => {
-      const targets = { ArrowLeft: 1 - index, ArrowRight: 1 - index, Home: 0, End: 1 };
+      const targets = { ArrowLeft: (index + detailTabs.length - 1) % detailTabs.length,
+        ArrowRight: (index + 1) % detailTabs.length, Home: 0, End: detailTabs.length - 1 };
       if (!(event.key in targets)) return;
       event.preventDefault();
-      selectDetailTab(["evidence", "usage"][targets[event.key]], true);
+      selectDetailTab(detailTabs[targets[event.key]], true);
     });
   }
   const usageNumber = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
@@ -71,7 +73,7 @@
     return `${Math.floor(value / 60)} 分 ${(value % 60).toFixed(1)} 秒`;
   }
   function renderTiming(timing, options = state.activeAnalysisOptions) {
-    const content = $("timing-content"), scrollTop = $("usage-panel").scrollTop;
+    const content = $("timing-content"), scrollTop = $("timing-panel").scrollTop;
     content.replaceChildren();
     const heading = el("div", "timing-heading");
     heading.append(el("h3", "", "本轮分析耗时"));
@@ -116,7 +118,7 @@
       content.append(list, el("p", "timing-meta",
         "本轮服务端实际耗时，含排队；步骤按实际执行记录，不将缓存里的历史服务耗时累计为本轮耗时。"));
     }
-    $("usage-panel").scrollTop = scrollTop;
+    $("timing-panel").scrollTop = scrollTop;
   }
   const usageCount = (value) => usageNumber(value) ? value.toLocaleString("zh-CN", { maximumFractionDigits: 8 }) : "未提供";
   const usageMoney = (value) => !usageNumber(value) ? "未知" : value > 0 && value < 1e-10
@@ -140,8 +142,9 @@
     ? `${rate.currency === "USD" ? usageMoney(rate.price) : `${usageCount(rate.price)} ${usageText(rate.currency)}`} / ${usageCount(rate.unit_quantity)} ${unit}` : "待配置";
   const cacheWriteNote = (metrics) => metrics && Object.prototype.hasOwnProperty.call(metrics, "cache_write_tokens")
     ? ` · 缓存写入 ${usageCount(metrics.cache_write_tokens)} token（单列，不叠加模型总量）` : "";
-  function usageSource(value) {
+  function usageSource(value, kind = "reference") {
     const label = usageText(value);
+    if (kind === "user_provided") return el("span", "", `用户提供：${label}（未按公开零售价核验）`);
     try {
       if (typeof value !== "string" || !/^https:\/\//i.test(value) || /[\s\\]/.test(value)) throw new Error();
       const url = new URL(value);
@@ -161,7 +164,7 @@
   }
   function usageRateDetails(rate, label) {
     const section = el("section", "usage-rate-detail"), sourceLine = el("p", "", "价格来源：");
-    sourceLine.append(usageSource(rate?.source));
+    sourceLine.append(usageSource(rate?.source, rate?.source_kind));
     section.append(el("h4", "", label), sourceLine,
       el("p", "", `上下文档位：${tierLabels[rate?.context_tier] || usageText(rate?.context_tier)}`),
       el("p", "", `价格日期：${usageText(rate?.as_of)} · 区域：${usageText(rate?.region)}`),
@@ -208,7 +211,7 @@
       `新提交 ${usageCount(requests.new)}`,
       `本地缓存 ${usageCount(requests.cached)} · 恢复 ${usageCount(requests.resumed)} · 未知 ${usageCount(requests.unknown)}`);
     content.append(heading, cards,
-      el("p", "usage-note", "仅为估算，不是账单。使用公开零售价，不代表合同价；未计税费或汇率换算。未知用量或价格意味着总额不完整，已知小计不是总额。"),
+      el("p", "usage-note", "仅为估算，不是账单。采用每项注明的公开参考价格或用户配置单价，不代表已核实合同价；未计税费或汇率换算。未知用量或价格意味着总额不完整，已知小计不是总额。"),
       el("p", "usage-note", "规范化输入 token 包含服务端缓存输入，不重复相加；模型 token = 输入 + 输出，推理 token 已包含在输出内。缓存写入单列，不叠加模型总量。CU 原始输入与缓存输入是否重叠未确认时，规范化总量保持未知，不直接相加原始计数。本地缓存与恢复仅引用历史操作，不计入本轮新增用量或费用。"),
       el("p", "usage-note", "场景估算区间来自后端假设，不是确定费用或账单上下限；短 / 长上下文适用门槛或 CU 用量语义未确认时，不擅自选择档位，不将候选价格或场景端点相加。价格待核包含已核实单价但适用档位未确认的情况；用量待核包含已返回 API 计数但缓存重叠语义未确认的情况。"));
     const history = el("section", "usage-history");
@@ -1639,6 +1642,65 @@
   $("export-button").addEventListener("click", exportPdf);
   $("dismiss-error").addEventListener("click", clearError);
   $("retry-bootstrap").addEventListener("click", bootstrap);
+  const splitter = $("review-splitter"), reviewArea = splitter.parentElement;
+  let detailHeight = null, splitDrag = null;
+  function splitLimits() {
+    const available = reviewArea.clientHeight - $("file-identity-status").offsetHeight - splitter.offsetHeight;
+    const minimum = Math.max(120, $("detail-panel").querySelector("header").offsetHeight + 48);
+    const drawingMinimum = parseFloat(getComputedStyle($("drawing-grid")).minHeight);
+    return { minimum, maximum: Math.max(minimum, available - drawingMinimum), available };
+  }
+  function updateSplit(height = detailHeight) {
+    const { minimum, maximum, available } = splitLimits();
+    const preferred = height ?? parseFloat(getComputedStyle(reviewArea).getPropertyValue("--review-detail-default"));
+    const value = Math.max(minimum, Math.min(maximum, preferred));
+    reviewArea.style.setProperty("--review-detail-height", `${value}px`);
+    splitter.setAttribute("aria-valuemin", String(Math.round(minimum)));
+    splitter.setAttribute("aria-valuemax", String(Math.round(maximum)));
+    splitter.setAttribute("aria-valuenow", String(Math.round(value)));
+    splitter.setAttribute("aria-valuetext", `详情高度 ${Math.round(value)} 像素，图纸高度 ${Math.round(available - value)} 像素`);
+    return value;
+  }
+  function endSplit(cancel = false) {
+    if (!splitDrag) return;
+    const drag = splitDrag;
+    splitDrag = null;
+    if (cancel) { detailHeight = drag.preference; updateSplit(); }
+    document.body.classList.remove("resizing-review");
+    if (splitter.hasPointerCapture(drag.pointerId)) splitter.releasePointerCapture(drag.pointerId);
+  }
+  splitter.addEventListener("pointerdown", (event) => {
+    if (splitDrag || event.button !== 0 || !event.isPrimary) return;
+    event.preventDefault();
+    splitter.focus({ preventScroll: true });
+    splitDrag = { pointerId: event.pointerId, y: event.clientY,
+      height: $("detail-panel").getBoundingClientRect().height, preference: detailHeight };
+    splitter.setPointerCapture(event.pointerId);
+    document.body.classList.add("resizing-review");
+  });
+  splitter.addEventListener("pointermove", (event) => {
+    if (!splitDrag || event.pointerId !== splitDrag.pointerId) return;
+    detailHeight = updateSplit(splitDrag.height + splitDrag.y - event.clientY);
+  });
+  splitter.addEventListener("pointerup", (event) => { if (event.pointerId === splitDrag?.pointerId) endSplit(); });
+  splitter.addEventListener("pointercancel", (event) => { if (event.pointerId === splitDrag?.pointerId) endSplit(true); });
+  splitter.addEventListener("lostpointercapture", () => endSplit());
+  splitter.addEventListener("dblclick", () => { endSplit(); detailHeight = null; updateSplit(); });
+  splitter.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && splitDrag) { event.preventDefault(); endSplit(true); return; }
+    const { minimum, maximum } = splitLimits(), value = $("detail-panel").getBoundingClientRect().height;
+    const step = event.shiftKey ? 80 : 24;
+    const targets = { ArrowUp: value + step, ArrowDown: value - step,
+      PageUp: value + 80, PageDown: value - 80, Home: minimum, End: maximum };
+    if (!(event.key in targets)) return;
+    event.preventDefault();
+    endSplit();
+    detailHeight = updateSplit(targets[event.key]);
+  });
+  window.addEventListener("blur", () => endSplit());
+  const splitObserver = new ResizeObserver(() => updateSplit());
+  for (const node of [reviewArea, $("file-identity-status"), $("detail-panel").querySelector("header")]) splitObserver.observe(node);
+  updateSplit();
   const observer = new ResizeObserver(() => sides.forEach(resizeStage));
   sides.forEach((side) => observer.observe($(`${side}-viewport`)));
   window.addEventListener("beforeunload", () => { state.jobController?.abort(); state.exportController?.abort(); });

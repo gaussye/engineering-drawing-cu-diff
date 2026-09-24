@@ -21,7 +21,48 @@
     "region": null,
     "snapshot": null,
     "cu_input_includes_cached": null,
-    "rates": []
+    "rates": [
+      {
+        "key": "model.gpt-6-luna.input",
+        "price": 0.10,
+        "unit_quantity": 1000000,
+        "unit": "tokens",
+        "currency": "USD",
+        "as_of": "2026-09-24",
+        "source_kind": "user_provided",
+        "source": "User-provided GPT-6 Luna rates; not verified Azure retail pricing"
+      },
+      {
+        "key": "model.gpt-6-luna.cached_input",
+        "price": 0.01,
+        "unit_quantity": 1000000,
+        "unit": "tokens",
+        "currency": "USD",
+        "as_of": "2026-09-24",
+        "source_kind": "user_provided",
+        "source": "User-provided GPT-6 Luna rates; not verified Azure retail pricing"
+      },
+      {
+        "key": "model.gpt-6-luna.cache_write",
+        "price": 0.125,
+        "unit_quantity": 1000000,
+        "unit": "tokens",
+        "currency": "USD",
+        "as_of": "2026-09-24",
+        "source_kind": "user_provided",
+        "source": "User-provided GPT-6 Luna rates; not verified Azure retail pricing"
+      },
+      {
+        "key": "model.gpt-6-luna.output",
+        "price": 0.50,
+        "unit_quantity": 1000000,
+        "unit": "tokens",
+        "currency": "USD",
+        "as_of": "2026-09-24",
+        "source_kind": "user_provided",
+        "source": "User-provided GPT-6 Luna rates; not verified Azure retail pricing"
+      }
+    ]
   },
   "model_comparison": {
     "enabled": false,

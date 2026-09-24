@@ -1,4 +1,4 @@
-"""Per-run consumption journal and explicit, provenance-bearing retail estimates."""
+"""Per-run consumption journal and explicit, provenance-bearing price estimates."""
 
 from copy import deepcopy
 from collections import deque
@@ -29,6 +29,10 @@ CU_METERS = {
     "contextualizationTokens": ("CU标准上下文处理", "tokens"),
     "advancedContextualizationTokens": ("CU高级上下文处理", "tokens"),
 }
+LATENCY_CHECKPOINT_FIELDS = frozenset({
+    "engine_tbt_ms", "engine_ttft_ms", "engine_ttlt_ms", "pre_inference_ms",
+    "service_tbt_ms", "service_ttft_ms", "service_ttlt_ms", "user_visible_ttft_ms",
+})
 _JOURNAL_INIT_LOCK = threading.RLock()
 
 
@@ -170,11 +174,15 @@ def validate_pricing(value=None):
                 or rate.get("unit") not in ("pages", "tokens")
                 or not isinstance(rate.get("as_of"), str) or not rate["as_of"]):
             raise ValueError("Each rate needs a key, unit price/basis, currency, unit and as_of date")
-        if not isinstance(rate.get("source"), str):
-            raise ValueError("Pricing source must be an HTTPS URL string")
-        source = urlsplit(rate["source"])
-        if source.scheme != "https" or not source.hostname or source.username or source.password:
-            raise ValueError("Pricing sources must be HTTPS URLs without credentials")
+        source_kind = rate.get("source_kind", "reference")
+        if source_kind not in ("reference", "user_provided"):
+            raise ValueError("Invalid pricing source_kind")
+        if not isinstance(rate.get("source"), str) or not rate["source"].strip():
+            raise ValueError("Pricing source must be a nonempty string")
+        if source_kind != "user_provided":
+            source = urlsplit(rate["source"])
+            if source.scheme != "https" or not source.hostname or source.username or source.password:
+                raise ValueError("Pricing sources must be HTTPS URLs without credentials")
         for field in ("region", "sku", "model_version"):
             if rate.get(field) is not None and not isinstance(rate[field], str):
                 raise ValueError(f"Invalid rate {field}")
@@ -188,7 +196,7 @@ def validate_pricing(value=None):
             raise ValueError("Invalid rate context interval")
         conditions = ("key", "region", "sku", "model_version", "min_input_tokens", "max_input_tokens", "context_tier")
         checked = [old for old in checked if any(old.get(k) != rate.get(k) for k in conditions)]
-        checked.append(dict(rate))
+        checked.append(dict(rate, source_kind=source_kind))
     return {"currency": currency, "region": region, "rates": checked,
             "cu_input_includes_cached": semantics}
 
@@ -233,9 +241,9 @@ def _normalize(entry, pricing):
     meters, warnings = [], []
     usage, service, meta = entry.get("usage"), entry["service"], entry["metadata"]
 
-    def meter(key, label, quantity, unit, category, *, quantity_range=None, **dimensions):
+    def meter(key, label, quantity, unit, category, *, quantity_range=None, eligible=True, **dimensions):
         quantity = quantity if _number(quantity) else None
-        candidates = _rates(pricing, key, unit, service=service, **dimensions)
+        candidates = _rates(pricing, key, unit, service=service, **dimensions) if eligible else []
         rate = candidates[0] if len(candidates) == 1 else None
         cost = None
         if quantity == 0:
@@ -325,16 +333,16 @@ def _normalize(entry, pricing):
     else:
         prompt, output = usage.get("prompt_tokens"), usage.get("completion_tokens")
         details = usage.get("prompt_tokens_details")
-        cached = details.get("cached_tokens", 0) if isinstance(details, dict) else 0
-        written = details.get("cache_write_tokens", 0) if isinstance(details, dict) else 0
+        cached = details.get("cached_tokens", 0) if isinstance(details, dict) else 0 if details is None else None
+        written = details.get("cache_write_tokens", 0) if isinstance(details, dict) else 0 if details is None else None
         if not _number(prompt) or not _number(cached) or cached > prompt:
             prompt = cached = None
         if not _number(output):
             output = None
         model, version, sku, _ = _deployment(meta)
         actual = meta.get("response_model")
-        if actual and model and actual not in (model, f"{model}-{version}"):
-            version = sku = None
+        identity_matches = not (actual and model and actual not in (model, f"{model}-{version}"))
+        if not identity_matches:
             warnings.append("实际返回模型与配置版本不一致，未套用该部署的版本单价。")
         metrics.update(input_tokens=prompt, cached_input_tokens=cached, output_tokens=output,
                        cache_write_tokens=written if _number(written) else None,
@@ -344,14 +352,34 @@ def _normalize(entry, pricing):
             ordinary = None
             warnings.append("服务返回缓存写入token；其与普通输入的计费重叠口径尚未核实，未重复相加。")
             meter(f"model.{model}.cache_write", f"直接调用 {model} · cache_write", written, "tokens", "direct_model",
-                  version=version, sku=sku, prompt=prompt)
+                  version=version, sku=sku, prompt=prompt, eligible=identity_matches)
         for kind, count in (("input", ordinary),
                             ("cached_input", cached), ("output", output)):
             meter(f"model.{model}.{kind}", f"直接调用 {model} · {kind}", count, "tokens", "direct_model",
-                  version=version, sku=sku, prompt=prompt)
+                  version=version, sku=sku, prompt=prompt, eligible=identity_matches)
         if _number(usage.get("total_tokens")) and metrics["model_tokens"] != usage["total_tokens"]:
             warnings.append("服务总token与输入/输出分项不一致，以分项展示并标记用量不完整。")
             meter("model.total_mismatch", "服务token合计不一致", None, "tokens", "direct_model")
+        recognized = {
+            "": {"prompt_tokens", "completion_tokens", "total_tokens",
+                 "prompt_tokens_details", "completion_tokens_details"},
+            "prompt_tokens_details": {"cached_tokens", "cache_write_tokens", "audio_tokens"},
+            "completion_tokens_details": {"reasoning_tokens", "audio_tokens",
+                                          "accepted_prediction_tokens", "rejected_prediction_tokens"},
+        }
+        latency = usage.get("latency_checkpoint")
+        # Only the observed, closed millisecond schema is known to be non-billing.
+        if (isinstance(latency, dict) and latency.keys() == LATENCY_CHECKPOINT_FIELDS
+                and all(_number(value) for value in latency.values())):
+            recognized[""].add("latency_checkpoint")
+        for group, names in recognized.items():
+            counts = usage.get(group) if group else usage
+            if isinstance(counts, dict):
+                for key in counts.keys() - names:
+                    path = f"{group}.{key}" if group else key
+                    meter("model.unknown."+path, "未识别的模型计量项："+path,
+                          None, "unknown", "direct_model")
+                    warnings.append("模型返回额外计量项，未将其当作零费用。")
     if any(m["quantity"] is None for m in meters):
         warnings.append("部分计量项缺失、无效或口径未核实；合计不是完整用量。")
     if entry.get("outcome") == "operation_incomplete":
@@ -368,7 +396,7 @@ def _normalize(entry, pricing):
 def usage_report(records, pricing=None):
     pricing = validate_pricing(pricing)
     journal_available = isinstance(records, list)
-    entries, warnings, dates = [], [], set()
+    entries, warnings, dates, sources = [], [], set(), []
     buckets = {name: {**{k: 0 for k in FIELDS}, "known_cost": 0., "estimated_cost": 0.,
                       "estimated_cost_range": {"min": 0., "max": 0.},
                       "unpriced_meters": 0, "unknown_usage_calls": 0} for name in ("current", "reused")}
@@ -420,6 +448,11 @@ def usage_report(records, pricing=None):
         })
         dates.update(m["rate"]["as_of"] for m in meters if m["rate"] is not None)
         dates.update(r["as_of"] for m in meters for r in m["rate_candidates"])
+        for m in meters:
+            for rate in ([m["rate"]] if m["rate"] is not None else m["rate_candidates"]):
+                source = {key: rate[key] for key in ("source_kind", "source", "as_of")}
+                if source not in sources:
+                    sources.append(source)
     if not journal_available:
         buckets["current"].update({k: None for k in FIELDS})
         buckets["current"].update(estimated_cost=None, estimated_cost_range=None, unknown_usage_calls=1)
@@ -437,4 +470,5 @@ def usage_report(records, pricing=None):
         b["estimated_cost"] is not None for b in buckets.values()) else "partial")
     return {"version": VERSION, "currency": pricing["currency"], "status": status,
             "price_as_of": min(dates) if dates else None,
+            "price_sources": sources,
             "summary": {"requests": requests, **buckets}, "entries": entries, "warnings": warnings}

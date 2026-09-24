@@ -172,7 +172,7 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
 
     def test_completed_timing_and_changed_settings_do_not_relabel_previous_result(self):
         self.compare()
-        self.page.get_by_role("tab", name="用量与费用").click()
+        self.page.get_by_role("tab", name="分析耗时").click()
         expect(self.page.locator("#timing-total")).to_have_text("1 分 5.3 秒")
         expect(self.page.locator('[data-stage-id="cu_old"]')).to_contain_text("0.125 秒")
         expect(self.page.locator("#timing-content")).to_contain_text("GPT-6 Astra")
@@ -188,17 +188,20 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
         self.job_status = "running"
         self.job_timing = timing("running", 9)
         self.page.locator("#compare-button").click()
-        self.page.get_by_role("tab", name="用量与费用").click()
+        self.page.get_by_role("tab", name="分析耗时").click()
         expect(self.page.locator("#timing-total")).to_have_text("9.00 秒")
         expect(self.page.locator('[data-stage-id="model"]')).to_contain_text("进行中")
+        self.page.get_by_role("tab", name="用量与费用").click()
         self.page.locator("#usage-call-0 > summary").click()
+        self.page.get_by_role("tab", name="分析耗时").click()
         self.job_timing = timing("failed", 12)
         self.job_status = "failed"
         expect(self.page.locator("#error-message")).to_have_text("Synthetic analysis failure")
         expect(self.page.locator("#timing-total")).to_have_text("12.00 秒")
         expect(self.page.locator('[data-stage-id="model"]')).to_contain_text("失败，保留已耗时间")
         expect(self.page.locator("#usage-call-0")).to_have_attribute("open", "")
-        expect(self.page.get_by_role("tab", name="用量与费用")).to_have_attribute("aria-selected", "true")
+        expect(self.page.get_by_role("tab", name="分析耗时")).to_have_attribute("aria-selected", "true")
+        expect(self.page.locator("#usage-panel")).to_be_hidden()
         expect(self.page.locator("#analysis-model")).to_be_enabled()
         self.assertGreaterEqual(self.polls, 2)
 
@@ -214,7 +217,7 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
         self.job_status = "failed"
         self.page.locator("#compare-button").click()
         expect(self.page.locator("#error-message")).to_have_text("Synthetic analysis failure")
-        self.page.get_by_role("tab", name="用量与费用").click()
+        self.page.get_by_role("tab", name="分析耗时").click()
         expect(self.page.locator("#timing-total")).to_have_text("5.00 秒")
         expect(self.page.locator(".timing-stage-time")).to_have_text("5.00 秒")
         expect(self.page.locator(".timing-execution")).to_have_text("两侧并行 · 子耗时不相加")
@@ -229,7 +232,7 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
              "status": "<script>", "elapsed_seconds": "123"},
         ]}
         self.compare()
-        self.page.get_by_role("tab", name="用量与费用").click()
+        self.page.get_by_role("tab", name="分析耗时").click()
         expect(self.page.locator("#timing-total")).to_have_text("未提供")
         expect(self.page.locator("#timing-content img, #timing-content script")).to_have_count(0)
         expect(self.page.locator(".timing-stage")).to_contain_text("状态未提供")
@@ -240,7 +243,7 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
     def test_missing_timing_is_not_historical_usage_or_zero_and_new_upload_clears_it(self):
         self.job_timing = None
         self.compare()
-        self.page.get_by_role("tab", name="用量与费用").click()
+        self.page.get_by_role("tab", name="分析耗时").click()
         expect(self.page.locator("#timing-content")).to_contain_text("暂无耗时数据")
         expect(self.page.locator("#timing-total")).to_have_count(0)
         self.job_timing = timing()

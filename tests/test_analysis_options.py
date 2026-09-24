@@ -115,6 +115,36 @@ class WorkspaceTest(unittest.TestCase):
 
 
 class OptionTests(WorkspaceTest):
+    def test_selected_model_uses_only_its_prices_and_cache_replay_is_not_billed(self):
+        original = config()
+        example = Path(__file__).resolve().parents[1] / "config.example.json"
+        original["pricing"] = json.loads(example.read_text(encoding="utf-8"))["pricing"]
+        expected = copy.deepcopy(original)
+        registry = AnalysisOptions(original)
+        for model in ("gpt-6-luna", "gpt-6-astra"):
+            selected, _ = registry.snapshot(model=model)
+            client = SyntheticClient(selected)
+            cache = self.root / model
+            complete_json(client, cache, body(client))
+            report = usage_report(client.usage_records, selected["pricing"])
+            current = report["summary"]["current"]
+            if model == "gpt-6-luna":
+                self.assertAlmostEqual(current["estimated_cost"], .000002)
+                self.assertEqual(report["price_sources"][0]["source_kind"], "user_provided")
+            else:
+                self.assertIsNone(current["estimated_cost"])
+                self.assertEqual(report["price_sources"], [])
+            self.assertTrue(all(m["key"].startswith(f"model.{model}.")
+                                for m in report["entries"][0]["meters"]))
+            replay = SyntheticClient(selected)
+            call_count = len(SyntheticClient.calls)
+            complete_json(replay, cache, body(replay), allow_submit=False)
+            self.assertEqual(len(SyntheticClient.calls), call_count)
+            self.assertEqual(usage_report(replay.usage_records, selected["pricing"])
+                             ["summary"]["current"]["estimated_cost"], 0)
+        self.assertEqual(original, expected)
+        self.assertEqual(registry.snapshot(model="gpt-6-luna")[0]["pricing"], expected["pricing"])
+
     def test_allowlist_snapshot_isolation_and_configuration_validation(self):
         original = config()
         expected = copy.deepcopy(original)
