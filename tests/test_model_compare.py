@@ -33,6 +33,14 @@ def pair(index=1, **extra):
             "rationale": "Model proposes this same-role pairing.", "observations": [], **extra}
 
 
+def many_lines(count):
+    document = response()
+    document["result"]["contents"][0]["pages"][0]["lines"] = [
+        {"content": f"SYNTHETIC ROW {index}", "source": "D(1,1,1,2,.3)"}
+        for index in range(1, count + 1)]
+    return document
+
+
 class FakeClient:
     def __init__(self):
         self.config = {"completion_model": "test-model", "model_deployments": {"test-model": "test-deploy"},
@@ -300,9 +308,101 @@ class ModelComparisonTests(unittest.TestCase):
         self.assertEqual(normalized["pairs"][0]["old_ids"], ["old:e2", "old:e1"])
         self.assertEqual(adjustments[0]["removed_count"], 2)
 
-    def test_oversized_coarse_references_still_fail_before_dedup_or_crops(self):
+    def test_raw_reference_budget_cannot_be_bypassed_by_dedup(self):
         self.coarse["pairs"][0]["old_ids"] = ["old:e1"] * 41
-        with self.assertRaisesRegex(CUError, "excessive"):
+        result = self.run_comparison()
+        self.assertEqual(self.client.calls, [])
+        item, = result["items"]
+        self.assertEqual(item["change"], "model_review")
+        self.assertEqual(item["old"]["locations"], [])
+        self.assertEqual(item["model_comparison"]["budget_issues"][0]["actual"], 41)
+        self.assertEqual(result["coverage"]["coarse"]["proposed_pairs"][0]["old_ids"], ["old:e1"] * 41)
+
+    def test_oversized_unchanged_table_is_retained_and_other_regions_continue(self):
+        for profile in ("engineering", "layout"):
+            with self.subTest(profile=profile):
+                self.client.config["extraction_profile"] = profile
+                oversized = pair(assessment="unchanged",
+                                 old_ids=[f"old:e{i}" for i in range(1, 52)],
+                                 new_ids=[f"new:e{i}" for i in range(1, 52)])
+                oversized["observations"] = [{
+                    "kind": "unchanged_text", "old_ids": oversized["old_ids"][:],
+                    "new_ids": oversized["new_ids"][:], "description": "Synthetic table",
+                    "check": "Check every row"}]
+                self.coarse["pairs"] = [oversized, pair(52)]
+                before = copy.deepcopy(self.coarse)
+                result = self.run_comparison(old=many_lines(52), new=many_lines(52))
+                review, confirmed = result["items"]
+                self.assertEqual(review["change"], "model_review")
+                self.assertEqual(confirmed["change"], "model_text_modified")
+                for side in ("old", "new"):
+                    self.assertEqual(review[side]["locations"], [])
+                    self.assertEqual(len(review["model_context"][side]["locations"]), 51)
+                    self.assertIn("SYNTHETIC ROW 51", review[side]["raw_text"])
+                self.assertEqual(len(review["model_comparison"]["budget_issues"]), 4)
+                self.assertEqual(result["coverage"]["coarse"]["proposed_pairs"], before["pairs"])
+                self.assertEqual(list(result["coverage"]["coarse"]["budget_exceeded_pairs"]), ["0"])
+                self.assertEqual(result["coverage"]["reread_regions"], 1)
+                self.assertTrue(any("不截断来源" in warning for warning in result["warnings"]))
+                self.assertEqual(self.coarse, before)
+
+    def test_observation_reference_and_observation_count_budgets_are_review_only(self):
+        for kind in ("reference", "observation"):
+            with self.subTest(kind=kind):
+                observation = {"kind": "visual_change", "old_ids": ["old:e1"],
+                               "new_ids": ["new:e1"], "description": "Synthetic", "check": "Verify"}
+                self.coarse["pairs"][0]["observations"] = (
+                    [dict(observation, old_ids=["old:e1"] * 41)] if kind == "reference"
+                    else [copy.deepcopy(observation) for _ in range(21)])
+                self.client.config["model_comparison"]["visual_review"] = True
+                result = self.run_comparison()
+                self.assertEqual(self.client.calls, [])
+                self.assertEqual(result["coverage"]["visual"]["regions"], [])
+                item, = result["items"]
+                self.assertEqual(item["old"]["locations"], [])
+                self.assertEqual(item["change"], "model_review")
+                self.assertTrue(item["model_comparison"]["budget_issues"])
+
+    def test_region_count_budget_retains_additional_pairs_without_confirmation(self):
+        self.coarse["pairs"] = [pair(i, assessment="unchanged") for i in range(1, 42)]
+        result = self.run_comparison(old=many_lines(41), new=many_lines(41))
+        self.assertEqual(self.client.calls, [])
+        item, = result["items"]
+        self.assertEqual(item["model_comparison"]["budget_issues"],
+                         [{"kind": "region_count", "actual": 41, "limit": 40}])
+        self.assertEqual(item["old"]["locations"], [])
+        self.assertEqual(len(result["coverage"]["coarse"]["proposed_pairs"]), 41)
+
+    def test_unknown_or_wrong_side_ids_in_budget_exceeding_tails_fail_before_inference(self):
+        for position in ("pair", "observation", "region"):
+            for invalid in ("old:invented", "new:e1"):
+                with self.subTest(position=position, invalid=invalid):
+                    self.coarse["pairs"] = [pair()]
+                    if position == "pair":
+                        self.coarse["pairs"][0]["old_ids"] = ["old:e1"] * 40 + [invalid]
+                    elif position == "observation":
+                        self.coarse["pairs"][0]["observations"] = [
+                            {"kind": "visual_change", "old_ids": ["old:e1"], "new_ids": [],
+                             "description": "Synthetic", "check": "Verify"} for _ in range(21)]
+                        self.coarse["pairs"][0]["observations"][-1]["old_ids"] = [invalid]
+                    else:
+                        self.coarse["pairs"] = [pair() for _ in range(41)]
+                        self.coarse["pairs"][-1]["old_ids"] = [invalid]
+                    with self.assertRaisesRegex(CUError, "unknown or wrong-side"):
+                        self.run_comparison()
+                    self.assertEqual(self.client.calls, [])
+
+    def test_budget_review_does_not_erase_shared_source_conflicts(self):
+        self.coarse["pairs"] = [pair(old_ids=["old:e1"] * 41), pair()]
+        result = self.run_comparison()
+        self.assertEqual(self.client.calls, [])
+        self.assertEqual(len(result["items"]), 2)
+        self.assertTrue(result["coverage"]["coarse"]["conflicting_source_ids"])
+        self.assertTrue(all(item["old"]["locations"] == [] for item in result["items"]))
+
+    def test_hard_response_array_bound_still_rejects_excessive_payloads(self):
+        self.coarse["pairs"][0]["old_ids"] = ["old:e1"] * 2001
+        with self.assertRaisesRegex(CUError, "oversized array"):
             self.run_comparison()
         self.assertEqual(self.client.calls, [])
 

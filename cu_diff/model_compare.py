@@ -17,6 +17,7 @@ from .web_evidence import locations, response_geometry_matches
 
 VERSION = "semantic-crop-v2"
 SIDES = ("old", "new")
+_MODEL_ARRAY_LIMIT = 2000
 
 
 def _object(properties):
@@ -138,7 +139,7 @@ def _json_shape(value, schema, label="model response"):
         for key, field in schema["properties"].items():
             _json_shape(value[key], field, label)
     elif kind == "array":
-        if not isinstance(value, list) or len(value) > 2000:
+        if not isinstance(value, list) or len(value) > _MODEL_ARRAY_LIMIT:
             raise CUError(f"{label}: invalid or oversized array")
         for item in value:
             _json_shape(item, schema["items"], label)
@@ -272,14 +273,10 @@ def _normalize_coarse_references(coarse):
     from copy import deepcopy
     normalized, adjustments = deepcopy(coarse), []
     for pair_index, pair in enumerate(normalized["pairs"]):
-        if len(pair["observations"]) > 20:
-            raise CUError("Model exceeded review observation budget")
         records = [(None, pair), *enumerate(pair["observations"])]
         for observation_index, record in records:
             for side in SIDES:
                 ids = record[f"{side}_ids"]
-                if len(ids) > 40:
-                    raise CUError("Model supplied excessive evidence references")
                 unique = list(dict.fromkeys(ids))
                 if len(unique) != len(ids):
                     record[f"{side}_ids"] = unique
@@ -289,6 +286,21 @@ def _normalize_coarse_references(coarse):
                         "removed_count": len(ids) - len(unique),
                     })
     return normalized, adjustments
+
+
+def _coarse_budget_issues(pair, index):
+    issues = []
+    if index >= 40:
+        issues.append({"kind": "region_count", "actual": index + 1, "limit": 40})
+    if len(pair["observations"]) > 20:
+        issues.append({"kind": "observation_count", "actual": len(pair["observations"]), "limit": 20})
+    for observation_index, record in [(None, pair), *enumerate(pair["observations"])]:
+        for side in SIDES:
+            count = len(record[f"{side}_ids"])
+            if count > 40:
+                issues.append({"kind": "reference_count", "side": side,
+                               "observation_index": observation_index, "actual": count, "limit": 40})
+    return issues
 
 
 def _source_schema(schema, catalogs):
@@ -325,12 +337,12 @@ def _combine(entries):
             "location_error": None, "detail": "原文与坐标来自CU；对应关系由模型提出，仍需工程复核。"}
 
 
-def _observation_references(observations, catalog):
-    if len(observations) > 20:
+def _observation_references(observations, catalog, *, observation_limit=20, reference_limit=40):
+    if len(observations) > observation_limit:
         raise CUError("Model exceeded review observation budget")
     for observation in observations:
         if observation["old_ids"] or observation["new_ids"]:
-            refs = _references(observation, catalog, 40)
+            refs = _references(observation, catalog, reference_limit)
         elif observation["kind"] in ("visual_change", "unresolved"):
             refs = {side: [] for side in SIDES}
         else:
@@ -498,24 +510,27 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                             schema=_source_schema(COARSE_SCHEMA, catalogs) if layout else None),
         allow_submit=allow_submit)
     _json_shape(coarse, COARSE_SCHEMA)
-    if len(coarse["pairs"]) > 40:
-        raise CUError("Model exceeded maximum region pairs")
     original_coarse = coarse
     coarse, reference_adjustments = _normalize_coarse_references(coarse)
     seen, pairs, owners, rejected_groups = {side: set() for side in SIDES}, [], {}, {}
-    for pair in coarse["pairs"]:
-        selected = _references(pair, catalogs, 40)
+    for index, pair in enumerate(coarse["pairs"]):
+        # Validate every source, including budget-exceeding tails, before any crop/inference.
+        selected = _references(pair, catalogs, _MODEL_ARRAY_LIMIT)
+        budget_issues = _coarse_budget_issues(original_coarse["pairs"][index], index)
         outside = {side: sorted({identifier for observation in pair["observations"]
                                 for identifier in observation[f"{side}_ids"]
                                 if identifier not in pair[f"{side}_ids"]})
                    for side in SIDES}
-        observations = list(_observation_references(pair["observations"], catalogs))
+        observations = list(_observation_references(
+            pair["observations"], catalogs,
+            observation_limit=_MODEL_ARRAY_LIMIT, reference_limit=_MODEL_ARRAY_LIMIT))
         figure_text = {side: sorted({entry["id"] for observation, refs in observations
                                     if observation["kind"] == "text_change"
                                     for entry in refs[side] if entry["role"] == "figure context"})
                        for side in SIDES}
-        if layout and (any(outside.values()) or any(figure_text.values())):
-            rejected_groups[len(pairs)] = {"outside": outside, "figure_text": figure_text}
+        if budget_issues or (layout and (any(outside.values()) or any(figure_text.values()))):
+            rejected_groups[len(pairs)] = {
+                "outside": outside, "figure_text": figure_text, "budget_issues": budget_issues}
         else:
             _focus_for_review(pair, selected)
         for side in SIDES:
@@ -541,12 +556,18 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                 reasons.append("模型观察引用了该配对范围之外的CU来源。")
             if any(rejected["figure_text"].values()):
                 reasons.append("模型将图形上下文用作文字差异证据；图形来源不能替代OCR原文。")
+            if rejected["budget_issues"]:
+                counts = "、".join(f"{issue['actual']}/{issue['limit']}"
+                                  for issue in rejected["budget_issues"])
+                reasons.append(f"模型区域或观察超出自动核验预算（数量/上限：{counts}）；"
+                               "完整引用保留，不截断来源、不追加重试请求。")
             reason = "".join(reasons) + "保留待核记录，不自动补配、裁剪或绘制差异框。"
             record = _record({**pair, "observations": []}, selected, stage="coarse",
                              issues=[reason], suppress_highlights=True)
             record["model_comparison"].update(
                 observations=pair["observations"], rejected_source_ids=rejected["outside"],
                 invalid_text_source_ids=rejected["figure_text"],
+                budget_issues=rejected["budget_issues"],
                 highlight_scope="none_invalid_observation_group")
             items.append(record)
             warnings.append(f"{pair['label']}：{reason}")
@@ -767,6 +788,9 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
         "enabled": True, "version": VERSION, "status": "completed_with_limits",
         "catalog": coverage, "coarse": {"model": coarse_meta, "proposed_pairs": original_coarse["pairs"],
                    "reference_adjustments": reference_adjustments,
+                   "budget_exceeded_pairs": {str(index): rejected["budget_issues"]
+                                            for index, rejected in rejected_groups.items()
+                                            if rejected["budget_issues"]},
                    "conflicting_source_ids": conflicts,
                    "unchanged_model_assessments": sum(p["assessment"] == "unchanged" for p, _ in pairs)},
         "fine": fine_records, "max_regions": opts["max_regions"], "reread_regions": used,
