@@ -33,7 +33,8 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
     def setUp(self):
         self.azure = True
         self.profile = "engineering"
-        self.options = {"use_cache": True, "model": "gpt-6-astra", "models": [
+        self.options = {"use_cache": False, "model": "gpt-6-sol", "models": [
+            {"id": "gpt-6-sol", "label": "GPT-6 Sol"},
             {"id": "gpt-6-astra", "label": "GPT-6 Astra"},
             {"id": "gpt-6-luna", "label": "GPT-6 Luna"},
         ]}
@@ -51,7 +52,7 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
         if url.netloc == "graphics-ui.test" and url.path == "/api/bootstrap":
             route.fulfill(json={
                 "csrf_token": "synthetic-csrf", "revision": self.revision, "azure_enabled": self.azure,
-                "model": "gpt-5.4", "model_comparison_deployment": "gpt-6-astra",
+                "model": "gpt-5.4", "model_comparison_deployment": "gpt-6-sol",
                 "model_comparison_enabled": True, "semantic_text_pairing_enabled": True,
                 "graphics_enabled": True, "documents": self.documents,
                 "analysis_options": self.options,
@@ -83,16 +84,27 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
             graphics.GraphicsBrowserTests.route(self, route)
 
     def test_defaults_submit_cache_and_model_without_calling_when_selection_changes(self):
-        expect(self.page.get_by_role("switch", name="使用缓存")).to_be_checked()
-        expect(self.page.locator("#analysis-model")).to_have_value("gpt-6-astra")
+        expect(self.page.get_by_role("switch", name="使用缓存")).not_to_be_checked()
+        expect(self.page.locator("#analysis-model")).to_have_value("gpt-6-sol")
         self.assertEqual(self.page.locator("#analysis-model option").all_text_contents(),
-                         ["GPT-6 Astra", "GPT-6 Luna"])
+                         ["GPT-6 Sol", "GPT-6 Astra", "GPT-6 Luna"])
         self.page.locator("#analysis-model").select_option("gpt-6-luna")
         expect(self.page.locator("#analysis-settings-note")).to_contain_text("CU 提取仍使用原模型")
         self.assertEqual(self.requests, [])
         self.compare()
-        self.assertEqual(self.requests, [{"revision": 2, "use_cache": True, "model": "gpt-6-luna"}])
+        self.assertEqual(self.requests, [{"revision": 2, "use_cache": False, "model": "gpt-6-luna"}])
         expect(self.page.locator("#model-tag")).to_contain_text("CU：gpt-5.4 · 模型对比：GPT-6 Luna")
+
+    def test_default_sol_submits_without_cache_and_explicit_cache_on_is_respected(self):
+        self.compare()
+        self.assertEqual(self.requests[-1], {"revision": 2, "use_cache": False, "model": "gpt-6-sol"})
+        expect(self.page.locator("#analysis-settings-note")).to_contain_text("不套用 Astra 单价")
+        self.page.get_by_role("switch", name="使用缓存").check()
+        self.compare()
+        self.assertTrue(self.requests[-1]["use_cache"])
+        self.page.reload(wait_until="networkidle")
+        expect(self.page.get_by_role("switch", name="使用缓存")).not_to_be_checked()
+        expect(self.page.locator("#analysis-model")).to_have_value("gpt-6-sol")
 
     def test_layout_profile_shows_ocr_as_primary_without_relabeling_as_schema(self):
         self.context.close()
@@ -175,13 +187,13 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
         self.page.get_by_role("tab", name="分析耗时").click()
         expect(self.page.locator("#timing-total")).to_have_text("1 分 5.3 秒")
         expect(self.page.locator('[data-stage-id="cu_old"]')).to_contain_text("0.125 秒")
-        expect(self.page.locator("#timing-content")).to_contain_text("GPT-6 Astra")
+        expect(self.page.locator("#timing-content")).to_contain_text("GPT-6 Sol")
         self.page.locator("#analysis-model").select_option("gpt-6-luna")
-        self.page.get_by_role("switch", name="使用缓存").uncheck()
+        self.page.get_by_role("switch", name="使用缓存").check()
         expect(self.page.locator("#analysis-settings-note")).to_contain_text("仅用于下一次对比")
-        expect(self.page.locator("#timing-content")).to_contain_text("GPT-6 Astra")
-        expect(self.page.locator("#timing-content")).to_contain_text("缓存：开启")
-        expect(self.page.locator("#model-tag")).to_contain_text("GPT-6 Astra")
+        expect(self.page.locator("#timing-content")).to_contain_text("GPT-6 Sol")
+        expect(self.page.locator("#timing-content")).to_contain_text("缓存：关闭")
+        expect(self.page.locator("#model-tag")).to_contain_text("GPT-6 Sol")
         self.assertEqual(len(self.requests), 1)
 
     def test_live_timing_preserves_tab_open_usage_details_and_partial_failure(self):
@@ -296,4 +308,4 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
             self.assertLessEqual(box["x"] + box["width"], 390)
         self.page.get_by_role("switch", name="使用缓存").focus()
         self.page.keyboard.press("Space")
-        expect(self.page.get_by_role("switch", name="使用缓存")).not_to_be_checked()
+        expect(self.page.get_by_role("switch", name="使用缓存")).to_be_checked()

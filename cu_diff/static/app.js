@@ -31,7 +31,7 @@
   const state = {
     ready: false, csrf: "", revision: 0, azure: false, graphicsEnabled: false, modelEnabled: false,
     semanticTextEnabled: false, generation: 0,
-    analysisSupported: false, analysisModels: [], analysisModel: "", useCache: true,
+    analysisSupported: false, analysisModels: [], analysisModel: "", useCache: false,
     activeAnalysisOptions: null, cuModel: "", configuredComparison: "", extractionProfile: "engineering",
     limits: { max_bytes: 20971520, max_pages: 20 }, result: null, selected: null,
     comparing: false, jobController: null, jobId: null, exporting: false, exportController: null, mutationQueue: Promise.resolve(),
@@ -406,7 +406,7 @@
     state.analysisModels = state.analysisSupported && Array.isArray(options.models)
       ? options.models.filter((m) => m && typeof m.id === "string" && m.id &&
         typeof m.label === "string" && m.label) : [];
-    state.useCache = !state.analysisSupported || options.use_cache !== false;
+    state.useCache = !state.azure || !state.analysisSupported || options.use_cache === true;
     state.analysisModel = state.analysisSupported && typeof options.model === "string" ? options.model : "";
     if (state.analysisModels.length && !state.analysisModels.some((m) => m.id === state.analysisModel)) {
       throw new Error("服务返回的默认分析模型不在可选列表中，未开始分析。");
@@ -438,9 +438,12 @@
     if (active && (active.model !== state.analysisModel || active.use_cache !== state.useCache)) {
       notes.push("设置仅用于下一次对比；当前结果和用量仍属于上一轮，不会随选项切换而改变。");
     }
-    if (state.analysisModel === "gpt-6-luna") notes.push(state.extractionProfile === "layout"
-      ? "Luna 负责语义对比，CU保持轻量OCR/布局提取；未核实的费用标为未知。"
-      : "Luna 仅用于模型对比，CU 提取仍使用原模型；未核实的费用会标为未知，不套用 Astra 单价。");
+    if (["gpt-6-luna", "gpt-6-sol"].includes(state.analysisModel)) {
+      const name = state.analysisModel === "gpt-6-sol" ? "Sol" : "Luna";
+      notes.push(state.extractionProfile === "layout"
+        ? `${name} 负责语义对比，CU保持轻量OCR/布局提取；未核实的费用标为未知。`
+        : `${name} 仅用于模型对比，CU 提取仍使用原模型；未核实的费用会标为未知，不套用 Astra 单价。`);
+    }
     const note = $("analysis-settings-note");
     note.textContent = notes.join(" ");
     note.hidden = !notes.length;
@@ -549,7 +552,7 @@
         state[side].document = data.documents?.[side] || null;
         renderDocument(side);
       }
-      status(state.azure ? "请上传原图和调整图；点击对比才会提交未缓存的文件。" : "只读缓存模式：允许预览和对比已有缓存；缓存未命中会明确报错，不上传 Azure。");
+      status(state.azure ? "请上传原图和调整图；点击对比才会按所选缓存设置分析，可能产生费用。" : "只读缓存模式：允许预览和对比已有缓存；缓存未命中会明确报错，不上传 Azure。");
       updateControls();
     } catch (err) {
       error(err.message);

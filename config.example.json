@@ -68,8 +68,14 @@
     "enabled": false,
     "deployment": null,
     "deployment_version": null,
-    "default_model": "gpt-6-astra",
+    "default_model": "gpt-6-sol",
     "models": [
+      {
+        "id": "gpt-6-sol",
+        "label": "GPT-6 Sol",
+        "deployment": "YOUR-EXISTING-SOL-DEPLOYMENT",
+        "deployment_version": "gpt-6-sol:RECORD-ACTUAL-VERSION:RECORD-ACTUAL-SKU"
+      },
       {
         "id": "gpt-6-astra",
         "label": "GPT-6 Astra",

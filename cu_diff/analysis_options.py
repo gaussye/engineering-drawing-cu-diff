@@ -47,11 +47,11 @@ class AnalysisOptions:
         self.default = default
 
     def bootstrap(self):
-        return {"use_cache": True, "model": self.default,
+        return {"use_cache": False, "model": self.default,
                 "models": [{"id": entry["id"], "label": entry["label"]}
                            for entry in self._models.values()]}
 
-    def snapshot(self, use_cache=True, model=None):
+    def snapshot(self, use_cache=False, model=None):
         if type(use_cache) is not bool:
             raise ValueError("use_cache必须为布尔值。")
         selected = self.default if model is None else model

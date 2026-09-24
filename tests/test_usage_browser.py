@@ -238,8 +238,10 @@ class UsageBrowserTests(unittest.TestCase):
             ["CU 分析费用", "CU 内部模型费用", "分析模型费用"])
         for width in (1600, 900, 390):
             self.page.set_viewport_size({"width": width, "height": 1050})
-            boxes = [self.page.locator(selector).bounding_box()
-                     for selector in ("#usage-current-cost", ".usage-components", ".usage-details-heading")]
+            boxes = self.page.evaluate("""selectors => selectors.map(selector => {
+                const {x, y, width, height} = document.querySelector(selector).getBoundingClientRect();
+                return {x, y, width, height};
+            })""", ["#usage-current-cost", ".usage-components", ".usage-details-heading"])
             self.assertLessEqual(boxes[0]["y"] + boxes[0]["height"], boxes[1]["y"])
             self.assertLessEqual(boxes[1]["y"] + boxes[1]["height"], boxes[2]["y"])
             for box in boxes:

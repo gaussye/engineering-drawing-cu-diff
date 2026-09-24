@@ -44,6 +44,8 @@ def config():
                  "deployment_version": "gpt-6-astra:2026-09-03:GlobalStandard"},
                 {"id": "gpt-6-luna", "label": "GPT-6 Luna", "deployment": "gpt-6-luna",
                  "deployment_version": "gpt-6-luna:2026-09-22:GlobalStandard"},
+                {"id": "gpt-6-sol", "label": "GPT-6 Sol", "deployment": "gpt-6-sol",
+                 "deployment_version": "gpt-6-sol:2026-09-22:GlobalStandard"},
             ],
         },
     }
@@ -121,7 +123,7 @@ class OptionTests(WorkspaceTest):
         original["pricing"] = json.loads(example.read_text(encoding="utf-8"))["pricing"]
         expected = copy.deepcopy(original)
         registry = AnalysisOptions(original)
-        for model in ("gpt-6-luna", "gpt-6-astra"):
+        for model in ("gpt-6-luna", "gpt-6-astra", "gpt-6-sol"):
             selected, _ = registry.snapshot(model=model)
             client = SyntheticClient(selected)
             cache = self.root / model
@@ -153,7 +155,7 @@ class OptionTests(WorkspaceTest):
         luna, public = registry.snapshot(False, "gpt-6-luna")
         self.assertEqual(public, {"use_cache": False, "model": "gpt-6-luna",
                                   "model_label": "GPT-6 Luna"})
-        self.assertTrue(astra_public["use_cache"])
+        self.assertFalse(astra_public["use_cache"])
         for key in ("completion_model", "model_deployments", "deployment_versions", "endpoint"):
             self.assertEqual(luna[key], original[key])
         self.assertEqual(luna["model_comparison"]["deployment"], "gpt-6-luna")
@@ -180,6 +182,21 @@ class OptionTests(WorkspaceTest):
             mutation(invalid)
             with self.assertRaises(ValueError):
                 AnalysisOptions(invalid)
+
+    def test_sol_default_routes_all_requests_without_changing_cu_configuration(self):
+        original = config()
+        original["model_comparison"]["default_model"] = "gpt-6-sol"
+        registry = AnalysisOptions(original)
+        selected, public = registry.snapshot()
+        self.assertEqual(public, {"use_cache": False, "model": "gpt-6-sol", "model_label": "GPT-6 Sol"})
+        self.assertEqual(registry.bootstrap()["model"], "gpt-6-sol")
+        self.assertFalse(registry.bootstrap()["use_cache"])
+        self.assertEqual(body(SyntheticClient(selected))["model"], "gpt-6-sol")
+        self.assertEqual(selected["model_comparison"]["deployment_version"], "gpt-6-sol:2026-09-22:GlobalStandard")
+        for key in ("completion_model", "model_deployments", "deployment_versions"):
+            self.assertEqual(selected[key], original[key])
+        example = json.loads((Path(__file__).resolve().parents[1] / "config.example.json").read_text(encoding="utf-8"))
+        self.assertEqual(AnalysisOptions(example).default, "gpt-6-sol")
 
     def test_legacy_astra_body_cache_and_cu_keys_remain_exactly_compatible(self):
         legacy = config()
@@ -381,22 +398,23 @@ class JobOptionTests(WorkspaceTest):
 
     def test_default_bootstrap_options_and_cache_reuse_then_model_switch(self):
         self.assertEqual(self.boot["analysis_options"], {
-            "use_cache": True, "model": "gpt-6-astra",
+            "use_cache": False, "model": "gpt-6-astra",
             "models": [{"id": "gpt-6-astra", "label": "GPT-6 Astra"},
-                       {"id": "gpt-6-luna", "label": "GPT-6 Luna"}]})
+                       {"id": "gpt-6-luna", "label": "GPT-6 Luna"},
+                       {"id": "gpt-6-sol", "label": "GPT-6 Sol"}]})
         self.assertEqual(self.boot["model"], "gpt-5.4")
         self.assertEqual(self.boot["model_comparison_deployment"], "gpt-6-astra")
-        first = self.run_job()
+        first = self.run_job(use_cache=True)
         count = len(SyntheticClient.calls)
         self.assertEqual(count, 5)  # Two full CU, one deduplicated crop, two direct requests.
-        second = self.run_job()
+        second = self.run_job(use_cache=True)
         self.assertEqual(len(SyntheticClient.calls), count)
         self.assertEqual(second["analysis_options"], first["analysis_options"])
         self.store.allow_azure = False
         self.run_job()
         self.assertEqual(len(SyntheticClient.calls), count)
         self.store.allow_azure = True
-        third = self.run_job(model="gpt-6-luna")
+        third = self.run_job(model="gpt-6-luna", use_cache=True)
         self.assertEqual(len(SyntheticClient.calls), count + 2)
         self.assertEqual(third["result"]["model_coverage"]["model"]["model"], "gpt-6-luna")
         self.assertEqual(third["analysis_options"], third["result"]["analysis_options"])
@@ -406,6 +424,15 @@ class JobOptionTests(WorkspaceTest):
         for instance in SyntheticClient.instances:
             self.assertEqual(instance.config["completion_model"], "gpt-5.4")
             self.assertNotIn("gpt-6-luna", instance.config["deployment_versions"])
+
+    def test_omitted_cache_option_reanalyzes_and_sol_can_be_selected(self):
+        first = self.run_job(model="gpt-6-sol")
+        self.assertFalse(first["analysis_options"]["use_cache"])
+        self.assertEqual(first["result"]["model_coverage"]["model"]["model"], "gpt-6-sol")
+        count = len(SyntheticClient.calls)
+        second = self.run_job(model="gpt-6-sol")
+        self.assertEqual(len(SyntheticClient.calls), count * 2)
+        self.assertFalse(second["analysis_options"]["use_cache"])
 
     def test_full_cu_requests_overlap_and_keep_per_side_usage_and_child_timing(self):
         rendezvous = threading.Barrier(2)
@@ -454,7 +481,7 @@ class JobOptionTests(WorkspaceTest):
         self.assertEqual(len(SyntheticClient.calls), 2)
 
     def test_cache_off_isolated_durable_namespace_preserves_shared_cache_and_guards(self):
-        self.run_job()
+        self.run_job(use_cache=True)
         shared = {p.relative_to(self.store.cache): p.read_bytes()
                   for p in self.store.cache.rglob("*") if p.is_file()}
         guard = self.store.cache / "model-comparison" / "synthetic.pending.json"
@@ -475,11 +502,11 @@ class JobOptionTests(WorkspaceTest):
         for path, content in shared.items():
             self.assertEqual((self.store.cache / path).read_bytes(), content)
         self.assertEqual(guard.read_text(encoding="utf-8"), '{"state":"pending"}')
-        self.run_job()
+        self.run_job(use_cache=True)
         self.assertEqual(len(SyntheticClient.calls), count)
 
     def test_cached_historical_service_durations_do_not_become_current_timing(self):
-        self.run_job()
+        self.run_job(use_cache=True)
         count = len(SyntheticClient.calls)
         for path in (self.store.cache / "model-comparison").glob("*.response.json"):
             saved = json.loads(path.read_text(encoding="utf-8"))
@@ -489,7 +516,7 @@ class JobOptionTests(WorkspaceTest):
             saved = json.loads(path.read_text(encoding="utf-8"))
             saved["elapsed_seconds"] = 987654.
             path.write_text(json.dumps(saved), encoding="utf-8")
-        job = self.run_job()
+        job = self.run_job(use_cache=True)
         self.assertEqual(len(SyntheticClient.calls), count)
         self.assertEqual(job["result"]["model_coverage"]["model"]["elapsed_seconds"], 987654.)
         self.assertLess(job["timing"]["total_seconds"], 100.)

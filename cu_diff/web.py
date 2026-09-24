@@ -32,6 +32,7 @@ MAX_PAGES = 20
 MAX_PAGE_PT = 14400
 SESSION_TTL = 24 * 3600
 MAX_SESSIONS = 16
+_DEFAULT_USE_CACHE = object()
 PDF_LOCK = threading.Lock()
 LOGGER = logging.getLogger(__name__)
 
@@ -239,7 +240,9 @@ class Store:
                 session.uploading = False
                 self.prune_files(session)
 
-    def start_job(self, session: Session, revision: int, *, use_cache=True, model=None) -> dict:
+    def start_job(self, session: Session, revision: int, *, use_cache=_DEFAULT_USE_CACHE, model=None) -> dict:
+        if use_cache is _DEFAULT_USE_CACHE:
+            use_cache = not self.allow_azure
         try:
             job_config, analysis_options = self.analysis_options.snapshot(use_cache, model)
         except ValueError as error:
@@ -560,7 +563,7 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
                         "session_ttl_hours": SESSION_TTL},
                 azure_enabled=allow_azure, model=config.get("completion_model"), graphics_enabled=True,
                 extraction_profile=store.extraction_profile,
-                analysis_options=store.analysis_options.bootstrap(),
+                analysis_options={**store.analysis_options.bootstrap(), "use_cache": not allow_azure},
                 model_comparison_enabled=store.model_options["enabled"],
                 semantic_text_pairing_enabled=store.model_options["enabled"] and store.model_options["text_pairing"],
                 model_comparison_deployment=(
@@ -620,7 +623,7 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
         if "model" in body and not isinstance(body["model"], str):
             raise WebError("model必须为服务端已批准的模型标识。")
         return jsonify(store.start_job(
-            g.review_session, body["revision"], use_cache=body.get("use_cache", True),
+            g.review_session, body["revision"], use_cache=body.get("use_cache", _DEFAULT_USE_CACHE),
             model=body.get("model"))), 202
 
     @app.get("/api/jobs/<identifier>")
