@@ -58,7 +58,18 @@ foreach ($id in @($SubscriptionId, $TenantId, $OperatorObjectId, $DeploymentId))
 
 function Invoke-Az([string[]]$Arguments) {
     # Never echo command arguments or raw errors: app settings may contain private data.
-    $result = & az @Arguments --only-show-errors --output json 2>$null
+    $command = (Get-Command az -ErrorAction Stop).Source
+    $prefix = @()
+    if ($IsWindows -and [IO.Path]::GetExtension($command) -eq '.cmd') {
+        # Avoid cmd.exe reinterpreting Graph filters and ARM query-string ampersands.
+        $cliPython = Join-Path (Split-Path (Split-Path $command -Parent) -Parent) 'python.exe'
+        if (-not (Test-Path -LiteralPath $cliPython)) {
+            throw 'Cannot locate Azure CLI Python runtime; refusing unsafe cmd.exe argument forwarding.'
+        }
+        $command = $cliPython
+        $prefix = @('-IBm', 'azure.cli')
+    }
+    $result = & $command @prefix @Arguments --only-show-errors --output json 2>$null
     if ($LASTEXITCODE -ne 0) {
         throw "Azure CLI operation failed ($($Arguments[0])). Inspect Azure activity logs; do not enable secret-bearing debug logs."
     }
@@ -234,6 +245,7 @@ try {
     }
 
     # No Azure writes occur before local validation and ownership preflight above.
+    Write-Host 'Preflight passed. Creating or reconciling dedicated hosting resources.'
     if (-not $groupExists) {
         $null = Invoke-Az @('group', 'create', '--subscription', "$SubscriptionId", '--name', $ResourceGroup,
             '--location', $Location, '--tags', "cuDeploymentOwner=$owner")
@@ -267,13 +279,20 @@ try {
     if ($hostname -notmatch '^[a-zA-Z0-9.-]+\.azurewebsites\.net$') { throw 'Unexpected Azure hostname.' }
     $origin = "https://$hostname"
     $redirect = "$origin/.auth/login/aad/callback"
+    Write-Host 'Configuring secretless Entra login and resource-scoped AI roles.'
     if (-not $registration) {
         $registration = Invoke-Json 'POST' 'https://graph.microsoft.com/v1.0/applications' @{
             displayName = $registrationName; notes = $owner; signInAudience = 'AzureADMyOrg'
-            web = @{ redirectUris = @($redirect); implicitGrantSettings = @{ enableIdTokenIssuance = $false; enableAccessTokenIssuance = $false } }
+            web = @{ redirectUris = @($redirect); implicitGrantSettings = @{ enableIdTokenIssuance = $true; enableAccessTokenIssuance = $false } }
         }
     } elseif (@($registration.web.redirectUris).Count -ne 1 -or $registration.web.redirectUris[0] -cne $redirect) {
         throw 'Existing registration callback differs; refusing to replace it.'
+    }
+    if (-not $registration.web.implicitGrantSettings.enableIdTokenIssuance) {
+        # Easy Auth requests code+id_token even with a federated client assertion.
+        $null = Invoke-Json 'PATCH' "https://graph.microsoft.com/v1.0/applications/$($registration.id)" @{
+            web = @{ redirectUris = @($redirect); implicitGrantSettings = @{ enableIdTokenIssuance = $true; enableAccessTokenIssuance = $false } }
+        }
     }
     $clientId = $registration.appId
     $servicePrincipals = @(Invoke-Az @('ad', 'sp', 'list', '--filter', "appId eq '$clientId'"))
@@ -364,10 +383,15 @@ try {
         throw 'EasyAuth verification failed; public access remains disabled.'
     }
     # SCM ZIP deployment needs network access. Authentication is already enforced.
+    Write-Host 'Authentication verified. Deploying source-only package and starting application.'
     $null = Invoke-Json 'PATCH' "$arm${siteId}?api-version=$webVersion" @{ properties = @{ publicNetworkAccess = 'Enabled' } }
     $null = Invoke-Az @('webapp', 'deploy', '--subscription', "$SubscriptionId", '--resource-group', $ResourceGroup,
         '--name', $AppName, '--src-path', $zip, '--type', 'zip', '--clean', 'true', '--restart', 'true',
-        '--timeout', '1800000')
+        '--timeout', '1800000', '--track-status', 'false')
+    # CLI Linux startup tracking can fail after a successful Oryx build. Verify
+    # actual HTTPS health and authentication instead of trusting that poller.
+    & $Python (Join-Path $PSScriptRoot 'verify_http.py') --origin $origin --tenant "$TenantId"
+    if ($LASTEXITCODE -ne 0) { throw 'Deployed endpoint verification failed.' }
     Write-Host "Deployment completed: $origin"
     Write-Host 'Verify approved and unapproved tenant users, anonymous redirects, and /api/health before sharing.'
     Write-Host 'Never scale beyond one instance. Jobs and review sessions are in memory.'

@@ -1,7 +1,7 @@
-# Dedicated Azure App Service deployment (not executed)
+# Dedicated Azure App Service deployment
 
-These tools **prepare** a deployment. No Azure resource has been provisioned or
-deployed by adding them. A dedicated paid B2 plan requires explicit approval.
+These tools prepare and execute a deployment. Adding the files alone does not
+create resources. A dedicated paid B2 plan requires explicit approval.
 Do not run the execution command until a subscription owner approves the recurring
 charge and the operator has reviewed the target IDs.
 
@@ -19,7 +19,8 @@ charge and the operator has reviewed the target IDs.
   create analyzers, configure default models, or mutate AI model deployments.
 - Entra EasyAuth requires the specified tenant and operator **object ID**.
   The only anonymous route is `/api/health`. All other unauthenticated requests
-  redirect to Entra login. Application authorization remains a second boundary.
+  redirect browsers to Entra login or return 401/403 to API clients.
+  Application authorization remains a second boundary.
 - The app's **system-assigned** identity receives only these two assignments,
   at the **AI account resource scope**, not the resource group/subscription:
   Content Understanding Reader (`379c52cb-64de-498c-8b5b-c6170d6c49d4`) and
@@ -27,6 +28,9 @@ charge and the operator has reviewed the target IDs.
 - A separate **user-assigned** identity, named `<AppName>-auth`, is attached only
   to this app and used only for secretless EasyAuth client assertions. Never attach
   it to another resource or give it AI roles.
+- EasyAuth's hybrid `code+id_token` login requires ID-token issuance enabled on
+  the registration even when using a federated client assertion. Implicit
+  access-token issuance remains disabled; no client secret is created.
 
 ## Prerequisites
 
@@ -189,12 +193,24 @@ cost and authorize eventual cleanup explicitly.
 
 ## Required post-deployment checks
 
-The tools have local tests and syntax validation, **not a live Azure validation**.
-Before sharing the endpoint, the approved operator must verify:
+Every target needs live validation. The script disables Azure CLI's Linux startup
+tracking (`--track-status false`), because that poller can fail after Oryx has
+successfully deployed and the app is healthy. It still requires the deployment
+command to succeed, then runs `verify_http.py` to check actual public health,
+anonymous access denial, and tenant-specific login initiation. Failed checks
+isolate the owned app; they are never treated as deployment success.
+
+For a separate non-billed HTTP check:
+
+```powershell
+python .\deploy\verify_http.py --origin https://<hostname> --tenant <tenant-guid>
+```
+
+Before sharing the endpoint, the approved operator must additionally verify:
 
 1. Deployment/Oryx succeeded, the startup process is healthy, and
    `https://<hostname>/api/health` returns the expected minimal health response.
-2. Anonymous access to `/` and protected API routes redirects to Entra; no
+2. Anonymous access to `/` and protected API routes redirects to Entra or returns 401/403; no
    drawings/results can be retrieved anonymously.
 3. The allowed user can sign in, while another user from the same tenant cannot
    access the app (403). A different tenant is rejected. Test a fresh browser
