@@ -84,11 +84,14 @@ def locations(entry: dict | None, pages: list[dict]) -> tuple[list[dict], str | 
 
 
 def web_result(comparison: dict, documents: dict, metadata: dict) -> dict:
+    profile = comparison.get("extraction_profile", comparison.get("coverage", {}).get(
+        "extraction_profile", "engineering"))
+    primary_text_channel = "ocr" if profile == "layout" else "schema"
     def side(entry, role):
         if entry is None:
             return None
         mapped, error = locations(entry, documents[role]["pages"])
-        return {key: entry.get(key) for key in ("raw_text", "detail", "confidence", "source")} | {
+        return {key: entry.get(key) for key in ("id", "raw_text", "detail", "confidence", "source")} | {
             "locations": mapped, "location_error": error,
         } | ({"schema_sources": entry["schema_sources"]} if "schema_sources" in entry else {})
 
@@ -169,16 +172,19 @@ def web_result(comparison: dict, documents: dict, metadata: dict) -> dict:
                             "；".join(dict.fromkeys(errors)) or "无法可靠定位变化词；仅导航完整原文，不画整行变化框")
             items.append(item)
     return {
+        "extraction_profile": profile, "primary_text_channel": primary_text_channel,
         "items": items, "coverage": comparison["coverage"], "warnings": comparison["warnings"],
         "metadata": {role: {key: data.get(key) for key in
                            ("cache_hit", "usage", "elapsed_this_run_seconds",
-                            "selected_completion_model", "document_sha256", "coordinate_basis")}
-                     for role, data in metadata.items()},
+                            "selected_completion_model", "document_sha256", "coordinate_basis",
+                            "extraction_profile")}
+                     for role, data in metadata.items()} | {
+                         "extraction_profile": profile, "primary_text_channel": primary_text_channel},
         "documents": documents,
         "limitations": [
             "差异是提取证据候选，不是已签核工程变更；未配对不确认新增或删除。",
             "只绘制CU返回且与页面尺寸一致的证据框；没有来源时不推测另一侧位置。",
             "纯图形、细小认证图标和全部几何变化未保证覆盖，请结合原图人工复核。",
             "解释文字不同不计为原文变更；提取置信度与匹配分数都不是准确率。",
-        ],
+        ] + list(comparison.get("coverage", {}).get("notices", [])),
     }

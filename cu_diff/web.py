@@ -22,6 +22,7 @@ from .analysis_options import AnalysisOptions
 from .client import CacheMiss, Client, CUError, digest, save_json
 from .compare import compare_responses
 from .parallel import cu_workers, parallel_cu_enabled, run_cu_pair
+from .schema import extraction_profile
 from .timing import JobTiming, STAGES
 from .web_evidence import response_geometry_matches, web_result
 
@@ -76,6 +77,10 @@ class Store:
         self.analysis_options = AnalysisOptions(config)
         default_config, _ = self.analysis_options.snapshot()
         self.model_options = options(default_config)
+        self.extraction_profile = extraction_profile(default_config)
+        if self.extraction_profile == "layout" and not (
+                self.model_options["enabled"] and self.model_options["text_pairing"]):
+            raise ValueError("轻量CU模式需要启用model_comparison.enabled和text_pairing，由模型判断语义差异。")
         self.pricing = validate_pricing(config.get("pricing"))
         cu_workers(config)
         self.config, self.root, self.cache = config, root.resolve(), cache.resolve()
@@ -283,6 +288,7 @@ class Store:
             job_config = job.pop("_config")
         from .model_compare import options
         model_options = options(job_config)
+        profile = extraction_profile(job_config)
         use_cache = job["analysis_options"]["use_cache"]
         # OFF isolates all persistent results/guards, but deduplicates within this job.
         cache = self.cache if use_cache else self.cache / "uncached-jobs" / identifier
@@ -361,7 +367,8 @@ class Store:
             stage("semantic_text_pairing", "配对BOM、字段和OCR证据")
             text_pairing = model_options["enabled"] and model_options["text_pairing"]
             comparison = compare_responses(
-                responses["old"], responses["new"], semantic_pairing=text_pairing)
+                responses["old"], responses["new"], semantic_pairing=text_pairing,
+                **({"extraction_profile": profile} if profile == "layout" else {}))
             if text_pairing:
                 from .semantic_text import resolve_text_pairing
 
@@ -374,7 +381,8 @@ class Store:
             with PDF_LOCK:
                 tabular = compare_document_tables(
                     documents["old"].analysis_path, documents["new"].analysis_path,
-                    responses["old"], responses["new"])
+                    responses["old"], responses["new"],
+                    **({"include_bom": True} if profile == "layout" else {}))
             stage("local_graphics_comparison", "核对本地图形")
             from .graphics import compare_graphics
             graphical = compare_graphics(
@@ -434,6 +442,7 @@ class Store:
                         "status": job["status"], "error": job.get("error"),
                         "revision": job["revision"],
                         "analysis_options": job["analysis_options"],
+                        "extraction_profile": profile,
                         "timing": job["timing"],
                         "cache_namespace": str(cache),
                         "events": client.events if client else [],
@@ -550,6 +559,7 @@ def create_app(config: dict, data_dir: Path, cache_dir: Path, *, port: int = 876
                 limits={"max_bytes": MAX_BYTES, "max_pages": MAX_PAGES,
                         "session_ttl_hours": SESSION_TTL},
                 azure_enabled=allow_azure, model=config.get("completion_model"), graphics_enabled=True,
+                extraction_profile=store.extraction_profile,
                 analysis_options=store.analysis_options.bootstrap(),
                 model_comparison_enabled=store.model_options["enabled"],
                 semantic_text_pairing_enabled=store.model_options["enabled"] and store.model_options["text_pairing"],

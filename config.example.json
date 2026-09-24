@@ -1,6 +1,7 @@
 {
   "endpoint": "https://YOUR-RESOURCE.services.ai.azure.com",
   "api_version": "2025-11-01",
+  "extraction_profile": "layout",
   "completion_model": "gpt-5.4",
   "model_deployments": {
     "gpt-5.4": "YOUR-EXISTING-GPT54-DEPLOYMENT",

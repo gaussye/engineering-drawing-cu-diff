@@ -267,6 +267,28 @@ def _references(record, catalogs, limit):
     return selected
 
 
+def _source_schema(schema, catalogs):
+    """Constrain layout-mode generation to the actual evidence IDs on each side."""
+    from copy import deepcopy
+    result = deepcopy(schema)
+
+    def visit(node):
+        if not isinstance(node, dict):
+            return
+        properties = node.get("properties", {})
+        for side in SIDES:
+            key = f"{side}_ids"
+            if key in properties:
+                properties[key] = {"type": "array", "items": {
+                    "type": "string", "enum": list(catalogs[side])}}
+        for value in properties.values():
+            visit(value)
+        visit(node.get("items"))
+
+    visit(result)
+    return result
+
+
 def _combine(entries):
     if not entries:
         return None
@@ -418,7 +440,9 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
     stage_progress = stage_progress or (lambda identifier: None)
     step_progress = step_progress or (lambda identifier, status: None)
     from .parallel import cu_workers, run_cu_pair
+    from .schema import extraction_profile
     cu_workers(client.config)
+    layout = extraction_profile(client.config) == "layout"
     catalogs, coverage, images, full_words, mask_coverage = {}, {}, [], {}, {}
     stage_progress("model_coarse")
     progress("模型语义配对：准备全页图像与CU来源目录")
@@ -442,14 +466,25 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
                **{side: _public_catalog(catalogs[side]) for side in SIDES}}
     client.usage_context = {"stage": "model_coarse"}
     coarse, coarse_meta = complete_json(
-        client, cache, _body(client, opts, COARSE_PROMPT, payload, images), allow_submit=allow_submit)
+        client, cache, _body(client, opts, COARSE_PROMPT, payload, images,
+                            schema=_source_schema(COARSE_SCHEMA, catalogs) if layout else None),
+        allow_submit=allow_submit)
     _json_shape(coarse, COARSE_SCHEMA)
     if len(coarse["pairs"]) > 40:
         raise CUError("Model exceeded maximum region pairs")
-    seen, pairs, owners = {side: set() for side in SIDES}, [], {}
+    seen, pairs, owners, rejected_groups = {side: set() for side in SIDES}, [], {}, {}
     for pair in coarse["pairs"]:
         selected = _references(pair, catalogs, 40)
-        _focus_for_review(pair, selected)
+        outside = {side: sorted({identifier for observation in pair["observations"]
+                                for identifier in observation[f"{side}_ids"]
+                                if identifier not in pair[f"{side}_ids"]})
+                   for side in SIDES}
+        if layout and any(outside.values()):
+            # Validate all references before retaining an unsafe grouping for review.
+            _focus_for_review(pair, {side: list(catalogs[side].values()) for side in SIDES})
+            rejected_groups[len(pairs)] = outside
+        else:
+            _focus_for_review(pair, selected)
         for side in SIDES:
             ids = set(pair[f"{side}_ids"])
             for identifier in ids:
@@ -463,7 +498,16 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
     conflict_pairs = {index for indices in conflicts.values() for index in indices}
     candidates = []
     for index, (pair, selected) in enumerate(pairs):
-        if index in conflict_pairs:
+        if index in rejected_groups:
+            reason = "模型观察引用了该配对范围之外的CU来源；保留待核记录，不自动补配、裁剪或绘制差异框。"
+            record = _record({**pair, "observations": []}, selected, stage="coarse",
+                             issues=[reason], suppress_highlights=True)
+            record["model_comparison"].update(
+                observations=pair["observations"], rejected_source_ids=rejected_groups[index],
+                highlight_scope="none_invalid_observation_group")
+            items.append(record)
+            warnings.append(f"{pair['label']}：{reason}")
+        elif index in conflict_pairs:
             items.append(_record(pair, selected, stage="coarse",
                                  issues=["模型将同一来源分配到多个对应区域；存在配对冲突，未进入局部确认。"],
                                  suppress_highlights=True))
@@ -527,7 +571,9 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
         progress(f"局部复读 {used}/{opts['max_regions']}：模型核对词级来源")
         client.usage_context = {"stage": "model_fine", "region_index": used}
         fine, fine_meta = complete_json(
-            client, cache, _body(client, opts, FINE_PROMPT, fine_payload, crop_images), allow_submit=allow_submit)
+            client, cache, _body(client, opts, FINE_PROMPT, fine_payload, crop_images,
+                                schema=_source_schema(FINE_SCHEMA, word_catalogs) if layout else None),
+            allow_submit=allow_submit)
         _json_shape(fine, FINE_SCHEMA)
         if (len(fine["changes"]) > 30
                 or (fine["assessment"] == "unchanged" and fine["changes"])
@@ -589,7 +635,7 @@ def compare_with_model(old_pdf, new_pdf, old_response, new_response, *, client, 
         from . import model_visual
 
         visual_candidates = [(pair, selected) for index, (pair, selected) in enumerate(pairs)
-                             if index not in conflict_pairs and any(
+                             if index not in conflict_pairs and index not in rejected_groups and any(
                                  o["kind"] == "visual_change" for o in pair.get("observations", []))]
         # The model's assessment and source correspondence select the route; no object-name rules.
         visual_candidates.sort(key=lambda value: (

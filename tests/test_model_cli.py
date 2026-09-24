@@ -41,6 +41,15 @@ class ModelCliTests(TablesCliTests):
         self.assertIn("不等于已证明无变化", report)
         self.assertIn("Synthetic incomplete coverage.", report)
 
+    def test_extraction_profile_mismatch_is_rejected_before_model_client_creation(self):
+        self.args.config.write_text(json.dumps({
+            "extraction_profile": "layout", "model_comparison": {"enabled": True},
+        }), encoding="utf-8")
+        with patch("cu_diff.cli.Client") as client:
+            with self.assertRaisesRegex(ValueError, "extraction profile"):
+                model_compare(self.args)
+            client.assert_not_called()
+
     def test_model_failure_preserves_audit_not_success_report(self):
         with patch("cu_diff.cli.Client", return_value=self.client), patch(
                 "cu_diff.model_compare.compare_with_model", side_effect=CUError("Synthetic failure")):

@@ -19,7 +19,7 @@ class DocumentTableTests(unittest.TestCase):
 
     def drawing(self, name, headers=None, rows=None, origin=(30, 40),
                 bottom=False, duplicate=False, incomplete=False, partial=False,
-                filled=False, shared_border=False, row_height=24):
+                filled=False, shared_border=False, row_height=24, shared_top=False):
         headers = headers or ["Customer P/N", "Supplier P/N", "L", "Barcode Tag"]
         rows = rows if rows is not None else [["TEST-A", "PART-X", "100", "Yes"]]
         doc = pymupdf.open()
@@ -42,7 +42,8 @@ class DocumentTableTests(unittest.TestCase):
                     page.draw_rect((xs[0], y - .2, xs[-1], y + .2),
                                    color=None, fill=(0, 0, 0))
                 else:
-                    page.draw_line((xs[0], y), (xs[-1], y), width=.5)
+                    page.draw_line((xs[0] - 20 if shared_top and y == ys[0] else xs[0], y),
+                                   (xs[-1], y), width=.5)
             if shared_border:
                 page.draw_line((xs[0], ys[-1]), (xs[-1] + 80, ys[-1]), width=.5)
                 page.draw_line((xs[-1] - .54, ys[0] + 5),
@@ -383,6 +384,219 @@ class DocumentTableTests(unittest.TestCase):
         result = self.compare(old, new)
         self.assertEqual(result["items"], [])
         self.assertTrue(any("duplicate overlapping words" in warning for warning in result["warnings"]))
+
+    def bom(self, name, rows=None, headers=None, **kwargs):
+        headers = headers or ["No", "BOM ITEM", "Q' TY", "P/N", "MATERIAL"]
+        rows = rows if rows is not None else [["1", "CONNECTOR", "1", "PART-A", "BRASS"]]
+        path, operation = self.drawing(name, headers=headers, rows=rows, **kwargs)
+        content = operation["result"]["contents"][0]
+        matrix = rows + [headers] if kwargs.get("bottom") else [headers] + rows
+        x, y = kwargs.get("origin", (30, 40))
+        height = kwargs.get("row_height", 24)
+        content["tables"] = [{
+            "rowCount": len(matrix), "columnCount": len(headers),
+            "cells": [{"rowIndex": ri, "columnIndex": ci,
+                       "kind": "columnHeader" if row is headers else "content",
+                       "content": text,
+                       "source": f"D(1,{(x + ci * 115) / 72},{(y + ri * height) / 72},{115 / 72},{height / 72})"}
+                      for ri, row in enumerate(matrix) for ci, text in enumerate(row)],
+        }]
+        content["markdown"] = "<table>" + "".join(
+            "<tr>" + "".join(f"<td>{text}</td>" for text in row) + "</tr>" for row in matrix) + "</table>"
+        self.assertNotIn("fields", content)
+        return path, operation
+
+    def compare_bom(self, old, new):
+        return compare_document_tables(old[0], new[0], old[1], new[1], include_bom=True)
+
+    def test_layout_bom_is_opt_in_and_legacy_exclusion_is_reported(self):
+        old = self.bom("old")
+        new = self.bom("new", rows=[["1", "CONNECTOR", "2", "PART-A", "BRASS"]])
+        legacy = self.compare(old, new)
+        self.assertEqual(legacy["items"], [])
+        self.assertFalse(legacy["coverage"]["bom"]["enabled"])
+        self.assertEqual(legacy["coverage"]["bom"]["old_excluded"], 1)
+        self.assertEqual(legacy["coverage"]["scope"], "non_bom_complete_vector_grids")
+        layout = self.compare_bom(old, new)
+        self.assertEqual(layout["coverage"]["bom"]["old_included"], 1)
+        self.assertEqual(layout["coverage"]["bom"]["new_included"], 1)
+        self.assertEqual(layout["coverage"]["bom"]["old_excluded"], 0)
+        self.assertEqual(layout["coverage"]["scope"], "all_complete_vector_grids")
+        record, = layout["items"]
+        self.assertEqual(record["key"], "Q' TY")
+
+    def test_layout_bom_quantity_change_only_highlights_real_changed_cell(self):
+        old = self.bom("old")
+        new = self.bom("new", rows=[["1", "CONNECTOR", "2", "PART-A", "BRASS"]])
+        snapshot = deepcopy((old[1], new[1]))
+        record, = self.compare_bom(old, new)["items"]
+        self.assertEqual(record["change"], "table_cell_modified")
+        self.assertEqual(record["table_comparison"]["table_kind"], "bom")
+        self.assertEqual(record["old"]["raw_text"], "1")
+        self.assertEqual(record["new"]["raw_text"], "2")
+        for side in ("old", "new"):
+            self.assertEqual(len(record[side]["locations"]), 1)
+            self.assertGreater(record[side]["locations"][0]["x"], 260 / 720)
+            self.assertLess(record[side]["locations"][0]["x"] + record[side]["locations"][0]["width"], 375 / 720)
+        self.assertEqual((old[1], new[1]), snapshot)
+
+    def test_layout_bom_part_number_change_uses_unchanged_description_identity(self):
+        record, = self.compare_bom(self.bom("old"), self.bom(
+            "new", rows=[["1", "CONNECTOR", "1", "PART-B", "BRASS"]]))["items"]
+        self.assertEqual(record["key"], "P/N")
+        self.assertEqual((record["old"]["raw_text"], record["new"]["raw_text"]), ("PART-A", "PART-B"))
+
+    def test_layout_bom_same_ordinal_does_not_pair_unrelated_replacement(self):
+        result = self.compare_bom(self.bom("old"), self.bom(
+            "new", rows=[["1", "HOUSING", "1", "PART-B", "BRASS"]]))
+        self.assertEqual(result["items"], [])
+        self.assertTrue(any("ambiguous/unmatched BOM" in w for w in result["warnings"]))
+
+    def test_layout_bom_added_and_removed_rows_have_null_missing_side(self):
+        old = self.bom("old")
+        new = self.bom("new", rows=[["1", "CONNECTOR", "1", "PART-A", "BRASS"],
+                                    ["2", "HOUSING", "3", "PART-B", "PLASTIC"]])
+        for before, after, change, missing in ((old, new, "table_row_added", "old"),
+                                               (new, old, "table_row_removed", "new")):
+            result = self.compare_bom(before, after)
+            record, = [item for item in result["items"] if item["change"] == change]
+            self.assertIsNone(record[missing])
+            self.assertTrue(record["table_context"][missing]["locations"])
+            self.assertEqual(record["table_comparison"]["scope"], "observed_row_presence")
+            self.assertIn("PART-B", record["new" if missing == "old" else "old"]["raw_text"])
+            self.assertEqual([i["change"] for i in result["items"]], ["table_grid_changed", change])
+
+    def test_layout_bom_missing_ocr_does_not_prove_row_added(self):
+        old = self.bom("old")
+        new = self.bom("new", rows=[["1", "CONNECTOR", "1", "PART-A", "BRASS"],
+                                    ["2", "HOUSING", "3", "PART-B", "PLASTIC"]])
+        words = new[1]["result"]["contents"][0]["pages"][0]["words"]
+        words[:] = [word for word in words if word["content"] != "PART-B"]
+        result = self.compare_bom(old, new)
+        self.assertFalse(any(i["change"] in ("table_row_added", "table_row_removed") for i in result["items"]))
+        self.assertTrue(any("incomplete OCR" in warning for warning in result["warnings"]))
+
+    def test_layout_bom_blank_cell_addition_and_removal_have_source_blank_context(self):
+        old = self.bom("old", rows=[["1", "CONNECTOR", "1", "", "BRASS"]])
+        new = self.bom("new")
+        for before, after, change, missing in ((old, new, "table_cell_added", "old"),
+                                               (new, old, "table_cell_removed", "new")):
+            record, = self.compare_bom(before, after)["items"]
+            self.assertEqual(record["change"], change)
+            self.assertIsNone(record[missing])
+            self.assertTrue(record["table_context"][missing]["locations"])
+            context = record["table_comparison"]["blank_counterpart_context"]
+            self.assertEqual(context["side"], missing)
+            self.assertTrue(context["locations"])
+
+    def test_layout_bom_missing_word_is_not_a_blank_cell(self):
+        old, new = self.bom("old"), self.bom("new")
+        words = old[1]["result"]["contents"][0]["pages"][0]["words"]
+        words[:] = [word for word in words if word["content"] != "PART-A"]
+        result = self.compare_bom(old, new)
+        self.assertEqual(result["items"], [])
+        self.assertTrue(any("cell unresolved" in warning for warning in result["warnings"]))
+
+    def test_layout_bom_duplicate_identities_remain_ambiguous(self):
+        rows = [["1", "CONNECTOR", "1", "PART-A", "BRASS"],
+                ["2", "CONNECTOR", "1", "PART-A", "BRASS"]]
+        new_rows = deepcopy(rows)
+        new_rows[1][2] = "2"
+        result = self.compare_bom(self.bom("old", rows=rows), self.bom("new", rows=new_rows))
+        self.assertEqual(result["items"], [])
+        self.assertTrue(any("ambiguous/unmatched BOM" in w for w in result["warnings"]))
+
+    def test_layout_bom_reordered_columns_and_bottom_headers(self):
+        old = self.bom("old", bottom=True)
+        new = self.bom("new", bottom=True, headers=["P/N", "MATERIAL", "No", "Q' TY", "BOM ITEM"],
+                       rows=[["PART-A", "BRASS", "1", "2", "CONNECTOR"]], origin=(70, 150))
+        record, = self.compare_bom(old, new)["items"]
+        self.assertEqual(record["key"], "Q' TY")
+        self.assertEqual(record["old"]["raw_text"], "1")
+        self.assertEqual(record["new"]["raw_text"], "2")
+
+    def test_layout_bom_two_column_quantity_table_without_generated_fields(self):
+        old = self.bom("old", headers=["Description", "Quantity"], rows=[["CONNECTOR", "1"]])
+        new = self.bom("new", headers=["Description", "Quantity"], rows=[["CONNECTOR", "2"]])
+        record, = self.compare_bom(old, new)["items"]
+        self.assertEqual(record["key"], "Quantity")
+
+    def test_layout_bom_duplicate_tables_never_pair_by_location(self):
+        result = self.compare_bom(self.bom("old", duplicate=True), self.bom(
+            "new", rows=[["1", "CONNECTOR", "2", "PART-A", "BRASS"]]))
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["coverage"]["paired_tables"], 0)
+
+    def test_layout_bom_low_confidence_quantity_is_unresolved(self):
+        old, new = self.bom("old"), self.bom("new", rows=[["1", "CONNECTOR", "2", "PART-A", "BRASS"]])
+        for word in new[1]["result"]["contents"][0]["pages"][0]["words"]:
+            if word["content"] == "2":
+                word["confidence"] = .3
+        result = self.compare_bom(old, new)
+        self.assertEqual(result["items"], [])
+        self.assertTrue(any("low-confidence/illegible BOM" in warning for warning in result["warnings"]))
+
+    def test_layout_opt_in_preserves_non_bom_results(self):
+        old = self.drawing("old")
+        new = self.drawing("new", rows=[["TEST-B", "PART-X", "100", "Yes"]])
+        self.assertEqual(self.compare(old, new)["items"], self.compare_bom(old, new)["items"])
+
+    def test_layout_bom_header_on_shared_page_border_requires_actual_column_support(self):
+        old = self.bom("old", shared_top=True)
+        new = self.bom("new", shared_top=True, rows=[["1", "CONNECTOR", "2", "PART-A", "BRASS"]])
+        record, = self.compare_bom(old, new)["items"]
+        self.assertEqual(record["key"], "Q' TY")
+        self.assertEqual(record["table_comparison"]["old_grid"]["rows_including_header"], 2)
+
+    def test_layout_bom_blank_drawn_row_filling_is_not_a_grid_addition(self):
+        old = self.bom("old", rows=[["1", "CONNECTOR", "1", "PART-A", "BRASS"], ["", "", "", "", ""]])
+        new = self.bom("new", rows=[["1", "CONNECTOR", "1", "PART-A", "BRASS"],
+                                    ["2", "HOUSING", "2", "PART-B", "PLASTIC"]])
+        record, = self.compare_bom(old, new)["items"]
+        self.assertEqual(record["change"], "table_row_added")
+        self.assertEqual(record["table_comparison"]["old_grid"]["blank_rows_verified"], 1)
+        self.assertEqual(record["table_comparison"]["old_grid"]["rows_including_header"],
+                         record["table_comparison"]["new_grid"]["rows_including_header"])
+
+    def test_layout_bom_conflicting_part_and_description_anchors_are_not_guessed(self):
+        old = self.bom("old", rows=[["1", "CONNECTOR", "1", "PART-A", "BRASS"],
+                                    ["2", "HOUSING", "1", "PART-B", "PLASTIC"]])
+        new = self.bom("new", rows=[["1", "CONNECTOR", "2", "PART-B", "BRASS"],
+                                    ["2", "HOUSING", "1", "PART-A", "PLASTIC"]])
+        result = self.compare_bom(old, new)
+        self.assertEqual(result["items"], [])
+        self.assertTrue(any("ambiguous/unmatched BOM" in w for w in result["warnings"]))
+
+    def test_layout_bom_reordered_rows_match_identity_not_position(self):
+        old = self.bom("old", rows=[["1", "CONNECTOR", "1", "PART-A", "BRASS"],
+                                    ["2", "HOUSING", "1", "PART-B", "PLASTIC"]])
+        new = self.bom("new", rows=[["2", "HOUSING", "2", "PART-B", "PLASTIC"],
+                                    ["1", "CONNECTOR", "1", "PART-A", "BRASS"]])
+        record, = self.compare_bom(old, new)["items"]
+        self.assertEqual(record["key"], "Q' TY")
+        self.assertLess(record["new"]["locations"][0]["y"], record["old"]["locations"][0]["y"])
+
+    def test_layout_bom_column_presence_is_distinct_from_missing_cell_text(self):
+        old = self.bom("old")
+        new = self.bom("new", headers=["No", "BOM ITEM", "P/N", "MATERIAL"],
+                       rows=[["1", "CONNECTOR", "PART-A", "BRASS"]])
+        for before, after, change, missing in ((old, new, "table_column_removed", "new"),
+                                               (new, old, "table_column_added", "old")):
+            record, = self.compare_bom(before, after)["items"]
+            self.assertEqual(record["change"], change)
+            self.assertEqual(record["key"], "Q' TY")
+            self.assertIsNone(record[missing])
+            self.assertEqual(record["table_comparison"]["scope"], "column_presence_only")
+
+    def test_layout_bom_cu_html_counts_cannot_fabricate_source_rows(self):
+        old, new = self.bom("old"), self.bom("new")
+        content = new[1]["result"]["contents"][0]
+        content["tables"][0]["rowCount"] = 20
+        content["tables"][0]["columnCount"] = 10
+        content["markdown"] += "<table><tr><td>UNSUPPORTED ROW</td></tr></table>"
+        result = self.compare_bom(old, new)
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["coverage"]["new_tables"][0]["grid"]["rows_including_header"], 2)
 
 
 if __name__ == "__main__":

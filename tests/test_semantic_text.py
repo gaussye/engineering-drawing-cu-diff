@@ -612,6 +612,19 @@ class SemanticTextTests(unittest.TestCase):
         self.run_pairing()
         self.assertNotEqual(first, self.calls[-1][0])
 
+    def test_engineering_profile_metadata_preserves_legacy_request_body(self):
+        comparison = compare_documents(self.responses["old"], self.responses["new"])
+        legacy = copy.deepcopy(comparison)
+        for key in ("extraction_profile", "primary_text_channel"):
+            legacy.pop(key)
+            legacy["coverage"].pop(key)
+        legacy["coverage"].pop("schema_domain_fields")
+        legacy["coverage"].pop("notices")
+        self.run_pairing(legacy)
+        legacy_body = copy.deepcopy(self.calls[-1][0])
+        self.run_pairing(comparison)
+        self.assertEqual(legacy_body, self.calls[-1][0])
+
     def test_disabled_no_candidates_and_one_sided_never_request(self):
         for settings in ({}, {"enabled": True}, {"enabled": False, "text_pairing": True}):
             self.client.config["model_comparison"] = settings

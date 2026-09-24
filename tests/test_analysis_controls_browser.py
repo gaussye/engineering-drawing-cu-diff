@@ -32,6 +32,7 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
 
     def setUp(self):
         self.azure = True
+        self.profile = "engineering"
         self.options = {"use_cache": True, "model": "gpt-6-astra", "models": [
             {"id": "gpt-6-astra", "label": "GPT-6 Astra"},
             {"id": "gpt-6-luna", "label": "GPT-6 Luna"},
@@ -54,6 +55,7 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
                 "model_comparison_enabled": True, "semantic_text_pairing_enabled": True,
                 "graphics_enabled": True, "documents": self.documents,
                 "analysis_options": self.options,
+                "extraction_profile": self.profile,
                 "limits": {"max_bytes": 20971520, "max_pages": 20, "session_ttl_hours": 24},
             })
         elif url.netloc == "graphics-ui.test" and url.path == "/api/compare":
@@ -91,6 +93,58 @@ class AnalysisControlsBrowserTests(unittest.TestCase):
         self.compare()
         self.assertEqual(self.requests, [{"revision": 2, "use_cache": True, "model": "gpt-6-luna"}])
         expect(self.page.locator("#model-tag")).to_contain_text("CU：gpt-5.4 · 模型对比：GPT-6 Luna")
+
+    def test_layout_profile_shows_ocr_as_primary_without_relabeling_as_schema(self):
+        self.context.close()
+        self.profile = "layout"
+        self.result.update(extraction_profile="layout", primary_text_channel="ocr")
+        self.open_context()
+        expect(self.page.locator("#model-tag")).to_contain_text("CU：轻量OCR/布局")
+        expect(self.page.locator('#channel-filter option[value="primary"]')).to_contain_text("OCR")
+        self.compare()
+        expect(self.page.locator('.result-item[data-id="D002"]')).to_be_visible()
+        self.page.locator("#channel-filter").select_option("schema")
+        expect(self.page.locator('.result-item[data-id="D002"]')).to_have_count(0)
+        self.page.locator("#channel-filter").select_option("ocr")
+        expect(self.page.locator('.result-item[data-id="D002"]')).to_be_visible()
+        self.page.locator("#analysis-model").select_option("gpt-6-luna")
+        expect(self.page.locator("#analysis-settings-note")).to_contain_text("轻量OCR/布局")
+
+    def test_layout_profile_rejects_legacy_or_missing_primary_channel_result(self):
+        self.context.close()
+        self.profile = "layout"
+        self.open_context()
+        self.page.locator("#compare-button").click()
+        expect(self.page.locator("#error-message")).to_contain_text("CU提取模式")
+        expect(self.page.locator(".result-item")).to_have_count(0)
+        self.result["extraction_profile"] = "layout"
+        self.page.locator("#compare-button").click()
+        expect(self.page.locator("#error-message")).to_contain_text("CU提取模式")
+        expect(self.page.locator(".result-item")).to_have_count(0)
+
+    def test_layout_bom_cell_and_row_presence_is_visible_without_counterpart_frames(self):
+        self.context.close()
+        self.profile = "layout"
+        self.result.update(extraction_profile="layout", primary_text_channel="ocr")
+        self.open_context()
+        for change, present, absent in (
+            ("table_row_added", "new", "old"), ("table_row_removed", "old", "new"),
+            ("table_cell_added", "new", "old"), ("table_cell_removed", "old", "new"),
+        ):
+            with self.subTest(change=change):
+                item = {"id": "T900", "channel": "tables", "region": "BOM", "key": "Synthetic BOM",
+                        "change": change, "old": None, "new": None, "review_required": True,
+                        "review_reasons": ["Synthetic source coverage"], "match": {"certainty": "high"},
+                        "table_comparison": {"status": "complete"},
+                        "table_context": {s: graphics.source([graphics.location(2)]) for s in ("old", "new")}}
+                item[present] = graphics.source([graphics.location(2, .2, .3, .1, .05)], raw_text="TEST-01")
+                self.result["items"] = [item]
+                self.compare()
+                self.page.locator('.result-item[data-id="T900"] button').click()
+                expect(self.page.locator(f'#{present}-stage rect[data-id="T900"]')).to_have_class("evidence-box selected")
+                expect(self.page.locator(f'#{absent}-stage rect[data-id="T900"]')).to_have_count(0)
+                expect(self.page.locator(f"#{absent}-page")).to_have_value("2")
+                expect(self.page.locator(f"#{absent}-evidence-note")).to_contain_text("仅导航")
 
     def test_cache_off_is_explicit_and_controls_lock_during_analysis(self):
         self.page.get_by_role("switch", name="使用缓存").uncheck()

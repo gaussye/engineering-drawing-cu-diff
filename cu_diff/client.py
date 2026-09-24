@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .schema import definition
+from .schema import definition, extraction_profile, layout_diagnostics
 
 
 def digest(value: bytes) -> str:
@@ -53,6 +53,7 @@ class Client:
     supports_parallel_cu = True
 
     def __init__(self, config: dict):
+        self.extraction_profile = extraction_profile(config)
         self.config = config
         self.endpoint = config["endpoint"].rstrip("/")
         parsed = urllib.parse.urlsplit(self.endpoint)
@@ -65,7 +66,7 @@ class Client:
             raise ValueError("Only public Azure AI resource endpoints are accepted")
         self.api_version = config.get("api_version", "2025-11-01")
         self.timeout = config.get("timeout_seconds", 1800)
-        if not config.get("deployment_versions"):
+        if self.extraction_profile == "engineering" and not config.get("deployment_versions"):
             raise ValueError("Record actual deployment model versions/SKUs for cache provenance")
         self.events: list[dict] = []
         self.usage_records: list[dict] = []
@@ -169,18 +170,21 @@ class Client:
         raise CUError("Azure CU polling timed out; rerun to resume the saved operation, not rebill")
 
     def ensure_analyzer(self, *, allow_create: bool = True) -> tuple[str, dict]:
-        base, _ = self.request("GET", self.url("analyzers/prebuilt-document"))
-        supported = base.get("supportedModels", {}).get("completion", [])
-        if self.config["completion_model"] not in supported:
-            raise CUError(
-                f"Requested model {self.config['completion_model']} is not supported by "
-                f"CU prebuilt-document on this resource. Supported: {', '.join(supported)}. "
-                "No model substitution or resource changes performed."
-            )
+        profile = extraction_profile(self.config)
+        if profile == "engineering":
+            base, _ = self.request("GET", self.url("analyzers/prebuilt-document"))
+            supported = base.get("supportedModels", {}).get("completion", [])
+            if self.config["completion_model"] not in supported:
+                raise CUError(
+                    f"Requested model {self.config['completion_model']} is not supported by "
+                    f"CU prebuilt-document on this resource. Supported: {', '.join(supported)}. "
+                    "No model substitution or resource changes performed."
+                )
         # CU validates defaults at creation, before request-level overrides exist.
         # The built-in alias lets each analyze request select its approved deployment.
-        spec = definition("prebuilt-analyzer-completion")
-        analyzer_id = "engineering.evidence." + digest(canonical(spec))[:16]
+        spec = definition("prebuilt-analyzer-completion", profile=profile)
+        prefix = "engineering.evidence." if profile == "engineering" else "engineering.layout."
+        analyzer_id = prefix + digest(canonical(spec))[:16]
         url = self.url("analyzers/" + analyzer_id)
         try:
             actual, _ = self.request("GET", url)
@@ -199,28 +203,55 @@ class Client:
             actual, _ = self.request("GET", url)
         if actual.get("status", "").lower() != "ready":
             raise CUError(f"Analyzer {analyzer_id} is not ready")
+        if profile == "layout":
+            self._validate_layout_dependencies(actual)
         for key in ("models", "fieldSchema"):
-            if actual.get(key) != spec[key]:
+            actual_value = actual.get(key)
+            if profile == "layout" and (
+                    actual_value is None
+                    or key == "fieldSchema" and actual_value == {"fields": {}}
+                    or key == "models" and actual_value == {"embedding": "prebuilt-analyzer-embedding"}):
+                actual_value = {}
+            if actual_value != spec[key]:
                 raise CUError(f"Existing analyzer {key} differs from expected immutable definition")
         for key, value in spec["config"].items():
             if actual.get("config", {}).get(key) != value:
                 raise CUError(f"Existing analyzer config differs: {key}")
         return analyzer_id, actual
 
+    @staticmethod
+    def _validate_layout_dependencies(actual):
+        # GA inherits this embedding alias even for an empty custom field schema.
+        # It is acceptable only without any configured consumer of embeddings.
+        for key in ("knowledgeSources", "trainingData"):
+            if actual.get(key) not in (None, [], {}):
+                raise CUError(f"Layout analyzer must not configure {key}")
+        config = actual.get("config", {})
+        for key in ("enableSegment", "enableChunking", "enableEmbeddings"):
+            if config.get(key, False) is not False:
+                raise CUError(f"Layout analyzer must not enable {key}")
+        if config.get("contentCategories") not in (None, [], {}):
+            raise CUError("Layout analyzer must not configure contentCategories")
+
     def analyze(self, path: Path, cache: Path, analyzer_id: str,
                 analyzer: dict, *, allow_submit: bool = True) -> tuple[dict, dict]:
+        profile = extraction_profile(self.config)
         binary = path.read_bytes()
-        deployments = dict(self.config["model_deployments"])
-        deployments["prebuilt-analyzer-completion"] = deployments[self.config["completion_model"]]
+        deployments = {}
+        if profile == "engineering":
+            deployments = dict(self.config["model_deployments"])
+            deployments["prebuilt-analyzer-completion"] = deployments[self.config["completion_model"]]
         provenance = {
             "document_sha256": digest(binary), "byte_length": len(binary),
             "endpoint": self.endpoint, "api_version": self.api_version,
             "analyzer_id": analyzer_id, "analyzer": analyzer,
             "model_deployments": deployments,
-            "selected_completion_model": self.config["completion_model"],
-            "deployment_versions": self.config["deployment_versions"],
+            "selected_completion_model": self.config["completion_model"] if profile == "engineering" else None,
+            "deployment_versions": self.config["deployment_versions"] if profile == "engineering" else {},
             "processing_location": self.config["processing_location"],
         }
+        if profile == "layout":
+            provenance["extraction_profile"] = "layout"
         key = digest(canonical(provenance))
         identity = (cache.resolve(), key)
         with self._cu_locks_lock:
@@ -238,6 +269,8 @@ class Client:
         pending_path = cache / f"{key}.operation.json"
         usage_metadata = {k: provenance[k] for k in (
             "model_deployments", "selected_completion_model", "deployment_versions")}
+        if provenance.get("extraction_profile") == "layout":
+            usage_metadata["extraction_profile"] = "layout"
         if raw_path.exists() and meta_path.exists():
             usage_entry = begin_usage(self, "cu", key, "cached", usage_metadata)
             raw = json.loads(raw_path.read_text(encoding="utf-8"))
@@ -245,6 +278,9 @@ class Client:
             if raw.get("status", "").lower() != "succeeded":
                 raise CUError("Cache contains an unsuccessful operation")
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if provenance.get("extraction_profile") == "layout":
+                meta["extraction_contract"] = layout_diagnostics(raw)
+                self._validate_layout_geometry(meta)
             return raw, dict(meta, cache_hit=True, cache_key=key)
         start = time.monotonic()
         if pending_path.exists():
@@ -267,8 +303,9 @@ class Client:
             body = {
                 "inputs": [{"data": base64.b64encode(binary).decode("ascii"),
                             "mimeType": "application/pdf", "name": "drawing.pdf"}],
-                "modelDeployments": deployments,
             }
+            if provenance.get("extraction_profile") != "layout":
+                body["modelDeployments"] = deployments
             url = self.url(f"analyzers/{analyzer_id}:analyze")
             url += "&processingLocation=" + urllib.parse.quote(self.config["processing_location"])
             usage_entry = begin_usage(self, "cu", key, "new", usage_metadata)
@@ -300,7 +337,17 @@ class Client:
         meta = dict(provenance, started_at=started_at, operation_location=location,
                     elapsed_this_run_seconds=round(time.monotonic() - start, 3),
                     usage=raw.get("usage"), cache_key=key, cache_hit=False)
+        if provenance.get("extraction_profile") == "layout":
+            meta["extraction_contract"] = layout_diagnostics(raw)
         save_json(raw_path, raw)
         save_json(meta_path, meta)
         pending_path.unlink()
+        self._validate_layout_geometry(meta)
         return raw, meta
+
+    @staticmethod
+    def _validate_layout_geometry(metadata):
+        contract = metadata.get("extraction_contract")
+        if contract is not None and not contract["geometry_valid"]:
+            raise CUError("Layout extraction is missing valid page geometry; "
+                          "the response is retained in cache, not treated as no changes")

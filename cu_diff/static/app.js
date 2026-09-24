@@ -12,6 +12,7 @@
     visual_moved: "视图平移（非内容变更）", visual_scaled: "绘图缩放（非实物尺寸）",
     table_row_added: "表格新增行候选", table_row_removed: "表格删除行候选",
     table_cell_modified: "表格单元格文字不同",
+    table_cell_added: "表格空白单元格新增文字候选", table_cell_removed: "表格单元格文字移除候选",
     table_column_added: "表格新增列候选", table_column_removed: "表格删除列候选",
     table_grid_changed: "表格网格结构不同",
     annotation_occurrence_changed: "图外标注次数不同（待核）",
@@ -31,7 +32,7 @@
     ready: false, csrf: "", revision: 0, azure: false, graphicsEnabled: false, modelEnabled: false,
     semanticTextEnabled: false, generation: 0,
     analysisSupported: false, analysisModels: [], analysisModel: "", useCache: true,
-    activeAnalysisOptions: null, cuModel: "", configuredComparison: "",
+    activeAnalysisOptions: null, cuModel: "", configuredComparison: "", extractionProfile: "engineering",
     limits: { max_bytes: 20971520, max_pages: 20 }, result: null, selected: null,
     comparing: false, jobController: null, jobId: null, exporting: false, exportController: null, mutationQueue: Promise.resolve(),
     old: { document: null, page: 1, zoom: "fit", epoch: 0, pending: false, loaded: false, imageEpoch: 0 },
@@ -349,6 +350,10 @@
       state.old.document.sha256 === state.new.document?.sha256;
   }
   function configureAnalysis(data) {
+    if (data.extraction_profile != null && !["engineering", "layout"].includes(data.extraction_profile)) {
+      throw new Error("服务返回了未知CU提取模式，未开始分析。");
+    }
+    state.extractionProfile = data.extraction_profile || "engineering";
     state.cuModel = data.model || "未提供";
     state.configuredComparison = data.model_comparison_deployment || "";
     const options = data.analysis_options, menu = $("analysis-model");
@@ -381,13 +386,16 @@
     const active = state.activeAnalysisOptions;
     const model = active?.model_label || active?.model || selected?.label || state.configuredComparison;
     const cache = active && typeof active.use_cache === "boolean" ? active.use_cache : state.useCache;
-    $("model-tag").textContent = `${state.modelEnabled && model ? `CU：${state.cuModel} · 模型对比：${model}` : state.cuModel || "模型"} / ${state.azure ? cache ? "缓存优先 · 可提交 CU" : "不复用历史缓存 · 可提交 CU" : "只读缓存模式"}`;
+    const cuLabel = state.extractionProfile === "layout" ? "轻量OCR/布局" : state.cuModel;
+    $("model-tag").textContent = `${state.modelEnabled && model ? `CU：${cuLabel} · 模型对比：${model}` : cuLabel || "模型"} / ${state.azure ? cache ? "缓存优先 · 可提交 CU" : "不复用历史缓存 · 可提交 CU" : "只读缓存模式"}`;
     const notes = [];
     if (!state.useCache) notes.push("缓存已关闭：下次对比不复用历史 CU / 模型结果，将重新分析并可能产生费用；不删除已有缓存。");
     if (active && (active.model !== state.analysisModel || active.use_cache !== state.useCache)) {
       notes.push("设置仅用于下一次对比；当前结果和用量仍属于上一轮，不会随选项切换而改变。");
     }
-    if (state.analysisModel === "gpt-6-luna") notes.push("Luna 仅用于模型对比，CU 提取仍使用原模型；未核实的费用会标为未知，不套用 Astra 单价。");
+    if (state.analysisModel === "gpt-6-luna") notes.push(state.extractionProfile === "layout"
+      ? "Luna 负责语义对比，CU保持轻量OCR/布局提取；未核实的费用标为未知。"
+      : "Luna 仅用于模型对比，CU 提取仍使用原模型；未核实的费用会标为未知，不套用 Astra 单价。");
     const note = $("analysis-settings-note");
     note.textContent = notes.join(" ");
     note.hidden = !notes.length;
@@ -401,6 +409,8 @@
     menu.querySelector('[value="primary"]').textContent = state.graphicsEnabled ? "字段 + 表格 + 图形候选" : "字段 + 表格（默认）";
     if (state.modelEnabled) menu.querySelector('[value="primary"]').textContent = state.graphicsEnabled
       ? "模型 + 字段 + 表格 + 图形" : "模型 + 字段 + 表格";
+    if (state.extractionProfile === "layout") menu.querySelector('[value="primary"]').textContent =
+      state.graphicsEnabled ? "模型 + OCR + 表格 + 图形" : "模型 + OCR + 表格";
     $("model-status").hidden = !state.modelEnabled;
     $("model-status").textContent = state.modelEnabled ? `模型引导对比已启用（服务配置）。${modelLimits}${state.semanticTextEnabled ? " 字段/OCR启用LLM语义配对，新增批量请求有独立缓存；坐标与原文仍取自CU。" : ""}` : "";
     const option = menu.querySelector('[value="graphics"]');
@@ -414,6 +424,11 @@
     $("filter-note").textContent = state.graphicsEnabled
       ? "平移和绘图缩放默认隐藏；勾选只改变本地显示，不重新调用 CU。红色实框：实际残差；红色虚框：对侧映射的对应位置，非本侧残差；黄色虚框：复核证据或可选视图范围。缩放伴随内容修改时，内容候选仍保留。"
       : "默认显示字段与表格专项候选，不重复展示 OCR。表格与字段可能重叠，不相加为独立变更数；黄色虚框仅供复核。";
+    if (state.extractionProfile === "layout") {
+      $("model-status").textContent += " 轻量CU仅提取原文、布局和坐标；默认显示OCR主证据，工程语义由对比模型判断，不生成旧版工程字段。";
+      if (!state.graphicsEnabled) $("filter-note").textContent = "默认显示模型、OCR原文和表格专项候选。";
+      $("filter-note").textContent += " 当前OCR是主文字证据；BOM纳入表格通道，各通道可能重叠，不相加为独立变更数。";
+    }
     $("coverage-content").textContent = `尚未运行对比。${state.graphicsEnabled ? "图形覆盖以本轮服务返回的统计为准。" : graphicsUnavailable}系统不会将缺失位置的证据推测成红框。`;
   }
   function updateControls() {
@@ -737,8 +752,8 @@
   function documentTableChange(item) {
     if (item?.channel !== "tables" || item.table_comparison?.status !== "complete") return false;
     if (["table_cell_modified", "table_grid_changed"].includes(item.change)) return Boolean(item.old && item.new);
-    return (item.change === "table_column_added" && !item.old && Boolean(item.new)) ||
-      (item.change === "table_column_removed" && !item.new && Boolean(item.old));
+    return (["table_column_added", "table_row_added", "table_cell_added"].includes(item.change) && !item.old && Boolean(item.new)) ||
+      (["table_column_removed", "table_row_removed", "table_cell_removed"].includes(item.change) && !item.new && Boolean(item.old));
   }
   function annotationReview(item) {
     return item?.channel === "schema" && item.change === "annotation_occurrence_changed" &&
@@ -766,7 +781,9 @@
       if (!$("show-interpretation").checked && item.change === "interpretation_only") return false;
       const channel = $("channel-filter").value;
       if (channel === "primary") {
-        if (!["model", "schema", "tables", "graphics"].includes(item.channel)) return false;
+        const primary = ["model", "schema", "tables", "graphics"];
+        if (state.result?.extraction_profile === "layout" && state.result?.primary_text_channel === "ocr") primary.push("ocr");
+        if (!primary.includes(item.channel)) return false;
       } else if (channel !== "all" && item.channel !== channel) return false;
       switch ($("review-filter").value) {
         case "paired": return (item.channel === "model" && !modelContextOnly(item)) || contentDifference(item) || annotationReview(item) || Boolean(item.old && item.new && transformation(item));
@@ -928,7 +945,8 @@
       node.textContent = `${item.id} · 本侧CU表格未提取到该行，仍需核对原图${context.length ? "；定位到对应表格（仅上下文，不伪造缺失行红框）" : "；缺少表格定位来源"}`;
     }
     else if (!source && documentTableChange(item)) {
-      node.textContent = `${item.id} · 对应完整网格内未发现该列；仅导航到本侧表格，不伪造缺失列红框，仍需原图复核`;
+      const part = item.change.startsWith("table_row_") ? "行" : item.change.startsWith("table_cell_") ? "单元格文字" : "列";
+      node.textContent = `${item.id} · 对应完整网格内未提取到该${part}；仅导航到本侧表格，不伪造缺失${part}红框，仍需原图复核`;
     }
     else if (!source) node.textContent = `${item.id} · 未配对到证据，不代表本侧图纸没有该内容`;
     else if (counterparts.length) {
@@ -1544,6 +1562,10 @@
         if (data.status === "failed") throw new Error(data.error || "对比失败，请重试。");
         if (data.status === "succeeded") {
           if (!data.result || !Array.isArray(data.result.items)) throw new Error("返回的对比结果不完整，请重试。");
+          if ((data.result.extraction_profile || "engineering") !== state.extractionProfile ||
+              state.extractionProfile === "layout" && data.result.primary_text_channel !== "ocr") {
+            throw new Error("结果的CU提取模式与本轮配置不一致，未显示错误模式的证据。");
+          }
           if (!sides.every((side) => data.result.documents?.[side]?.id === state[side].document?.id &&
               data.result.documents[side].sha256 === state[side].document?.sha256)) {
             throw new Error("结果文件与当前上传文件不一致，已拒绝显示旧结果或证据框，请重新对比。");

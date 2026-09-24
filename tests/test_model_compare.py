@@ -121,6 +121,59 @@ class ModelComparisonTests(unittest.TestCase):
         self.chat.assert_not_called()
         self.assertEqual(self.client.calls, [])
 
+    def test_layout_request_schema_constrains_each_side_without_mutating_legacy_schema(self):
+        from cu_diff.model_compare import COARSE_SCHEMA, FINE_SCHEMA
+        originals = copy.deepcopy((COARSE_SCHEMA, FINE_SCHEMA))
+        self.client.config["extraction_profile"] = "layout"
+        self.run_comparison()
+        coarse, fine = [call.args[2]["response_format"]["json_schema"]["schema"]
+                        for call in self.chat.call_args_list]
+        pair_properties = coarse["properties"]["pairs"]["items"]["properties"]
+        observation = pair_properties["observations"]["items"]["properties"]
+        fine_properties = fine["properties"]["changes"]["items"]["properties"]
+        for side in ("old", "new"):
+            for fields in (pair_properties, observation):
+                self.assertEqual(fields[f"{side}_ids"]["items"]["enum"], [f"{side}:e1", f"{side}:e2"])
+            self.assertEqual(fine_properties[f"{side}_ids"]["items"]["enum"], [f"{side}:w1", f"{side}:w2"])
+        self.assertEqual((COARSE_SCHEMA, FINE_SCHEMA), originals)
+
+    def test_layout_still_rejects_wrong_side_response_without_crops(self):
+        self.client.config["extraction_profile"] = "layout"
+        self.coarse["pairs"][0]["new_ids"] = ["old:e1"]
+        with self.assertRaisesRegex(CUError, "unknown or wrong-side"):
+            self.run_comparison()
+        self.assertEqual(self.client.calls, [])
+
+    def test_layout_out_of_pair_known_observation_is_explicit_review_without_inference_or_frames(self):
+        self.client.config.update(extraction_profile="layout")
+        self.client.config["model_comparison"]["visual_review"] = True
+        self.coarse["pairs"][0]["observations"] = [
+            {"kind": "visual_change", "old_ids": ["old:e2"], "new_ids": ["new:e2"],
+             "description": "Synthetic out-of-group observation", "check": "Review sources"}]
+        result = self.run_comparison()
+        record, = result["items"]
+        self.assertEqual(record["change"], "model_review")
+        self.assertEqual(record["model_comparison"]["highlight_scope"], "none_invalid_observation_group")
+        self.assertEqual(record["model_comparison"]["rejected_source_ids"],
+                         {"old": ["old:e2"], "new": ["new:e2"]})
+        self.assertTrue(result["warnings"])
+        self.assertEqual(self.client.calls, [])
+        self.assertEqual(self.chat.call_count, 1)
+        for side in ("old", "new"):
+            self.assertEqual(record[side]["locations"], [])
+            self.assertTrue(record["model_context"][side]["locations"])
+        self.assertEqual(result["coverage"]["visual"]["regions"], [])
+
+    def test_layout_unknown_observation_still_fails_atomically(self):
+        self.client.config["extraction_profile"] = "layout"
+        self.coarse["pairs"].append(pair(2, observations=[
+            {"kind": "text_change", "old_ids": ["new:e1"], "new_ids": ["new:e2"],
+             "description": "Invalid cross-side reference", "check": "Review sources"}]))
+        with self.assertRaisesRegex(CUError, "unknown or wrong-side"):
+            self.run_comparison()
+        self.assertEqual(self.client.calls, [])
+        self.assertEqual(self.chat.call_count, 1)
+
     def test_insertion_does_not_color_unchanged_anchor_as_difference(self):
         self.client.old_words, self.client.new_words = ["SYN", "END"], ["SYN", "NEW", "END"]
         self.fine["changes"][0]["new_ids"].append("new:w3")

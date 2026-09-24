@@ -107,8 +107,10 @@ def _public(candidate):
 
 def _collect(comparison, responses, pages, opts, coverage):
     originals, all_entries, endpoints = {}, {}, {side: [] for side in SIDES}
+    profile = comparison.get("extraction_profile", comparison.get("coverage", {}).get(
+        "extraction_profile", "engineering"))
     for side in SIDES:
-        items, lines, _, _ = _extract(responses[side], side, .8)
+        items, lines, _, _ = _extract(responses[side], side, .8, extraction_profile=profile)
         originals[side] = {}
         all_entries[side] = {}
         for channel, entries in (("schema", items), ("ocr", lines)):

@@ -15,6 +15,8 @@ CHANGE_LABELS = {
     "table_row_added": "对应CU表格的新增行候选（需原图确认）",
     "table_row_removed": "对应CU表格的删除行候选（需原图确认）",
     "table_cell_modified": "表格单元格文字不同",
+    "table_cell_added": "对应空白单元格新增文字候选（需原图确认）",
+    "table_cell_removed": "对应单元格文字移除候选（需原图确认）",
     "table_column_added": "表格新增列候选",
     "table_column_removed": "表格删除列候选",
     "table_grid_changed": "表格网格结构不同（不等于记录增删）",

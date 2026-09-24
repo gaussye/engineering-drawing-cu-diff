@@ -90,7 +90,7 @@ def _entry_context(polygons, contexts):
     })) for polygon in polygons]
 
 
-def _diagnostics(operation, side):
+def _diagnostics(operation, side, *, extraction_profile="engineering"):
     """Retain service diagnostics separately from correspondence/extraction scores."""
     uncertainties, service_warnings, warnings = [], [], []
 
@@ -115,6 +115,8 @@ def _diagnostics(operation, side):
                 collect_warnings(child, f"{path}[{index}]")
 
     collect_warnings(operation, "$")
+    if extraction_profile == "layout":
+        return uncertainties, service_warnings, warnings
     result = operation.get("result") if isinstance(operation, dict) else None
     contents = result.get("contents") if isinstance(result, dict) else None
     for content_index, content in enumerate(contents if isinstance(contents, list) else []):
@@ -147,9 +149,36 @@ def _diagnostics(operation, side):
     return uncertainties, service_warnings, warnings
 
 
-def _extract(operation, side, threshold):
+def _profile(value):
+    if value not in ("engineering", "layout"):
+        raise ValueError("extraction_profile must be 'engineering' or 'layout'")
+    return value
+
+
+def _layout_geometry_issues(polygons, contexts):
+    issues = []
+    for polygon in polygons:
+        context = contexts.get(polygon["page_number"], {})
+        width, height = context.get("width"), context.get("height")
+        if (not _valid_number(width) or not _valid_number(height) or width <= 0 or height <= 0
+                or context.get("unit") not in ("inch", "pixel")):
+            issues.append("missing or invalid OCR page geometry")
+            continue
+        points = polygon["points"]
+        if any(x < 0 or y < 0 or x > width or y > height for x, y in points):
+            issues.append("OCR source coordinates exceed page bounds")
+        if max(x for x, _ in points) <= min(x for x, _ in points) or (
+                max(y for _, y in points) <= min(y for _, y in points)):
+            issues.append("OCR source geometry has zero area")
+    return list(dict.fromkeys(issues))
+
+
+def _extract(operation, side, threshold, *, extraction_profile="engineering"):
+    _profile(extraction_profile)
     items, lines, warnings = [], [], []
     counts = {"contents": 0, "pages": 0, "invalid_items": 0, "invalid_lines": 0}
+    if extraction_profile == "layout":
+        counts.update(words=0, word_evidence_issues=0)
     if not isinstance(operation, dict):
         return items, lines, [f"{side}: operation is not an object"], counts
     if operation.get("status") != "Succeeded":
@@ -169,11 +198,17 @@ def _extract(operation, side, threshold):
         if not isinstance(pages, list):
             warnings.append(f"{side}: content {content_index} has no full OCR pages array")
             pages = []
+        elif extraction_profile == "layout" and not pages:
+            warnings.append(f"{side}: content {content_index} has no OCR pages")
         contexts = _page_context(pages, content.get("unit"))
         fields = content.get("fields")
         array = fields.get("Items") if isinstance(fields, dict) else None
         raw_items = array.get("valueArray") if isinstance(array, dict) else None
-        if not isinstance(raw_items, list):
+        if extraction_profile == "layout":
+            if isinstance(fields, dict) and ("Items" in fields or "Uncertainties" in fields):
+                warnings.append(f"{side}: layout profile ignores unexpected generated Items/Uncertainties")
+            raw_items = []
+        elif not isinstance(raw_items, list):
             warnings.append(f"{side}: content {content_index} has no Items.valueArray")
             raw_items = []
         for item_index, raw in enumerate(raw_items):
@@ -233,10 +268,43 @@ def _extract(operation, side, threshold):
             if not isinstance(page, dict):
                 warnings.append(f"{side}: content {content_index} page {page_index} is invalid")
                 continue
+            if extraction_profile == "layout":
+                number = page.get("pageNumber")
+                context = contexts.get(number, {}) if type(number) is int else {}
+                if (any(not _valid_number(context.get(k)) or context[k] <= 0 for k in ("width", "height"))
+                        or context.get("unit") not in ("inch", "pixel")):
+                    warnings.append(f"{side}: content {content_index} page {page_index}: "
+                                    "missing or invalid OCR page geometry")
+                raw_words = page.get("words")
+                if not isinstance(raw_words, list):
+                    warnings.append(f"{side}: content {content_index} page {page_index}: "
+                                    "missing or invalid OCR words array; word grounding unavailable")
+                else:
+                    counts["words"] += len(raw_words)
+                    for word_index, raw_word in enumerate(raw_words):
+                        word = raw_word if isinstance(raw_word, dict) else {}
+                        text = word.get("content")
+                        issues = ([] if isinstance(text, str) and normalize_text(text) else
+                                  ["missing or invalid OCR word content"])
+                        issues.extend(_evidence_issues(word.get("source"), word.get("confidence"), threshold))
+                        polygons = parse_source(word.get("source"))
+                        issues.extend(_layout_geometry_issues(polygons, contexts))
+                        if any(p["page_number"] != number for p in polygons):
+                            issues.append("OCR word source page conflicts with containing page")
+                        counts["word_evidence_issues"] += bool(issues)
+                        warnings.extend(f"{side}:word:{content_index}:{page_index}:{word_index}: {issue}"
+                                        for issue in issues)
             raw_lines = page.get("lines")
             if not isinstance(raw_lines, list):
                 warnings.append(f"{side}: content {content_index} page {page_index} has no OCR lines")
                 continue
+            if extraction_profile == "layout":
+                if not raw_lines:
+                    warnings.append(f"{side}: content {content_index} page {page_index}: "
+                                    "no OCR text recognized; text coverage unavailable")
+                elif page.get("words") == []:
+                    warnings.append(f"{side}: content {content_index} page {page_index}: "
+                                    "OCR words array is empty; word grounding unavailable")
             for line_index, raw in enumerate(raw_lines):
                 identity = f"{side}:ocr:{content_index}:{page_index}:{line_index}"
                 value = raw if isinstance(raw, dict) else {}
@@ -246,9 +314,14 @@ def _extract(operation, side, threshold):
                     text = ""
                     issues.append("missing or invalid OCR content")
                     counts["invalid_lines"] += 1
+                elif extraction_profile == "layout" and not normalize_text(text):
+                    issues.append("missing or invalid OCR content")
+                    counts["invalid_lines"] += 1
                 source, confidence = value.get("source"), value.get("confidence")
                 issues.extend(_evidence_issues(source, confidence, threshold))
                 polygons = parse_source(source)
+                if extraction_profile == "layout":
+                    issues.extend(_layout_geometry_issues(polygons, contexts))
                 if polygons and any(p["page_number"] != page.get("pageNumber") for p in polygons):
                     issues.append("OCR source page conflicts with containing page")
                 lines.append({
@@ -730,7 +803,8 @@ def _coverage(records, old_count, new_count):
     }
 
 
-def compare_documents(old, new, *, confidence_threshold=0.8, semantic_pairing=False):
+def compare_documents(old, new, *, confidence_threshold=0.8, semantic_pairing=False,
+                      extraction_profile="engineering"):
     """Return a JSON-compatible report without mutating either raw operation.
 
     Match scores are heuristics, not extraction confidence or probabilities.
@@ -740,27 +814,37 @@ def compare_documents(old, new, *, confidence_threshold=0.8, semantic_pairing=Fa
     omitted OCR evidence are outside this comparator's guarantees. Schema
     ``Uncertainties`` and service warnings retain their raw evidence in dedicated
     output arrays and set the report-level ``review_required`` flag.
+    ``layout`` intentionally omits generated schema fields and their title/BOM
+    heuristics. OCR remains the primary text channel with original source IDs;
+    missing OCR or invalid source geometry still requires review.
     """
     if not _valid_number(confidence_threshold) or not 0 <= confidence_threshold <= 1:
         raise ValueError("confidence_threshold must be a finite number between 0 and 1")
     if type(semantic_pairing) is not bool:
         raise ValueError("semantic_pairing must be a boolean")
-    old_items, old_lines, old_warnings, old_counts = _extract(old, "old", confidence_threshold)
-    new_items, new_lines, new_warnings, new_counts = _extract(new, "new", confidence_threshold)
-    old_uncertainties, old_service_warnings, old_diagnostics = _diagnostics(old, "old")
-    new_uncertainties, new_service_warnings, new_diagnostics = _diagnostics(new, "new")
+    _profile(extraction_profile)
+    old_items, old_lines, old_warnings, old_counts = _extract(
+        old, "old", confidence_threshold, extraction_profile=extraction_profile)
+    new_items, new_lines, new_warnings, new_counts = _extract(
+        new, "new", confidence_threshold, extraction_profile=extraction_profile)
+    old_uncertainties, old_service_warnings, old_diagnostics = _diagnostics(
+        old, "old", extraction_profile=extraction_profile)
+    new_uncertainties, new_service_warnings, new_diagnostics = _diagnostics(
+        new, "new", extraction_profile=extraction_profile)
     uncertainties = old_uncertainties + new_uncertainties
     service_warnings = old_service_warnings + new_service_warnings
-    title_pairs, old_remaining, new_remaining, title_warnings = reconcile_title_fields(
-        old_items, new_items, old_lines, new_lines)
-    item_records, pairing_warnings = _compare_items(
-        old_remaining, new_remaining, allow_geometry=not semantic_pairing)
-    item_records.extend(_record(left, right, "printed_title_label_value", 1.0, "high")
-                        for left, right in title_pairs)
-    table_warnings = reconcile_bom(item_records, old, new)
-    refine_bom(item_records, old, new)
-    if old.get("status") == new.get("status") == "Succeeded":
-        _annotation_occurrences(item_records, old_lines, new_lines)
+    item_records, pairing_warnings, title_warnings, table_warnings = [], [], [], []
+    if extraction_profile == "engineering":
+        title_pairs, old_remaining, new_remaining, title_warnings = reconcile_title_fields(
+            old_items, new_items, old_lines, new_lines)
+        item_records, pairing_warnings = _compare_items(
+            old_remaining, new_remaining, allow_geometry=not semantic_pairing)
+        item_records.extend(_record(left, right, "printed_title_label_value", 1.0, "high")
+                            for left, right in title_pairs)
+        table_warnings = reconcile_bom(item_records, old, new)
+        refine_bom(item_records, old, new)
+        if old.get("status") == new.get("status") == "Succeeded":
+            _annotation_occurrences(item_records, old_lines, new_lines)
     ocr_records = _compare_lines(old_lines, new_lines, allow_geometry=not semantic_pairing)
     warnings = (old_warnings + new_warnings + pairing_warnings + title_warnings + table_warnings
                 + old_diagnostics + new_diagnostics)
@@ -768,8 +852,17 @@ def compare_documents(old, new, *, confidence_threshold=0.8, semantic_pairing=Fa
                        or any(record["review_required"] for record in item_records + ocr_records))
     if review_required:
         warnings.append("Evidence requires review; uncertain or unpaired entries are not confirmed additions/deletions")
-    warnings.append("Comparison covers extracted schema items and OCR lines only; it cannot guarantee all drawing changes")
+    warnings.append("Comparison covers extracted schema items and OCR lines only; it cannot guarantee all drawing changes"
+                    if extraction_profile == "engineering" else
+                    "Layout comparison covers source OCR text; generated schema/domain fields are unavailable by design")
+    notices = ([] if extraction_profile == "engineering" else [
+        "布局提取以原始OCR为主要文字证据；未请求Items或Uncertainties，缺少这些字段不是提取失败。",
+        "区域、参数分类和BOM领域字段未生成；不会从OCR伪造schema、标题或BOM字段。"
+        "CU原始表格由独立表格通道处理。",
+    ])
     return {
+        "extraction_profile": extraction_profile,
+        "primary_text_channel": "ocr" if extraction_profile == "layout" else "schema",
         "differences": [record for record in item_records if record["change"] != "unchanged"],
         "unchanged": [record for record in item_records if record["change"] == "unchanged"],
         "ocr_differences": [record for record in ocr_records if record["change"] != "unchanged"],
@@ -780,7 +873,12 @@ def compare_documents(old, new, *, confidence_threshold=0.8, semantic_pairing=Fa
             "old_extraction": old_counts, "new_extraction": new_counts,
             "uncertainty_count": len(uncertainties),
             "service_warning_count": len(service_warnings),
-            "scope": "custom_schema_items_and_full_ocr_lines",
+            "scope": ("full_ocr_lines" if extraction_profile == "layout"
+                      else "custom_schema_items_and_full_ocr_lines"),
+            "extraction_profile": extraction_profile,
+            "primary_text_channel": "ocr" if extraction_profile == "layout" else "schema",
+            "schema_domain_fields": ("unavailable_by_design" if extraction_profile == "layout" else "requested"),
+            "notices": notices,
             "completeness": "not_guaranteed",
             "changed_text_pairing": "semantic_pending" if semantic_pairing else "geometry_text",
         },

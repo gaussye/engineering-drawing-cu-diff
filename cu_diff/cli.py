@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from .client import CUError, Client, save_json
+from .schema import extraction_profile
 
 
 def read_json(path: Path) -> dict:
@@ -83,7 +84,8 @@ def compare(args: argparse.Namespace) -> None:
             raise ValueError(f"{role} CU operation did not succeed; refusing a success-shaped report")
         if not response.get("result", {}).get("contents"):
             raise ValueError(f"{role} CU operation has no content; cannot conclude no changes")
-    result = compare_responses(old, new)
+    profile = getattr(args, "extraction_profile", "engineering")
+    result = compare_responses(old, new, **({"extraction_profile": profile} if profile == "layout" else {}))
     result["provenance"] = {
         "old_response": str(args.old.resolve()), "new_response": str(args.new.resolve()),
         "chronology": "User supplied old/new order; not inferred from part IDs or filenames",
@@ -189,7 +191,10 @@ def tables(args: argparse.Namespace) -> None:
         if response.get("status") != "Succeeded" or not response.get("result", {}).get("contents"):
             raise ValueError(f"{role} CU response did not succeed or has no content")
         responses[role] = response
-    result = compare_document_tables(args.old, args.new, responses["old"], responses["new"])
+    include_bom = getattr(args, "include_bom", False)
+    result = compare_document_tables(
+        args.old, args.new, responses["old"], responses["new"],
+        **({"include_bom": True} if include_bom else {}))
     result["provenance"] = {
         "document_sha256": hashes, "azure_calls": 0,
         "chronology": "User-supplied old/new direction",
@@ -207,14 +212,18 @@ def model_compare(args: argparse.Namespace) -> None:
     from .report import write_model_report
     from .usage import usage_report, validate_pricing
     config = read_json(args.config)
+    profile = extraction_profile(config)
     pricing = validate_pricing(config.get("pricing"))
     if not options(config)["enabled"]:
         raise ValueError("Enable model_comparison only after approving the existing deployment boundary")
     responses = {}
     for role in ("old", "new"):
         path = getattr(args, role)
-        if read_json(getattr(args, f"{role}_metadata")).get("document_sha256") != digest(path.read_bytes()):
+        metadata = read_json(getattr(args, f"{role}_metadata"))
+        if metadata.get("document_sha256") != digest(path.read_bytes()):
             raise ValueError(f"{role} cached CU document hash does not match the PDF")
+        if metadata.get("extraction_profile", "engineering") != profile:
+            raise ValueError(f"{role} CU extraction profile does not match the configured analyzer")
         responses[role] = read_json(getattr(args, f"{role}_response"))
     client = Client(config)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -231,7 +240,9 @@ def model_compare(args: argparse.Namespace) -> None:
             from .semantic_text import resolve_text_pairing
 
             text_result = resolve_text_pairing(
-                compare_responses(responses["old"], responses["new"], semantic_pairing=True),
+                compare_responses(
+                    responses["old"], responses["new"], semantic_pairing=True,
+                    **({"extraction_profile": profile} if profile == "layout" else {})),
                 responses, {"old": args.old, "new": args.new},
                 client=client, cache=args.cache_dir, allow_submit=args.allow_azure_upload,
                 progress=lambda message: print(message, flush=True))
@@ -267,6 +278,7 @@ def main() -> None:
     comparison.add_argument("--old", type=Path, required=True)
     comparison.add_argument("--new", type=Path, required=True)
     comparison.add_argument("--output", type=Path, default=Path("output"))
+    comparison.add_argument("--extraction-profile", choices=("engineering", "layout"), default="engineering")
     comparison.set_defaults(action=compare)
     cropping = commands.add_parser("crop")
     cropping.add_argument("--pdf", type=Path, required=True)
@@ -289,12 +301,14 @@ def main() -> None:
                            help="Include verified uniform drawing scale, not physical part dimensions")
     graphical.add_argument("--output", type=Path, default=Path("output") / "graphics")
     graphical.set_defaults(action=graphics)
-    tabular = commands.add_parser("tables", help="Offline non-BOM table evidence; never calls Azure")
+    tabular = commands.add_parser("tables", help="Offline table evidence; never calls Azure")
     for role in ("old", "new"):
         tabular.add_argument(f"--{role}", type=Path, required=True)
         tabular.add_argument(f"--{role}-response", type=Path, required=True)
         tabular.add_argument(f"--{role}-metadata", type=Path, required=True)
     tabular.add_argument("--output", type=Path, default=Path("output") / "tables")
+    tabular.add_argument("--include-bom", action="store_true",
+                         help="Include BOM tables when using extraction-only CU without generated Items")
     tabular.set_defaults(action=tables)
     model = commands.add_parser("model-compare", help="Model region pairing and source-grounded CU crop rereading")
     for role in ("old", "new"):

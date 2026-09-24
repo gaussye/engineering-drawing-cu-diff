@@ -1,4 +1,4 @@
-"""Conservative non-BOM comparisons grounded in PDF rulings and cached OCR.
+"""Conservative table comparisons grounded in PDF rulings and cached OCR.
 
 ``compare_document_tables(old_pdf, new_pdf, old_operation, new_operation)``
 returns browser-ready ``items``, ``coverage``, and ``warnings``. Items use IDs
@@ -14,6 +14,10 @@ cell: rendered cell ink is checked. No network, OCR service, or CU table counts
 are used. Raster/merged/partial grids and ambiguous records remain diagnostics.
 Callers must supply the cached operation belonging to each displayed PDF;
 dimensions alone cannot authenticate document identity.
+
+Keyword-only ``include_bom=True`` enables BOM evidence without ``fields.Items``.
+The default excludes BOMs for callers whose schema channel already handles them.
+CU HTML/cell records may be present but never replace source ruling/ink checks.
 """
 
 from collections import defaultdict
@@ -39,6 +43,13 @@ _HEADERS = {
     "unit": "unit", "material": "material", "pn": "part_number",
 }
 _EPS = 0.75
+_BOM_HEADERS = {
+    "itemno": "number", "number": "number", "no": "number",
+    "partno": "part_number", "partnumber": "part_number",
+    "units": "unit", "um": "unit", "qty": "quantity",
+    "manufacturer": "manufacturer", "supplier": "manufacturer",
+    "flameclass": "flame_class", "fireproofingrank": "flame_class",
+}
 
 
 def _key(text):
@@ -86,7 +97,7 @@ def _merge_lines(lines):
     return merged
 
 
-def _grids(page):
+def _grids(page, *, extend_shared_borders=False):
     horizontal, vertical = [], []
 
     def segment(a, b):
@@ -143,9 +154,23 @@ def _grids(page):
     found = []
     for group in bounded_groups:
         ys = group["ys"]
+        left, right = group["left"], group["right"]
+        if extend_shared_borders:
+            supports = [(x, top, bottom) for x, top, bottom in vertical
+                        if left - _EPS <= x <= right + _EPS
+                        and top <= ys[0] + _EPS and bottom >= ys[-1] - _EPS]
+            if len(supports) >= 3:
+                top, bottom = max(s[1] for s in supports), min(s[2] for s in supports)
+                # A BOM header often shares the longer page-border ruling.
+                # Extend only through actual full-width lines AND every
+                # existing column boundary; never infer a missing top edge.
+                for y, start, end in horizontal:
+                    if (top - _EPS <= y <= bottom + _EPS
+                            and start <= left + _EPS and end >= right - _EPS
+                            and not any(abs(y - previous) <= _EPS for previous in ys)):
+                        ys = sorted([*ys, y])
         if not 3 <= len(ys) <= 101:
             continue
-        left, right = group["left"], group["right"]
         if (left < 0 or ys[0] < 0 or right > page.rect.width
                 or ys[-1] > page.rect.height):
             continue
@@ -287,18 +312,25 @@ def _cell(page, box, words, rendered=None):
                                                  (residual_y + origin_y) / 2))}
 
 
-def _header(cells):
+def _is_bom_header(cells, keys):
+    return (any(_key(cell["text"]).startswith("bom") for cell in cells)
+            or {"description", "quantity"}.issubset(keys))
+
+
+def _header(cells, include_bom=False):
     if any(not cell["complete"] or not cell["text"] for cell in cells):
         return None
-    if any(_key(cell["text"]).startswith("bom") for cell in cells):
+    if not include_bom and any(_key(cell["text"]).startswith("bom") for cell in cells):
         return None
-    keys = [_HEADERS.get(_key(cell["text"]), "header:" + _key(cell["text"])) for cell in cells]
+    aliases = _HEADERS | (_BOM_HEADERS if include_bom else {})
+    keys = [aliases.get(_key(cell["text"]), "header:" + _key(cell["text"])) for cell in cells]
     if len(set(keys)) != len(keys):
         return None
     recognized = {key for key in keys if not key.startswith("header:")}
-    if {"description", "quantity"}.issubset(recognized):
+    bom = _is_bom_header(cells, keys)
+    if bom and not include_bom:
         return None
-    if len(recognized) < 3:
+    if len(recognized) < (2 if bom else 3):
         return None
     for cell in cells:
         if any(not isinstance(w["confidence"], (int, float)) or w["confidence"] < .8
@@ -317,7 +349,7 @@ def _printed_panel_header(cell):
                     and word["confidence"] >= .8 for word in cell["words"]))
 
 
-def _extract(path, operation, side, warnings, diagnostics=None):
+def _extract(path, operation, side, warnings, diagnostics=None, *, include_bom=False):
     import numpy as np
     import pymupdf
 
@@ -339,15 +371,21 @@ def _extract(path, operation, side, warnings, diagnostics=None):
             rendered = (np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width),
                         pix.x, pix.y)
             accepted, rejected = 0, 0
-            for grid in _grids(page):
+            for grid in _grids(page, extend_shared_borders=include_bom):
                 xs, ys = grid["xs"], grid["ys"]
                 rows = [[_cell(page, (x0, y0, x1, y1), words, rendered)
                          for x0, x1 in zip(xs, xs[1:])] for y0, y1 in zip(ys, ys[1:])]
                 grid.update({"page": number, "width": page.rect.width,
                              "height": page.rect.height, "rows": rows, "side": side})
-                headers = [(index, _header(rows[index])) for index in (0, len(rows) - 1)]
+                bom_header_seen = any(
+                    keys and _is_bom_header(rows[index], keys)
+                    for index in (0, len(rows) - 1)
+                    for keys in [_header(rows[index], include_bom=True)])
+                headers = [(index, _header(rows[index], include_bom=include_bom))
+                           for index in (0, len(rows) - 1)]
                 headers = [(index, keys) for index, keys in headers if keys]
-                kind = "column_table"
+                kind = ("bom" if len(headers) == 1 and _is_bom_header(rows[headers[0][0]], headers[0][1])
+                        else "column_table")
                 if (not headers and len(xs) == 2 and _printed_panel_header(rows[0][0])
                         and not _printed_panel_header(rows[-1][0])):
                     headers = [(0, ["panel:" + " ".join(rows[0][0]["text"].casefold().split())])]
@@ -357,6 +395,8 @@ def _extract(path, operation, side, warnings, diagnostics=None):
                         "page": number, "ruled_bands": len(ys) - 1, "columns": len(xs) - 1,
                         "header_assignment": headers[0][0] if len(headers) == 1 else None,
                         "status": "eligible" if len(headers) == 1 else "unmatched_or_excluded",
+                        "table_kind": "bom" if bom_header_seen else kind,
+                        "exclusion_reason": "bom_disabled" if bom_header_seen and not include_bom else None,
                         "first_band_ocr": " | ".join(cell["text"] for cell in rows[0]),
                         "locations": [_location(grid["box"], number, page.rect.width, page.rect.height)],
                         "horizontal_boundaries_points": ys, "vertical_boundaries_points": xs,
@@ -370,11 +410,13 @@ def _extract(path, operation, side, warnings, diagnostics=None):
                 tables.append(grid)
                 accepted += 1
             if not accepted:
-                warnings.append(f"{side} page {number}: no eligible non-BOM table: "
+                scope = "table" if include_bom else "non-BOM table"
+                warnings.append(f"{side} page {number}: no eligible {scope}: "
                                 "requires complete vector grid and unique readable header.")
             if rejected:
+                exclusions = "unrecognized/incomplete, or ambiguous headers" if include_bom else "BOM, unrecognized/incomplete, or ambiguous headers"
                 warnings.append(f"{side} page {number}: {rejected} source grids skipped "
-                                "(BOM, unrecognized/incomplete, or ambiguous headers).")
+                                f"({exclusions}).")
     return tables
 
 
@@ -415,6 +457,8 @@ def _measurement(table):
 def _record(old, new, change, key, old_cells=None, new_cells=None, structural=False):
     scope = ("structural_grid_only" if structural else
              "column_presence_only" if change.startswith("table_column_") else
+             "observed_row_presence" if change in ("table_row_added", "table_row_removed") else
+             "observed_cell_presence" if change in ("table_cell_added", "table_cell_removed") else
              "observed_cell_text_pair")
     return {"channel": "tables", "region": "document_table", "key": key, "change": change,
             "review_required": True,
@@ -424,6 +468,7 @@ def _record(old, new, change, key, old_cells=None, new_cells=None, structural=Fa
             "new": _entry(new, new_cells, structural) if new_cells is not None or structural else None,
             "table_context": {"old": _entry(old, structural=True), "new": _entry(new, structural=True)},
             "table_comparison": {"status": "complete", "scope": scope,
+                                 "table_kind": old["kind"],
                                  "meaning": "Complete only for the stated evidence scope, not OCR accuracy or whole-table coverage.",
                                  "old_grid": _measurement(old),
                                  "new_grid": _measurement(new)}}
@@ -565,6 +610,70 @@ def _compare_panel(old, new, warnings, diagnostics):
     return [record]
 
 
+def _reliable_cell(cell):
+    return cell["complete"] and all(
+        isinstance(word["confidence"], (int, float)) and math.isfinite(word["confidence"])
+        and word["confidence"] >= .8 and "\ufffd" not in word["text"]
+        for word in cell["words"])
+
+
+def _bom_pairs(old, new, old_rows, new_rows, warnings, label):
+    identity_keys = set(old["keys"]) & set(new["keys"]) & {
+        "description", "part_number", "supplier_part_number"}
+    usable = [key for key in sorted(identity_keys) if all(
+        _reliable_cell(row[table["keys"].index(key)])
+        for table, rows in ((old, old_rows), (new, new_rows)) for row in rows)]
+    edges, reverse = defaultdict(list), defaultdict(list)
+    for i, left in enumerate(old_rows):
+        for j, right in enumerate(new_rows):
+            anchors = []
+            for key in usable:
+                oi, ni = old["keys"].index(key), new["keys"].index(key)
+                value = left[oi]["text"]
+                if (value and value == right[ni]["text"]
+                        and sum(row[oi]["text"] == value for row in old_rows) == 1
+                        and sum(row[ni]["text"] == value for row in new_rows) == 1):
+                    anchors.append(key)
+            if anchors:
+                edges[i].append(j)
+                reverse[j].append(i)
+    indexes = [(i, js[0]) for i, js in edges.items()
+               if len(js) == 1 and len(reverse[js[0]]) == 1]
+    unmatched_old = [row for i, row in enumerate(old_rows) if i not in {i for i, _ in indexes}]
+    unmatched_new = [row for j, row in enumerate(new_rows) if j not in {j for _, j in indexes}]
+    presence = []
+    if unmatched_old or unmatched_new:
+        complete = all(_reliable_cell(cell) for table in (old, new)
+                       for row in table["rows"] for cell in row)
+        if complete and not (unmatched_old and unmatched_new):
+            side, rows = ("old", unmatched_old) if unmatched_old else ("new", unmatched_new)
+            for row in rows:
+                record = _record(old, new, "table_row_removed" if side == "old" else "table_row_added",
+                                 "BOM row presence", old_cells=row if side == "old" else None,
+                                 new_cells=row if side == "new" else None)
+                record["match"]["method"] = "complete_source_bom_and_exhaustive_identity_pairing"
+                presence.append(record)
+        else:
+            warnings.append(f"{label}: ambiguous/unmatched BOM identities or incomplete OCR; "
+                            "no row addition/removal claims.")
+    return [(old_rows[i], new_rows[j]) for i, j in indexes], presence
+
+
+def _bom_cell_presence(old, new, key, before, after):
+    blank_side, blank, present = ("old", before, after) if before["blank"] else ("new", after, before)
+    table = old if blank_side == "old" else new
+    header = old["rows"][old["header"]][old["keys"].index(key)]["text"]
+    record = _record(old, new, "table_cell_added" if blank_side == "old" else "table_cell_removed",
+                     header, old_cells=None if blank_side == "old" else [present],
+                     new_cells=None if blank_side == "new" else [present])
+    record["table_comparison"]["blank_counterpart_context"] = {
+        "side": blank_side, "source": "PDF cell rulings and rendered empty cell interior",
+        "locations": [_location(blank["box"], table["page"], table["width"], table["height"])],
+        "meaning": "Navigation context only; no missing-side OCR text or red evidence box.",
+    }
+    return record
+
+
 def _compare_pair(old, new, warnings, panel_diagnostics):
     records = []
     label = f"table p{old['page']} ({', '.join(old['keys'])})"
@@ -596,7 +705,10 @@ def _compare_pair(old, new, warnings, panel_diagnostics):
     # unchanged shared cells. A coincidentally equal length is not an identity.
     pairs = []
     shared = sorted(old_keys & new_keys)
-    if len(old_rows) == len(new_rows) == 1:
+    if old["kind"] == "bom":
+        pairs, presence = _bom_pairs(old, new, old_rows, new_rows, warnings, label)
+        records.extend(presence)
+    elif len(old_rows) == len(new_rows) == 1:
         pairs = [(old_rows[0], new_rows[0])]
     elif old_rows or new_rows:
         edges = defaultdict(list)
@@ -628,7 +740,13 @@ def _compare_pair(old, new, warnings, panel_diagnostics):
                 continue
             if a["text"] == b["text"]:
                 continue
+            if old["kind"] == "bom" and (not _reliable_cell(a) or not _reliable_cell(b)):
+                warnings.append(f"{label} {key}: low-confidence/illegible BOM cell text; unresolved.")
+                continue
             if not a["text"] or not b["text"]:
+                if old["kind"] == "bom" and (a["blank"] or b["blank"]):
+                    records.append(_bom_cell_presence(old, new, key, a, b))
+                    continue
                 warnings.append(f"{label} {key}: observed blank/text transition; "
                                 "not emitted as a text-to-text modification.")
                 continue
@@ -637,8 +755,8 @@ def _compare_pair(old, new, warnings, panel_diagnostics):
     return records
 
 
-def compare_document_tables(old_pdf, new_pdf, old_operation, new_operation):
-    """Compare bounded non-BOM table evidence; return JSON-serializable web items.
+def compare_document_tables(old_pdf, new_pdf, old_operation, new_operation, *, include_bom=False):
+    """Compare bounded table evidence; return JSON-serializable web items.
 
     Header matching is location-independent and order-independent. At least
     three shared roles and >=60% overlap of the larger header set are required,
@@ -652,11 +770,16 @@ def compare_document_tables(old_pdf, new_pdf, old_operation, new_operation):
     is independently accounted for. Such span records retain whole-panel issues.
     Source grid counts include header and independently verified blanks.
     No schema/ordinary OCR records are removed; callers must expose overlap.
+    Opt-in BOM matching requires unique unchanged description/part-number
+    evidence, never row ordinals alone. One-sided unmatched rows require complete
+    source/ink/OCR coverage of both tables. Source-verified blank cells may yield
+    table_cell_added/removed with a null missing side and separate blank context.
+    No fields.Items, generated interpretations, or CU row counts are required.
     """
     warnings = []
     old_diagnostics, new_diagnostics = [], []
-    old_tables = _extract(old_pdf, old_operation, "old", warnings, old_diagnostics)
-    new_tables = _extract(new_pdf, new_operation, "new", warnings, new_diagnostics)
+    old_tables = _extract(old_pdf, old_operation, "old", warnings, old_diagnostics, include_bom=include_bom)
+    new_tables = _extract(new_pdf, new_operation, "new", warnings, new_diagnostics, include_bom=include_bom)
     edges, reverse = defaultdict(list), defaultdict(list)
     for i, old in enumerate(old_tables):
         for j, new in enumerate(new_tables):
@@ -664,7 +787,8 @@ def compare_document_tables(old_pdf, new_pdf, old_operation, new_operation):
                 continue
             common = set(old["keys"]) & set(new["keys"])
             panel_match = old["kind"] == "printed_header_panel" and old["keys"] == new["keys"]
-            if panel_match or (len(common) >= 3 and len(common) / max(len(old["keys"]), len(new["keys"])) >= .6):
+            minimum = 2 if old["kind"] == "bom" else 3
+            if panel_match or (len(common) >= minimum and len(common) / max(len(old["keys"]), len(new["keys"])) >= .6):
                 edges[i].append(j)
                 reverse[j].append(i)
     items, paired, panel_diagnostics = [], 0, []
@@ -697,6 +821,15 @@ def compare_document_tables(old_pdf, new_pdf, old_operation, new_operation):
                                         "new_tables": [{"headers": table["keys"],
                                                         "grid": _measurement(table)}
                                                        for table in new_tables],
-                                        "scope": "non_bom_complete_vector_grids",
+                                        "bom": {"enabled": include_bom,
+                                                "old_included": sum(t["kind"] == "bom" for t in old_tables),
+                                                "new_included": sum(t["kind"] == "bom" for t in new_tables),
+                                                "old_excluded": sum(d["exclusion_reason"] == "bom_disabled"
+                                                                    for d in old_diagnostics),
+                                                "new_excluded": sum(d["exclusion_reason"] == "bom_disabled"
+                                                                    for d in new_diagnostics),
+                                                "source": "PDF vector grids and cached OCR; no generated Items"},
+                                        "scope": ("all_complete_vector_grids" if include_bom
+                                                  else "non_bom_complete_vector_grids"),
                                         "complete": False},
             "warnings": list(dict.fromkeys(warnings))}

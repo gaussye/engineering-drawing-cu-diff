@@ -1,7 +1,9 @@
 # 工程图 CU 提取与证据差异
 
 Python CLI 与本地 Web 审阅台，使用 **Azure Content Understanding GA `2025-11-01`** 对两份原始 PDF
-分别进行全页 OCR/layout 与领域结构化提取，再在本地保守配对。不是仅凭 LLM 看图总结。
+分别进行全页 OCR/layout 提取，再进行有来源约束的语义比较。不是仅凭 LLM 看图总结。
+示例配置采用 **`extraction_profile: "layout"` 轻量模式**：CU保留原文、表格和坐标，
+工程语义由所选Astra/Luna判断；旧版生成工程字段的模式仍可显式选择 `"engineering"`。
 支持 BOM、插头认证印字、线材印字、包装/标签、尺寸公差、备注及图框字段。
 本地 Web 另有独立图形候选通道：基于原始PDF渲染和CU布局来源，不额外调用生成模型。
 可选**模型语义配对＋CU局部复读**通道：让现有模型先提出跨版本区域对应关系，再高清裁剪复读，
@@ -55,7 +57,7 @@ Copy-Item config.example.json local\config.json # 填写真实配置
 .\.venv\Scripts\python -m cu_diff.cli compare `
   --old C:\local-results\drawing-diff\old.response.json `
   --new C:\local-results\drawing-diff\new.response.json `
-  --output C:\local-results\drawing-diff
+  --output C:\local-results\drawing-diff --extraction-profile layout
 ```
 
 `extract` 保持 OCR 开启，即使 PDF 有少量原生文本；工程图大量文字可能是矢量轮廓。
@@ -64,18 +66,52 @@ Copy-Item config.example.json local\config.json # 填写真实配置
 失败作业保留其记录并明确报错；要重新计费尝试，先调查错误，再有意识地移走对应
 `cache\*.operation.json`。不能把空结果当成“无变更”。
 
-每次请求显式传 `modelDeployments`，不修改资源默认映射。响应中的真实 usage、
+旧工程字段模式每次请求显式传 `modelDeployments`；轻量模式不配置completion模型，
+也不发送该覆盖参数，两者都不修改资源默认映射。响应中的真实 usage、
 延迟和 HTTP 状态本地保存；不凭 token 估算金额。CU 提取、contextualization 和
 Foundry 模型分别计费，最终金额需以 Azure 账单为准。
 
-CU 在创建 analyzer 阶段会验证模型默认映射，早于请求级 override。
+旧工程字段模式的CU在创建 analyzer 阶段会验证模型默认映射，早于请求级 override。
 因此 analyzer 使用已有 `prebuilt-analyzer-completion` 别名，分析请求将该别名
 显式映射到配置指定的模型部署；绝不依赖其可能指向其它模型的资源默认值。
 实际所选模型及完整映射保留在 metadata 中，最终 usage 也应核对模型名称。
 
+### 轻量提取与旧模式兼容
+
+`extraction_profile` 只允许 `layout` 或 `engineering`。为兼容已有配置和缓存，
+未设置时仍使用旧 `engineering`；新示例配置显式选择 `layout`：
+
+| 能力 | `layout` | `engineering` |
+|---|---|---|
+| OCR、布局、原文与词坐标 | 保留 | 保留 |
+| 详细结果、表格HTML | 保留 | 保留 |
+| CU生成工程Items/中文解释 | 不生成 | 保留旧schema |
+| CU图形描述/深度图形分析、公式提取 | 关闭 | 保留旧配置 |
+| 工程语义配对 | Astra/Luna引用OCR来源 | 原有字段加模型配对 |
+| 默认主文字通道 | OCR原文，不伪装成生成字段 | 结构化字段 |
+| BOM | 纳入本地表格专项通道 | 保留原字段/BOM通道 |
+
+轻量Web模式要求已批准的 `model_comparison.enabled` 和 `text_pairing` 均为 `true`。
+CU只提取不代表整个应用不调用模型；全页模型配对、词级核对、图形复核仍按原预算执行。
+局部高清CU也使用轻量分析器，不重复生成整套工程字段。未降低OCR分辨率，不省略
+低置信度或未配对证据，也不把LLM建议的坐标伪装成CU词框。
+CU未返回图形分区时，本地图形通道仍采用已有整页回退并记录覆盖限制。
+轻量模式的区域/局部模型输出schema按本轮两侧CU目录分别约束来源ID。
+全局未知或错侧引用仍明确失败；已知来源但超出所属配对组的观察保留显式待核记录，
+不自动补配、不执行该组局部/图形确认，也不绘制差异框。原始响应与拒绝原因保留，
+其余合规区域及独立全页文字/表格通道可继续分析，不以缺少生成字段作为“无差异”。
+
+两种模式使用不同的不可变分析器和CU缓存身份。切换模式不会把旧重型CU缓存
+当成轻量提取的结果，也不会删除它；模型缓存仍按实际输入、提示词、模型版本指纹复用。
+首次轻量分析会产生新的提取/模型用量，后续保持缓存开启可复用。候选编号可能随提取模式变化。
+改模式后先通过已授权的 `extract` 创建/核对新分析器，再启动Web；Web本身仍不创建分析器。
+可将配置改回 `engineering` 回退，不修改Azure共享模型映射或原分析器。
+实际速度与Token减少量以当前作业审计为准，不承诺固定秒数或无漏检。
+
 `diagnose` 只读检查 CU 实际 supportedModels 和默认映射，不上传文件。
 存在 Azure OpenAI 部署并不等于 CU 支持该模型。`extract` 遇到不支持的模型会在
-创建 analyzer/上传文件之前停止；不会偷偷换成其它模型。
+创建 analyzer/上传文件之前停止；不会偷偷换成其它模型。轻量模式不使用completion模型，
+因此不以该模型的支持列表作为OCR提取的前提。
 
 ## 模型语义配对与局部复读（可选）
 
@@ -290,12 +326,14 @@ BOM 行配对成功后，还必须通过 `table_diff.py` 的单元格核验：
 表格结构完整不代表 OCR 内容无遗漏，仍需两侧原图确认；缺表、缺格、来源或对应关系不可靠时
 不会升级为行增删。图外标注与表内行不能仅凭同名文字去重。
 
-### 非BOM表格专项通道
+### 表格专项通道
 
 仅修复 BOM 并不覆盖全部表格：规格表可能没有进入 CU 的 `tables`，
 只有表头和分散的文字行；修订表也可能漏掉没有文字的空白行。
 Web 因此增加独立的“表格专项证据”通道，默认与字段和图形候选一起显示，
 使用原PDF的本地网格证据和已有CU文字，不重新调用CU。
+旧模式默认排除已由字段通道处理的BOM；轻量Web模式显式包含BOM。
+独立CLI使用 `tables --include-bom` 开启相同覆盖。
 `table_cell_modified` 表示有来源的单元格文字不同；
 `table_column_added` / `table_column_removed` 表示对应网格的列差异候选；
 `table_grid_changed` 则是实际绘制的网格结构不同，**包括表头与空白行，不能称为业务记录增删**。
